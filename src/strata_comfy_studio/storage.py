@@ -1,0 +1,323 @@
+from __future__ import annotations
+
+import os
+import re
+import secrets
+import sqlite3
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+_CONVERSATION_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+class StorageError(RuntimeError):
+    """Persistent app state is missing or invalid."""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class ConversationStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.RLock()
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    def _initialize(self) -> None:
+        with self._lock, self._connect() as connection:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    context_saved_at TEXT,
+                    context_tokens INTEGER,
+                    context_bytes INTEGER,
+                    context_message_count INTEGER,
+                    image_prompt TEXT NOT NULL DEFAULT '',
+                    aspect_ratio TEXT NOT NULL DEFAULT '1:1 (Square)'
+                );
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                    content TEXT NOT NULL,
+                    display_content TEXT,
+                    reasoning_content TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS messages_conversation_id_id
+                    ON messages(conversation_id, id);
+                CREATE TABLE IF NOT EXISTS generations (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    prompt TEXT NOT NULL,
+                    seed INTEGER NOT NULL,
+                    aspect_ratio TEXT NOT NULL DEFAULT '1:1 (Square)',
+                    megapixels REAL NOT NULL DEFAULT 4.0,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    sampler_name TEXT NOT NULL DEFAULT 'euler',
+                    scheduler TEXT NOT NULL DEFAULT 'simple',
+                    status TEXT NOT NULL,
+                    prompt_id TEXT,
+                    filename TEXT,
+                    subfolder TEXT,
+                    image_type TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS generations_conversation_id_created_at
+                    ON generations(conversation_id, created_at);
+                CREATE TABLE IF NOT EXISTS app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            """)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(conversations)")}
+            if "context_message_count" not in columns:
+                connection.execute("ALTER TABLE conversations ADD COLUMN context_message_count INTEGER")
+            if "image_prompt" not in columns:
+                connection.execute("ALTER TABLE conversations ADD COLUMN image_prompt TEXT NOT NULL DEFAULT ''")
+            if "aspect_ratio" not in columns:
+                connection.execute("ALTER TABLE conversations ADD COLUMN aspect_ratio TEXT NOT NULL DEFAULT '1:1 (Square)'")
+            message_columns = {row["name"] for row in connection.execute("PRAGMA table_info(messages)")}
+            if "display_content" not in message_columns:
+                connection.execute("ALTER TABLE messages ADD COLUMN display_content TEXT")
+            if "reasoning_content" not in message_columns:
+                connection.execute("ALTER TABLE messages ADD COLUMN reasoning_content TEXT NOT NULL DEFAULT ''")
+            generation_columns = {row["name"] for row in connection.execute("PRAGMA table_info(generations)")}
+            for name, declaration in (
+                ("aspect_ratio", "TEXT NOT NULL DEFAULT '1:1 (Square)'"),
+                ("megapixels", "REAL NOT NULL DEFAULT 4.0"),
+                ("sampler_name", "TEXT NOT NULL DEFAULT 'euler'"),
+                ("scheduler", "TEXT NOT NULL DEFAULT 'simple'"),
+            ):
+                if name not in generation_columns:
+                    connection.execute(f"ALTER TABLE generations ADD COLUMN {name} {declaration}")
+        os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def validate_id(conversation_id: str) -> str:
+        if not isinstance(conversation_id, str) or not _CONVERSATION_ID.fullmatch(conversation_id):
+            raise StorageError("invalid conversation id")
+        return conversation_id
+
+    @classmethod
+    def session_filename(cls, conversation_id: str) -> str:
+        return f"{cls.validate_id(conversation_id)}.bin"
+
+    def create_conversation(self, title: str = "New conversation") -> dict[str, Any]:
+        conversation_id = secrets.token_hex(16)
+        now = _now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (conversation_id, title[:120], now, now),
+            )
+        return self.get_conversation(conversation_id) or {}
+
+    def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+        conversation_id = self.validate_id(conversation_id)
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_conversations(self) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT c.*, (SELECT count(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count "
+                "FROM conversations c ORDER BY updated_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def messages(self, conversation_id: str) -> list[dict[str, str]]:
+        conversation_id = self.validate_id(conversation_id)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT role, content, reasoning_content FROM messages WHERE conversation_id = ? ORDER BY id",
+                (conversation_id,),
+            ).fetchall()
+        return [
+            {"role": row["role"], "content": row["content"],
+             **({"reasoning_content": row["reasoning_content"]} if row["reasoning_content"] else {})}
+            for row in rows
+        ]
+
+    def display_messages(self, conversation_id: str) -> list[dict[str, str]]:
+        conversation_id = self.validate_id(conversation_id)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT role, coalesce(display_content, content) AS content, reasoning_content FROM messages "
+                "WHERE conversation_id = ? ORDER BY id",
+                (conversation_id,),
+            ).fetchall()
+        return [
+            {"role": row["role"], "content": row["content"],
+             **({"reasoning_content": row["reasoning_content"]} if row["reasoning_content"] else {})}
+            for row in rows
+        ]
+
+    def append_exchange(self, conversation_id: str, user_text: str, assistant_text: str,
+                        image_prompt: str = "", aspect_ratio: str = "1:1 (Square)",
+                        display_answer: str | None = None, reasoning_content: str = "") -> None:
+        conversation_id = self.validate_id(conversation_id)
+        now = _now()
+        with self._lock, self._connect() as connection:
+            existing = connection.execute("SELECT title FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+            if existing is None:
+                raise StorageError("conversation does not exist")
+            connection.executemany(
+                                "INSERT INTO messages (conversation_id, role, content, display_content, reasoning_content, created_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                ((conversation_id, "user", user_text, user_text, "", now),
+                                 (conversation_id, "assistant", assistant_text, display_answer or assistant_text,
+                                    reasoning_content, now)),
+            )
+            title = existing["title"]
+            if title == "New conversation":
+                title = user_text.strip().replace("\n", " ")[:72] or title
+            connection.execute("UPDATE conversations SET title = ?, image_prompt = ?, aspect_ratio = ?, updated_at = ? "
+                               "WHERE id = ?", (title, image_prompt, aspect_ratio, now, conversation_id))
+
+    def mark_context_saved(self, conversation_id: str, token_count: int, byte_count: int) -> None:
+        conversation_id = self.validate_id(conversation_id)
+        if token_count < 0 or byte_count < 0:
+            raise StorageError("saved context sizes must be non-negative")
+        with self._lock, self._connect() as connection:
+            message_count = connection.execute(
+                "SELECT count(*) FROM messages WHERE conversation_id = ?", (conversation_id,)
+            ).fetchone()[0]
+            cursor = connection.execute(
+                "UPDATE conversations SET context_saved_at = ?, context_tokens = ?, context_bytes = ?, "
+                "context_message_count = ?, updated_at = ? WHERE id = ?",
+                (_now(), token_count, byte_count, message_count, _now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError("conversation does not exist")
+
+    def context_is_current(self, conversation_id: str) -> bool:
+        conversation_id = self.validate_id(conversation_id)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT c.context_saved_at, c.context_message_count, "
+                "(SELECT count(*) FROM messages m WHERE m.conversation_id = c.id) AS current_count "
+                "FROM conversations c WHERE c.id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return bool(row and row["context_saved_at"] and row["context_message_count"] == row["current_count"])
+
+    def active_conversation_id(self) -> str | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT value FROM app_state WHERE key = 'strata_conversation_id'").fetchone()
+        if row is None:
+            return None
+        return self.validate_id(row["value"])
+
+    def set_active_conversation_id(self, conversation_id: str | None) -> None:
+        if conversation_id is not None:
+            conversation_id = self.validate_id(conversation_id)
+            if self.get_conversation(conversation_id) is None:
+                raise StorageError("conversation does not exist")
+        with self._lock, self._connect() as connection:
+            if conversation_id is None:
+                connection.execute("DELETE FROM app_state WHERE key = 'strata_conversation_id'")
+            else:
+                connection.execute(
+                    "INSERT INTO app_state (key, value) VALUES ('strata_conversation_id', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (conversation_id,),
+                )
+
+    def selected_conversation_id(self) -> str | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT value FROM app_state WHERE key = 'selected_conversation_id'").fetchone()
+        if row is None:
+            return None
+        return self.validate_id(row["value"])
+
+    def set_selected_conversation_id(self, conversation_id: str | None) -> None:
+        if conversation_id is not None:
+            conversation_id = self.validate_id(conversation_id)
+            if self.get_conversation(conversation_id) is None:
+                raise StorageError("conversation does not exist")
+        with self._lock, self._connect() as connection:
+            if conversation_id is None:
+                connection.execute("DELETE FROM app_state WHERE key = 'selected_conversation_id'")
+            else:
+                connection.execute(
+                    "INSERT INTO app_state (key, value) VALUES ('selected_conversation_id', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (conversation_id,),
+                )
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        conversation_id = self.validate_id(conversation_id)
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+            if cursor.rowcount != 1:
+                return False
+            connection.execute("DELETE FROM app_state WHERE value = ?", (conversation_id,))
+        return True
+
+    def create_generation(self, conversation_id: str, prompt: str, seed: int, aspect_ratio: str,
+                          megapixels: float, width: int, height: int, sampler_name: str,
+                          scheduler: str) -> str:
+        conversation_id = self.validate_id(conversation_id)
+        generation_id = secrets.token_hex(16)
+        now = _now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO generations (id, conversation_id, prompt, seed, aspect_ratio, megapixels, width, height, "
+                "sampler_name, scheduler, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+                (generation_id, conversation_id, prompt, seed, aspect_ratio, megapixels, width, height,
+                 sampler_name, scheduler, now, now),
+            )
+        return generation_id
+
+    def update_generation(self, generation_id: str, status: str, prompt_id: str | None = None,
+                          image: dict[str, str] | None = None, error: str | None = None) -> None:
+        allowed = {"queued", "running", "complete", "failed"}
+        if status not in allowed:
+            raise StorageError("invalid generation status")
+        values = image or {}
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE generations SET status = ?, prompt_id = coalesce(?, prompt_id), filename = coalesce(?, filename), "
+                "subfolder = coalesce(?, subfolder), image_type = coalesce(?, image_type), error = ?, updated_at = ? "
+                "WHERE id = ?",
+                (status, prompt_id, values.get("filename"), values.get("subfolder"), values.get("type"),
+                 error, _now(), generation_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError("generation does not exist")
+
+    def generations(self, conversation_id: str) -> list[dict[str, Any]]:
+        conversation_id = self.validate_id(conversation_id)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM generations WHERE conversation_id = ? ORDER BY created_at DESC",
+                (conversation_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def generation(self, generation_id: str) -> dict[str, Any] | None:
+        if not isinstance(generation_id, str) or not re.fullmatch(r"^[0-9a-f]{32}$", generation_id):
+            raise StorageError("invalid generation id")
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM generations WHERE id = ?", (generation_id,)).fetchone()
+        return dict(row) if row else None

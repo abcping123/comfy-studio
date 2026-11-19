@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Strata + MiniMax Studio</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="wordmark" href="/" aria-label="Studio home">
+      <span class="mark" aria-hidden="true">S</span>
+      <span>Fieldnotes <span class="wordmark-sub">IMAGE STUDIO</span></span>
+    </a>
+    <div class="service-strip" aria-label="Model service status">
+      <span class="service-pill"><i id="strata-dot" class="status-dot"></i><span id="strata-status">Strata</span></span>
+      <span class="service-divider" aria-hidden="true"></span>
+      <span class="service-pill"><i id="comfy-dot" class="status-dot"></i><span id="comfy-status">MiniMax</span></span>
+    </div>
+    <button id="refresh-state" class="quiet-button" type="button" title="Refresh service status">Refresh</button>
+  </header>
+
+  <div id="workspace" class="workspace">
+    <aside id="sidebar" class="sidebar" aria-label="Conversations">
+      <div class="sidebar-head">
+        <button id="new-conversation" class="new-button" type="button" title="New chat"><span aria-hidden="true">+</span><span class="new-button-label">New chat</span></button>
+      </div>
+      <div class="sidebar-section-title">Recent</div>
+      <nav id="conversation-list" class="conversation-list" aria-label="Recent conversations"></nav>
+      <div class="sidebar-foot" aria-label="System utilization">
+        <div class="system-status-heading"><span>System status</span><span id="system-status-label">Waiting</span></div>
+        <div class="system-metric">
+          <div class="system-metric-heading"><span>CPU</span><strong id="system-cpu-value">--</strong></div>
+          <div id="system-cpu-meter" class="system-meter is-cpu" role="meter" aria-label="CPU utilization" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Unavailable"><span></span></div>
+        </div>
+        <div class="system-metric">
+          <div class="system-metric-heading"><span>Memory</span><strong id="system-memory-value">--</strong></div>
+          <div id="system-memory-meter" class="system-meter is-memory" role="meter" aria-label="Memory utilization" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Unavailable"><span></span></div>
+        </div>
+        <div class="system-metric">
+          <div class="system-metric-heading"><span>GPU</span><strong id="system-gpu-value">--</strong></div>
+          <div id="system-gpu-meter" class="system-meter is-gpu" role="meter" aria-label="GPU utilization" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Unavailable"><span></span></div>
+        </div>
+        <div class="system-metric">
+          <div class="system-metric-heading"><span>VRAM</span><strong id="system-vram-value">--</strong></div>
+          <div id="system-vram-meter" class="system-meter is-vram" role="meter" aria-label="VRAM utilization" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Unavailable"><span></span></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="chat-column">
+      <h1 id="conversation-title" class="visually-hidden">New conversation</h1>
+      <span id="context-badge" class="context-badge visually-hidden" role="status"><i></i> Context ready</span>
+      <section id="messages" class="messages" aria-live="polite" aria-label="Conversation messages"></section>
+      <form id="chat-form" class="composer">
+        <label class="visually-hidden" for="chat-input">Message Strata</label>
+        <textarea id="chat-input" rows="2" maxlength="20000" placeholder="Describe the image you have in mind..."></textarea>
+        <div class="composer-foot">
+          <span class="composer-hint">Strata will help shape the image prompt</span>
+          <div class="composer-actions">
+            <label class="thinking-effort" for="thinking-effort"><span>Thinking</span>
+              <select id="thinking-effort" aria-label="Thinking effort" title="Thinking effort">
+                <option value="none" selected>None</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+            </label>
+            <button id="send-message" class="send-button" type="submit"><span>Send</span><span aria-hidden="true">&#8593;</span></button>
+          </div>
+        </div>
+      </form>
+    </main>
+
+    <aside class="prompt-column" aria-label="Image prompt and output">
+      <div class="prompt-editor-wrap">
+        <label for="image-prompt" class="field-label">Prompt</label>
+        <textarea id="image-prompt" class="prompt-editor" maxlength="20000" placeholder="A detailed prompt from your conversation will appear here."></textarea>
+        <div class="prompt-meta"><span id="prompt-count">0 characters</span></div>
+      </div>
+
+      <div class="settings-block">
+        <div class="settings-title">Resolution</div>
+        <div class="selector-grid">
+          <label class="field-control ratio-control" for="image-aspect-ratio">Aspect ratio
+            <select id="image-aspect-ratio" disabled></select>
+          </label>
+          <label class="field-control" for="image-megapixels">Pixels (MP)
+            <input id="image-megapixels" type="number" min="0.1" max="16" step="0.01" value="4.00">
+          </label>
+        </div>
+        <div class="resolution-preview" aria-live="polite">
+          <span id="resolution-value">2048 x 2048 px</span>
+          <span id="resolution-details">4.00 MP target / 32 px aligned</span>
+        </div>
+        <div class="selector-grid sampling-grid">
+          <label class="field-control" for="image-sampler">Sampler
+            <select id="image-sampler" disabled></select>
+          </label>
+          <label class="field-control" for="image-scheduler">Scheduler
+            <select id="image-scheduler" disabled></select>
+          </label>
+        </div>
+        <div class="seed-row">
+          <label for="image-seed">Seed</label>
+          <input id="image-seed" type="number" min="0" max="4294967295" value="42">
+          <button id="random-seed" class="icon-button" type="button" title="Randomize seed" aria-label="Randomize seed">&#8635;</button>
+        </div>
+        <button id="generate-image" class="generate-button" type="button" disabled>
+          <span id="generate-image-label" class="generate-button-label" aria-live="polite">Generate image</span>
+          <span id="generate-image-percent" class="generate-button-percent" aria-hidden="true"></span>
+          <span class="generate-button-icon" aria-hidden="true">&#8599;</span>
+          <span id="generate-image-progress" class="generate-button-progress is-indeterminate" role="progressbar" aria-label="Image generation progress" aria-valuemin="0" aria-valuemax="100">
+            <span class="generate-button-progress-fill"></span>
+          </span>
+        </button>
+      </div>
+
+      <section class="result-section" aria-label="Generated images">
+        <div class="result-heading"><span class="settings-title">Results</span><span id="result-count" class="result-count" aria-live="polite">0</span></div>
+        <div id="result-viewer" class="result-viewer">
+          <button id="older-result" class="gallery-nav gallery-nav-older" type="button" title="Older image" aria-label="Older image" aria-controls="image-gallery" disabled>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>
+          </button>
+          <div id="image-gallery" class="image-gallery" aria-live="polite">
+            <div id="empty-result" class="empty-result">
+              <span class="empty-glyph" aria-hidden="true">&#9634;</span>
+              <span>Your images will appear here</span>
+            </div>
+          </div>
+          <button id="newer-result" class="gallery-nav gallery-nav-newer" type="button" title="Newer image" aria-label="Newer image" aria-controls="image-gallery" disabled>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10 3-5 5 5 5"/></svg>
+          </button>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <dialog id="token-dialog" class="token-dialog">
+    <form id="token-form" method="dialog">
+      <div class="eyebrow">PRIVATE WORKSPACE</div>
+      <h2>Enter access token</h2>
+      <p>Use the token from this studio's local config file.</p>
+      <label for="token-input">Access token</label>
+      <input id="token-input" type="password" autocomplete="current-password" required>
+      <div id="token-error" class="token-error" role="alert"></div>
+      <button class="generate-button" type="submit">Open studio</button>
+    </form>
+  </dialog>
+  <dialog id="delete-dialog" class="confirm-dialog">
+    <div class="eyebrow">CONVERSATION</div>
+    <h2 id="delete-title">Delete conversation?</h2>
+    <p id="delete-copy">The chat and saved Strata context will be removed. Generated PNG files remain in ComfyUI's output folder.</p>
+    <div class="dialog-actions">
+      <button id="cancel-delete" class="quiet-button" type="button">Cancel</button>
+      <button id="confirm-delete" class="danger-button" type="button">Delete</button>
+    </div>
+  </dialog>
+  <dialog id="image-lightbox" class="image-lightbox" aria-label="Full-screen image viewer">
+    <button id="lightbox-close" class="lightbox-close" type="button" title="Close image viewer" aria-label="Close image viewer">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+    </button>
+    <button id="lightbox-older" class="lightbox-nav lightbox-nav-older" type="button" title="Older image" aria-label="Older image" aria-controls="lightbox-image" disabled>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>
+    </button>
+    <figure class="lightbox-figure"><img id="lightbox-image" alt=""></figure>
+    <button id="lightbox-newer" class="lightbox-nav lightbox-nav-newer" type="button" title="Newer image" aria-label="Newer image" aria-controls="lightbox-image" disabled>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10 3-5 5 5 5"/></svg>
+    </button>
+    <span id="lightbox-count" class="lightbox-count" aria-live="polite"></span>
+  </dialog>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+</body>
+</html>

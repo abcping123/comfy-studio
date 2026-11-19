@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "app": {
+    "listen_host": "127.0.0.1",
+    "port": 8765,
+    "access_token": ""
+  },
+  "paths": {
+    "strata_runtime_config": "temp/strata/runtime.json",
+    "strata_sessions": "temp/strata",
+    "database": "temp/studio.sqlite3",
+    "temp_root": "temp",
+    "workflow_api": "data/comfyui/minimax_h3_image_t2i.json"
+  },
+  "strata": {
+    "endpoint": "http://127.0.0.1:8080",
+    "python": "/home/pic1wx/repos/Strata/.venv/bin/python",
+    "server_script": "/home/pic1wx/repos/Strata/serve/server.py",
+    "source_config_json": "/home/pic1wx/repos/Strata/strata-q2_0.json",
+    "api_key": "",
+    "model": "qwen3.8-flash-next-q2_0",
+    "min_free_vram_mib": null,
+    "idle_unload_s": 600,
+    "request_timeout_s": 900
+  },
+  "comfyui": {
+    "endpoint": "http://127.0.0.1:8188",
+    "python": "/home/pic1wx/repos/ComfyUI/.venv/bin/python",
+    "main_script": "/home/pic1wx/repos/ComfyUI/main.py",
+    "working_directory": "/home/pic1wx/repos/ComfyUI",
+    "diffusion_models_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/diffusion_models",
+    "text_encoders_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3/text_encoders",
+    "vae_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/vae",
+    "models": {
+      "diffusion_model": "minimax_h3_image_pruned_int8_convrot.safetensors",
+      "text_encoder": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+      "vae": "minimax_h3_image_vae_fp16.safetensors"
+    },
+    "output_directory": "/home/pic1wx/repos/ComfyUI/output",
+    "gpu_id": 0,
+    "request_timeout_s": 1800,
+    "poll_interval_s": 1.0
+  },
+  "generation": {
+    "prompt_enhancement": false,
+    "prompt_skill_version": 3,
+    "system_prompt_file": "data/strata/minimax_h3_image_t2i.txt",
+    "aspect_ratios": [
+      {"label": "1:1 (Square)", "width": 1, "height": 1},
+      {"label": "2:3 (Portrait Photo)", "width": 2, "height": 3},
+      {"label": "3:2 (Photo)", "width": 3, "height": 2},
+      {"label": "3:4 (Portrait Standard)", "width": 3, "height": 4},
+      {"label": "4:3 (Standard)", "width": 4, "height": 3},
+      {"label": "9:16 (Portrait Widescreen)", "width": 9, "height": 16},
+      {"label": "16:9 (Widescreen)", "width": 16, "height": 9},
+      {"label": "21:9 (Ultrawide)", "width": 21, "height": 9}
+    ],
+    "default_aspect_ratio": "1:1 (Square)",
+    "default_megapixels": 4.0,
+    "resolution_multiple": 32,
+    "steps": 6,
+    "cfg": 1.0,
+    "sampler_options": ["euler", "euler_cfg_pp", "euler_ancestral", "euler_ancestral_cfg_pp", "heun", "heunpp2", "exp_heun_2_x0", "exp_heun_2_x0_sde", "dpm_2", "dpm_2_ancestral", "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_2s_ancestral_cfg_pp", "dpmpp_sde", "dpmpp_sde_gpu", "dpmpp_2m", "dpmpp_2m_cfg_pp", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "dpmpp_2m_sde_heun", "dpmpp_2m_sde_heun_gpu", "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ddpm", "lcm", "ipndm", "ipndm_v", "deis", "cfgpp_ud10_ab", "res_multistep", "res_multistep_cfg_pp", "res_multistep_ancestral", "res_multistep_ancestral_cfg_pp", "gradient_estimation", "gradient_estimation_cfg_pp", "er_sde", "seeds_2", "seeds_3", "sa_solver", "sa_solver_pece", "ddim", "uni_pc", "uni_pc_bh2"],
+    "scheduler_options": ["simple", "sgm_uniform", "karras", "exponential", "ddim_uniform", "beta", "normal", "linear_quadratic", "kl_optimal"],
+    "default_sampler": "euler",
+    "default_scheduler": "simple"
+  },
+  "coordination": {
+    "handoff_timeout_s": 120,
+    "generation_timeout_s": 1800,
+    "poll_interval_s": 1.0
+  }
+}
