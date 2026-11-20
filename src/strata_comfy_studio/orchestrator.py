@@ -49,6 +49,7 @@ class Orchestrator:
         self._clock = clock
         self._sleep = sleeper
         self._operation_lock = threading.Lock()
+        self._comfy_models_retained = False
 
     def _enter(self) -> None:
         if not self._operation_lock.acquire(blocking=False):
@@ -106,6 +107,7 @@ class Orchestrator:
 
     def _release_comfy(self) -> None:
         self._require_idle_queue()
+        self._comfy_models_retained = False
         self.comfy.free_memory()
         self._wait_for_free_vram()
 
@@ -529,7 +531,8 @@ class Orchestrator:
                 "type": "phase", "message": "Preparing GPU resources for ComfyUI",
             })
             self._require_idle_queue()
-            if self._strata_loaded():
+            strata_was_loaded = self._strata_loaded()
+            if strata_was_loaded:
                 active_id = self.store.active_conversation_id()
                 if active_id is None:
                     raise CoordinationError("Strata is loaded but its active conversation is unknown")
@@ -539,7 +542,8 @@ class Orchestrator:
                     raise CoordinationError("Strata did not unload; image generation was not started")
             if self.store.messages(conversation_id) and not self.store.context_is_current(conversation_id):
                 raise CoordinationError("this conversation has no current native Strata session")
-            self._release_comfy()
+            if strata_was_loaded or not self._comfy_models_retained:
+                self._release_comfy()
             generation = self.settings.section("generation")
             selected_ratio = aspect_ratio or generation["default_aspect_ratio"]
             selected_megapixels = megapixels if megapixels is not None else generation["default_megapixels"]
@@ -568,6 +572,7 @@ class Orchestrator:
             prompt_id = response.get("prompt_id")
             if not isinstance(prompt_id, str) or not prompt_id:
                 raise CoordinationError("ComfyUI did not return a prompt id")
+            self._comfy_models_retained = True
             self.store.update_generation(generation_id, "running", prompt_id=prompt_id)
             self._report_generation_event(progress_callback, {
                 "type": "phase", "message": "ComfyUI is executing the workflow",
@@ -583,23 +588,15 @@ class Orchestrator:
                                                  error=str(error)[:1000])
                 except StorageError:
                     pass
-        cleanup_warning = None
         self._report_generation_event(progress_callback, {
-            "type": "phase", "message": "Releasing ComfyUI memory",
+            "type": "phase", "message": "Keeping ComfyUI models loaded for the next generation",
         })
-        try:
-            self._require_idle_queue()
-            self.comfy.free_memory()
-            self._wait_for_free_vram()
-        except Exception as error:
-            cleanup_warning = f"GPU cleanup is not confirmed; Strata remains blocked: {error}"
-        finally:
-            if progress_socket is not None:
-                try:
-                    progress_socket.close()
-                except Exception:
-                    pass
-            self._leave()
+        if progress_socket is not None:
+            try:
+                progress_socket.close()
+            except Exception:
+                pass
+        self._leave()
         if failure is not None:
             raise CoordinationError(str(failure)) from failure
         if generation_id is None or prompt_id is None or completed_image is None:
@@ -607,4 +604,4 @@ class Orchestrator:
         self._report_generation_event(progress_callback, {
             "type": "phase", "message": "Image ready",
         })
-        return GenerationOutcome(generation_id, prompt_id, completed_image, cleanup_warning)
+        return GenerationOutcome(generation_id, prompt_id, completed_image)

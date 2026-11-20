@@ -1,11 +1,13 @@
 (() => {
   const tokenKey = "fieldnotes.access-token";
+  const conversationSettingsPrefix = "fieldnotes.conversation-settings.v1.";
   const state = {
     token: sessionStorage.getItem(tokenKey) || "",
     conversationId: null,
     options: null,
     pendingDeleteId: null,
     busy: false,
+    generationRunId: null,
     imageUrls: new Set(),
     imageViewerGenerationId: null,
   };
@@ -113,13 +115,7 @@
     return consumeChatStream(response, onEvent);
   }
 
-  async function streamGeneration(body, onEvent) {
-    const response = await fetch("/api/generate/stream", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json", Accept: "text/event-stream" }),
-      body: JSON.stringify(body),
-      cache: "no-store",
-    });
+  async function consumeGenerationStream(response, onEvent) {
     if (response.status === 401) {
       sessionStorage.removeItem(tokenKey);
       state.token = "";
@@ -129,7 +125,9 @@
     if (!response.ok) {
       const error = response.headers.get("content-type")?.includes("application/json")
         ? await response.json() : null;
-      throw new Error(error?.detail || `Request failed (${response.status})`);
+      const failure = new Error(error?.detail || `Request failed (${response.status})`);
+      failure.status = response.status;
+      throw failure;
     }
     if (!response.body) throw new Error("Generation stream is unavailable.");
 
@@ -146,7 +144,10 @@
       if (!data) return;
       const event = JSON.parse(data);
       if (event.type === "done") outcome = event;
-      else if (event.type === "error") streamError = new Error(event.message || "ComfyUI generation failed.");
+      else if (event.type === "error") {
+        streamError = new Error(event.message || "ComfyUI generation failed.");
+        streamError.generationFailed = true;
+      }
       onEvent(event);
     };
     try {
@@ -171,6 +172,29 @@
     if (streamError) throw streamError;
     if (!outcome) throw new Error("Generation stream ended before the image was ready.");
     return outcome;
+  }
+
+  async function streamGeneration(body, onEvent, onRunId = () => {}) {
+    const requestBody = JSON.stringify(body).replace(
+      `"seed":${JSON.stringify(body.seed)}`,
+      `"seed":${body.seed}`,
+    );
+    const response = await fetch("/api/generate/stream", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json", Accept: "text/event-stream" }),
+      body: requestBody,
+      cache: "no-store",
+    });
+    if (response.ok) onRunId(response.headers.get("X-Generation-Run-Id"));
+    return consumeGenerationStream(response, onEvent);
+  }
+
+  async function resumeGenerationStream(runId, afterSequence, onEvent) {
+    const response = await fetch(
+      `/api/generate/runs/${encodeURIComponent(runId)}/stream?after=${afterSequence}`,
+      { headers: authHeaders({ Accept: "text/event-stream" }), cache: "no-store" },
+    );
+    return consumeGenerationStream(response, onEvent);
   }
 
   function resetGenerationMonitor() {
@@ -348,7 +372,37 @@
     copy.textContent = "Start with a scene, object, mood, or any detail you want to explore.";
     const suggestions = document.createElement("div");
     suggestions.className = "suggestion-row";
-    ["A quiet coastal bookstore", "A sculptural glass lamp", "A field guide illustration"].forEach((text) => {
+    const prompts = [
+      "A quiet coastal bookstore",
+      "A sculptural glass lamp",
+      "A field guide illustration of desert flowers",
+      "A tiny greenhouse on a rainy rooftop",
+      "A night market just after the rain",
+      "A mountain observatory at blue hour",
+      "A teacup filled with a miniature garden",
+      "An old tram winding through a hillside town",
+      "A white fox beneath the northern lights",
+      "A botanical print of unusual mushrooms",
+      "A floating library among misty cliffs",
+      "A warm bakery before sunrise",
+      "A coral reef seen through a glass submarine",
+      "A ceramic vase shaped by ocean waves",
+      "A lantern-lit path through a bamboo forest",
+      "A vintage radio in a sunlit attic",
+      "A tiny sailboat crossing a pond in a teacup",
+      "A modern cabin tucked into autumn woods",
+      "A still life of citrus and blue ceramics",
+      "A moonlit greenhouse full of tropical leaves",
+      "An illustrated map of an imaginary island",
+      "A red bicycle beside a flower shop",
+      "A snow-covered train station at dusk",
+      "A cloud-shaped reading nook for children",
+    ];
+    for (let index = prompts.length - 1; index > 0; index--) {
+      const swapIndex = Math.floor(Math.random() * (index + 1));
+      [prompts[index], prompts[swapIndex]] = [prompts[swapIndex], prompts[index]];
+    }
+    prompts.slice(0, 3).forEach((text) => {
       const button = document.createElement("button");
       button.className = "suggestion";
       button.type = "button";
@@ -390,7 +444,8 @@
     const ratio = state.options.aspect_ratios.find((item) => item.label === byId("image-aspect-ratio").value);
     const megapixels = Number(byId("image-megapixels").value);
     const multiple = state.options.resolution_multiple;
-    if (!ratio || !Number.isFinite(megapixels) || megapixels < 0.1 || megapixels > 16) return null;
+    if (!ratio || !Number.isFinite(megapixels) || megapixels < state.options.megapixels.min ||
+      megapixels > state.options.megapixels.max) return null;
     const scale = Math.sqrt(megapixels * 1024 * 1024 / (ratio.width * ratio.height));
     return {
       width: roundToEven(ratio.width * scale / multiple) * multiple,
@@ -405,7 +460,7 @@
     byId("generate-image").disabled = state.busy || !imagePrompt.value.trim() || !result;
     if (!result) {
       byId("resolution-value").textContent = "Check resolution settings";
-      byId("resolution-details").textContent = "0.1–16 MP";
+      byId("resolution-details").textContent = "4–20 MP";
       return;
     }
     byId("resolution-value").textContent = `${result.width} x ${result.height} px`;
@@ -441,6 +496,72 @@
     updateResolutionPreview();
   }
 
+  function readConversationSettings(conversationId = state.conversationId) {
+    if (!conversationId) return {};
+    try {
+      const saved = JSON.parse(localStorage.getItem(`${conversationSettingsPrefix}${conversationId}`) || "{}");
+      return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveConversationSettings() {
+    if (!state.conversationId || !state.options) return;
+    const saved = readConversationSettings();
+    const aspectRatio = byId("image-aspect-ratio").value;
+    const megapixels = Number(byId("image-megapixels").value);
+    const sampler = byId("image-sampler").value;
+    const scheduler = byId("image-scheduler").value;
+    const thinkingEffort = byId("thinking-effort").value;
+
+    if (state.options.aspect_ratios.some((item) => item.label === aspectRatio)) {
+      saved.aspect_ratio = aspectRatio;
+    }
+    if (Number.isFinite(megapixels) && megapixels >= state.options.megapixels.min &&
+        megapixels <= state.options.megapixels.max) {
+      saved.megapixels = megapixels;
+    }
+    if (state.options.samplers.includes(sampler)) saved.sampler = sampler;
+    if (state.options.schedulers.includes(scheduler)) saved.scheduler = scheduler;
+    if (["none", "low", "medium", "high"].includes(thinkingEffort)) {
+      saved.thinking_effort = thinkingEffort;
+    }
+
+    try {
+      localStorage.setItem(`${conversationSettingsPrefix}${state.conversationId}`, JSON.stringify(saved));
+    } catch {
+      // Browser storage may be unavailable; preferences remain usable for this page load.
+    }
+  }
+
+  function restoreConversationSettings() {
+    const saved = readConversationSettings();
+    if (!state.options) return;
+
+    if (state.options.aspect_ratios.some((item) => item.label === saved.aspect_ratio)) {
+      byId("image-aspect-ratio").value = saved.aspect_ratio;
+    }
+    const megapixels = Number(saved.megapixels);
+    if (Number.isFinite(megapixels) && megapixels >= state.options.megapixels.min &&
+        megapixels <= state.options.megapixels.max) {
+      byId("image-megapixels").value = megapixels.toFixed(2);
+    }
+    if (state.options.samplers.includes(saved.sampler)) byId("image-sampler").value = saved.sampler;
+    if (state.options.schedulers.includes(saved.scheduler)) byId("image-scheduler").value = saved.scheduler;
+    if (["none", "low", "medium", "high"].includes(saved.thinking_effort)) {
+      byId("thinking-effort").value = saved.thinking_effort;
+    }
+  }
+
+  function clearConversationSettings(conversationId) {
+    try {
+      localStorage.removeItem(`${conversationSettingsPrefix}${conversationId}`);
+    } catch {
+      // Ignore unavailable browser storage.
+    }
+  }
+
   function setServiceStatus(name, service, text) {
     byId(`${name}-status`).textContent = text;
     const dot = byId(`${name}-dot`);
@@ -461,14 +582,30 @@
     renderConversationList(data.conversations || []);
     if (!state.conversationId) {
       const activeChat = data.active_chat;
-      const selected = activeChat?.conversation_id || data.active_conversation_id || data.conversations?.[0]?.id;
-      if (activeChat) setBusy(true);
+      const activeGeneration = data.active_generation;
+      const activeOperation = activeChat || activeGeneration;
+      const selected = activeChat?.conversation_id || activeGeneration?.conversation_id ||
+        data.active_conversation_id || data.conversations?.[0]?.id;
+      if (activeOperation) setBusy(true);
       if (selected) {
-        const conversation = await selectConversation(selected, null, Boolean(activeChat));
+        const conversation = await selectConversation(selected, null, true);
         if (activeChat && conversation) void resumeActiveChat(activeChat, conversation);
-        else if (activeChat) setBusy(false);
+        else if (activeGeneration && conversation) void resumeActiveGeneration(activeGeneration);
+        else setBusy(false);
       }
-      else await createConversation();
+      else {
+        await createConversation();
+        if (!state.generationRunId) setBusy(false);
+      }
+    } else if (data.active_generation && !state.generationRunId) {
+      const activeGeneration = data.active_generation;
+      let conversation = true;
+      if (state.conversationId !== activeGeneration.conversation_id) {
+        setBusy(true);
+        conversation = await selectConversation(activeGeneration.conversation_id, null, true);
+      }
+      if (conversation) void resumeActiveGeneration(activeGeneration);
+      else setBusy(false);
     }
   }
 
@@ -479,7 +616,6 @@
       ["gpu", "gpu_percent"],
       ["vram", "vram_percent"],
     ];
-    let available = false;
     fields.forEach(([name, key]) => {
       const value = metrics[key];
       const label = byId(`system-${name}-value`);
@@ -492,7 +628,6 @@
         fill.style.width = "0%";
         return;
       }
-      available = true;
       const percent = Math.max(0, Math.min(100, value));
       const display = Math.round(percent);
       label.textContent = `${display}%`;
@@ -500,7 +635,6 @@
       meter.setAttribute("aria-valuetext", `${display}%`);
       fill.style.width = `${percent}%`;
     });
-    byId("system-status-label").textContent = available ? "Live" : "Unavailable";
   }
 
   async function refreshSystemMetrics() {
@@ -571,6 +705,7 @@
     byId("confirm-delete").disabled = true;
     try {
       await api(`/api/conversations/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+      clearConversationSettings(conversationId);
       deleteDialog.close();
       state.pendingDeleteId = null;
       if (state.conversationId === conversationId) {
@@ -733,6 +868,7 @@
         byId("image-sampler").value = latestGeneration.sampler_name;
         byId("image-scheduler").value = latestGeneration.scheduler;
       }
+      restoreConversationSettings();
       updatePromptCount();
       const badge = byId("context-badge");
       badge.classList.toggle("is-warning", !data.conversation.context_saved_at);
@@ -772,6 +908,7 @@
         byId("image-megapixels").value = Number(state.options.megapixels.default).toFixed(2);
         byId("image-sampler").value = state.options.default_sampler;
         byId("image-scheduler").value = state.options.default_scheduler;
+        saveConversationSettings();
       }
       updatePromptCount();
       clearImages();
@@ -791,6 +928,7 @@
     const message = chatInput.value.trim();
     if (!message || !state.conversationId || state.busy) return;
     const reasoningEffort = byId("thinking-effort").value;
+    saveConversationSettings();
     appendMessage("user", message);
     chatInput.value = "";
     resizeChatInput();
@@ -842,6 +980,7 @@
     if (state.options?.aspect_ratios.some((item) => item.label === result.aspect_ratio)) {
       byId("image-aspect-ratio").value = result.aspect_ratio;
     }
+    saveConversationSettings();
     updatePromptCount();
     assistant.meta = document.createElement("div");
     assistant.meta.className = "message-meta";
@@ -886,11 +1025,82 @@
     }
   }
 
+  async function resumeActiveGeneration(activeGeneration) {
+    if (state.generationRunId === activeGeneration.id) return;
+    state.generationRunId = activeGeneration.id;
+    setBusy(true);
+    resetGenerationMonitor();
+    if (activeGeneration.latest_event) updateGenerationMonitor(activeGeneration.latest_event);
+    let afterSequence = Math.max(0, Number(activeGeneration.sequence) || 0);
+    try {
+      let result;
+      while (!result) {
+        try {
+          result = await resumeGenerationStream(activeGeneration.id, afterSequence, (event) => {
+            afterSequence += 1;
+            updateGenerationMonitor(event);
+          });
+        } catch (error) {
+          if (error.status === 401 || error.status === 404 || error.generationFailed) throw error;
+          byId("generate-image-label").textContent = "Reconnecting to generation";
+          setGenerationProgress(Number.NaN);
+          await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        }
+      }
+      await selectConversation(activeGeneration.conversation_id, result.generation_id);
+      if (result.cleanup_warning) toast(result.cleanup_warning, true);
+      else toast("Image generated.");
+      await refreshState();
+    } catch (error) {
+      const button = byId("generate-image");
+      button.classList.add("is-error");
+      button.title = error.message;
+      byId("generate-image-label").textContent = error.generationFailed
+        ? "Generation failed" : "Generation status unavailable";
+      setGenerationProgress(Number.NaN);
+      toast(error.message, true);
+    } finally {
+      if (state.generationRunId === activeGeneration.id) {
+        state.generationRunId = null;
+        setBusy(false);
+        clearGenerationMonitor();
+      }
+    }
+  }
+
+  function normalizeSeedInput(value) {
+    const seedText = value.replace(/^0+(?=\d)/, "");
+    if (!/^[0-9]+$/.test(seedText) || seedText.length > 20 ||
+        (seedText.length === 20 && seedText > "18446744073709551615")) {
+      return null;
+    }
+    return seedText;
+  }
+
+  function updateSeedValidity() {
+    const seedInput = byId("image-seed");
+    seedInput.setCustomValidity("");
+    const seedText = normalizeSeedInput(seedInput.value);
+    const valid = seedText !== null && seedInput.validity.valid;
+    seedInput.classList.toggle("is-invalid", !valid);
+    if (valid) seedInput.removeAttribute("aria-invalid");
+    else seedInput.setAttribute("aria-invalid", "true");
+    return { seedInput, seedText, valid };
+  }
+
   async function generateImage() {
     if (state.busy || !state.conversationId || !imagePrompt.value.trim()) return;
     const resolution = calculateResolution();
     if (!resolution) return;
-    const seed = Number(byId("image-seed").value);
+    const { seedInput, seedText, valid } = updateSeedValidity();
+    if (!valid) {
+      seedInput.setCustomValidity("Seed must be an integer from 0 to 18446744073709551615.");
+      seedInput.reportValidity();
+      return;
+    }
+    const seed = seedText;
+    saveConversationSettings();
+    state.generationRunId = "starting";
     setBusy(true);
     resetGenerationMonitor();
     try {
@@ -902,7 +1112,9 @@
           megapixels: resolution.megapixels,
           sampler_name: byId("image-sampler").value,
           scheduler: byId("image-scheduler").value,
-        }, updateGenerationMonitor);
+        }, updateGenerationMonitor, (runId) => {
+          if (runId) state.generationRunId = runId;
+        });
       await selectConversation(state.conversationId, result.generation_id);
       if (result.cleanup_warning) toast(result.cleanup_warning, true);
       else toast("Image generated.");
@@ -914,6 +1126,7 @@
       setGenerationProgress(Number.NaN);
       toast(error.message, true);
     } finally {
+      state.generationRunId = null;
       setBusy(false);
       clearGenerationMonitor();
     }
@@ -961,20 +1174,36 @@
   byId("confirm-delete").addEventListener("click", deleteConversation);
   imagePrompt.addEventListener("input", updatePromptCount);
   window.addEventListener("resize", resizeChatInput);
-  byId("image-aspect-ratio").addEventListener("change", updateResolutionPreview);
-  byId("image-megapixels").addEventListener("input", updateResolutionPreview);
-  byId("image-sampler").addEventListener("change", updateResolutionPreview);
-  byId("image-scheduler").addEventListener("change", updateResolutionPreview);
+  byId("thinking-effort").addEventListener("change", saveConversationSettings);
+  byId("image-aspect-ratio").addEventListener("change", () => {
+    updateResolutionPreview();
+    saveConversationSettings();
+  });
+  byId("image-megapixels").addEventListener("input", () => {
+    updateResolutionPreview();
+    saveConversationSettings();
+  });
+  byId("image-seed").addEventListener("input", updateSeedValidity);
+  byId("image-sampler").addEventListener("change", () => {
+    updateResolutionPreview();
+    saveConversationSettings();
+  });
+  byId("image-scheduler").addEventListener("change", () => {
+    updateResolutionPreview();
+    saveConversationSettings();
+  });
   byId("random-seed").addEventListener("click", () => {
     const value = new Uint32Array(1);
     crypto.getRandomValues(value);
     byId("image-seed").value = String(value[0]);
+    updateSeedValidity();
   });
   byId("token-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     state.token = byId("token-input").value.trim();
     sessionStorage.setItem(tokenKey, state.token);
     byId("token-error").textContent = "";
+    setBusy(true);
     try {
       await loadOptions();
       await refreshState();
@@ -991,6 +1220,7 @@
   updatePromptCount();
   resizeChatInput();
   if (state.token) {
+    setBusy(true);
     loadOptions().then(refreshState).catch((error) => toast(error.message, true));
     startSystemMetricsPolling();
   } else tokenDialog.showModal();

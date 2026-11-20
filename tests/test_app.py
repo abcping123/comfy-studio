@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from strata_comfy_studio.app import ChatRunManager, create_app
+from strata_comfy_studio.app import ChatRunManager, GenerationRunManager, create_app
 from strata_comfy_studio.orchestrator import ChatOutcome, GenerationOutcome
 from strata_comfy_studio.settings import Settings
 from strata_comfy_studio.storage import ConversationStore
@@ -79,9 +79,23 @@ class AppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         options = response.json()
         self.assertEqual(options["default_aspect_ratio"], "1:1 (Square)")
+        self.assertEqual(options["megapixels"]["min"], 0.5)
+        self.assertEqual(options["megapixels"]["max"], 20.0)
         self.assertEqual(options["megapixels"]["default"], 4.0)
         self.assertEqual(options["resolution_multiple"], 32)
         self.assertFalse(options["prompt_enhancement"])
+
+    def test_generate_stream_rejects_megapixels_outside_half_to_twenty(self) -> None:
+        headers = {"Authorization": "Bearer test-access-token"}
+        for megapixels in (0.49, 20.01):
+            response = self.client.post("/api/generate/stream", headers=headers, json={
+                "conversation_id": "invalid-for-this-request",
+                "prompt": "A test image",
+                "seed": 1,
+                "megapixels": megapixels,
+            })
+            with self.subTest(megapixels=megapixels):
+                self.assertEqual(response.status_code, 422)
 
     def test_chat_forwards_current_editor_state(self) -> None:
         headers = {"Authorization": "Bearer test-access-token"}
@@ -192,6 +206,40 @@ class AppTests(unittest.TestCase):
             release.set()
         self.assertEqual(len(list(run.stream())), 2)
 
+    def test_state_exposes_active_generation_for_page_recovery(self) -> None:
+        headers = {"Authorization": "Bearer test-access-token"}
+        conversation = self.client.post("/api/conversations", headers=headers).json()
+        run = self.app.state.generation_runs.start(conversation["id"])
+        event = {"type": "progress", "overall_percent": 42}
+        run.publish(event)
+
+        response = self.client.get("/api/state", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["active_generation"], {
+            "id": run.id,
+            "conversation_id": conversation["id"],
+            "sequence": 1,
+            "latest_event": event,
+        })
+        self.app.state.generation_runs.finish(run, {"type": "error", "message": "test complete"})
+
+    def test_generation_stream_can_resume_after_last_seen_event(self) -> None:
+        headers = {"Authorization": "Bearer test-access-token"}
+        run = self.app.state.generation_runs.start("conversation-id")
+        run.publish({"type": "phase", "message": "Preparing ComfyUI"})
+        sequence = run.public_info()["sequence"]
+        run.publish({"type": "progress", "value": 4, "max": 6})
+        run.finish({"type": "done", "generation_id": "generation-1"})
+
+        response = self.client.get(
+            f"/api/generate/runs/{run.id}/stream?after={sequence}", headers=headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        self.assertEqual([event["type"] for event in events], ["progress", "done"])
+
     def test_generate_stream_forwards_progress_and_completion(self) -> None:
         headers = {"Authorization": "Bearer test-access-token"}
         conversation = self.client.post("/api/conversations", headers=headers).json()
@@ -216,10 +264,13 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
+        run_id = response.headers["x-generation-run-id"]
+        self.assertTrue(run_id)
         events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
         self.assertEqual([event["type"] for event in events], ["phase", "progress", "done"])
         self.assertEqual(events[1]["value"], 3)
         self.assertEqual(events[-1]["generation_id"], "generation-1")
+        self.assertIsNone(self.app.state.generation_runs.active())
         self.assertEqual(generate.call_args.kwargs["progress_callback"].__class__.__name__, "method")
 
     def test_unknown_asset_is_not_served(self) -> None:

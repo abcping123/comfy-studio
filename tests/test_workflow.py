@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import unittest
 
-from strata_comfy_studio.settings import load_config, project_root
+from strata_comfy_studio.settings import Settings, load_config, project_root
 from strata_comfy_studio.workflow import WorkflowError, build_workflow
 
 
 class WorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.settings = load_config(project_root() / "config.example.json")
+        root = project_root()
+        cls.settings = Settings(root, load_config(root / "data" / "config.example.json").data)
 
     def test_prompt_flows_directly_to_minimax_conditioning(self) -> None:
         graph = build_workflow(self.settings, "A glass greenhouse at dawn", 7)
@@ -30,8 +31,8 @@ class WorkflowTests(unittest.TestCase):
     def test_dimensions_seed_and_prompt_are_validated(self) -> None:
         with self.assertRaisesRegex(WorkflowError, "unsupported aspect ratio"):
             build_workflow(self.settings, "A scene", 1, aspect_ratio="5:7")
-        with self.assertRaisesRegex(WorkflowError, "between 0.1 and 16.0"):
-            build_workflow(self.settings, "A scene", 1, megapixels=20)
+        with self.assertRaisesRegex(WorkflowError, "between 0.5 and 20.0"):
+            build_workflow(self.settings, "A scene", 1, megapixels=20.01)
         with self.assertRaisesRegex(WorkflowError, "unsigned 64-bit"):
             build_workflow(self.settings, "A scene", -1)
         with self.assertRaisesRegex(WorkflowError, "non-empty"):

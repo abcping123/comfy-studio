@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import socket
 import subprocess
+import sys
 import time
+from http.client import HTTPException
 from pathlib import Path
+from urllib.error import URLError
 from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, Request, build_opener
 
-from .settings import Settings
+from .settings import Settings, project_root
 
 
 class ServiceError(RuntimeError):
@@ -16,6 +21,10 @@ class ServiceError(RuntimeError):
 
 
 def service_command(settings: Settings, service: str) -> tuple[list[str], Path, str, int]:
+    if service == "studio":
+        config = settings.section("app")
+        return ([sys.executable, "-m", "strata_comfy_studio.app"], project_root(),
+                config["listen_host"], config["port"])
     if service == "strata":
         config = settings.section("strata")
         endpoint = urlsplit(config["endpoint"])
@@ -61,34 +70,65 @@ def _port_open(host: str, port: int) -> bool:
         return False
 
 
+def _strata_endpoint_matches(settings: Settings) -> bool:
+    config = settings.section("strata")
+    api_key = config.get("api_key")
+    if not isinstance(api_key, str) or not api_key.strip():
+        return False
+    request = Request(
+        f"{config['endpoint'].rstrip('/')}/v1/models",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with build_opener(ProxyHandler({})).open(request, timeout=1.0) as response:
+            raw = response.read(65537)
+        if len(raw) > 65536:
+            return False
+        payload = json.loads(raw)
+    except (HTTPException, OSError, URLError, ValueError):
+        return False
+    models = payload.get("data") if isinstance(payload, dict) else None
+    return isinstance(models, list) and any(
+        isinstance(model, dict) and model.get("id") == config["model"] for model in models
+    )
+
+
 def service_running(settings: Settings, service: str) -> bool:
     command, cwd, _, _ = service_command(settings, service)
     pid_file = _pid_path(settings, service)
     try:
         pid = int(pid_file.read_text(encoding="ascii").strip())
     except (OSError, ValueError):
-        return False
-    return _process_matches(pid, command, cwd)
+        pid = None
+    if pid is not None and _process_matches(pid, command, cwd):
+        return True
+    return service == "strata" and _strata_endpoint_matches(settings)
 
 
-def start_service(settings: Settings, service: str) -> tuple[int, Path]:
+def start_service(settings: Settings, service: str) -> tuple[int | None, Path]:
     command, cwd, host, port = service_command(settings, service)
     pid_file = _pid_path(settings, service)
+    log_path = pid_file.parent / "service.log"
     pid_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if pid_file.exists():
         try:
             old_pid = int(pid_file.read_text(encoding="ascii").strip())
         except ValueError as error:
+            if service == "strata" and _strata_endpoint_matches(settings):
+                return None, log_path
             raise ServiceError(f"invalid pid file; inspect before removing it: {pid_file}") from error
         if _process_matches(old_pid, command, cwd):
-            return old_pid, pid_file.parent / "service.log"
+            return old_pid, log_path
         if (Path("/proc") / str(old_pid)).exists():
+            if service == "strata" and _strata_endpoint_matches(settings):
+                return None, log_path
             raise ServiceError(f"pid file does not identify the expected {service} process: {pid_file}")
         pid_file.unlink()
     if _port_open(host, port):
+        if service == "strata" and _strata_endpoint_matches(settings):
+            return None, log_path
         raise ServiceError(f"refusing to start {service}: {host}:{port} is already in use")
 
-    log_path = pid_file.parent / "service.log"
     with log_path.open("ab") as log:
         process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -105,19 +145,27 @@ def start_service(settings: Settings, service: str) -> tuple[int, Path]:
     return process.pid, log_path
 
 
-def stop_service(settings: Settings, service: str, wait_s: float = 10.0) -> bool:
+def stop_service(settings: Settings, service: str, wait_s: float = 10.0) -> bool | None:
     command, cwd, _, _ = service_command(settings, service)
     pid_file = _pid_path(settings, service)
     if not pid_file.exists():
+        if service == "strata" and _strata_endpoint_matches(settings):
+            return None
         return False
     try:
         pid = int(pid_file.read_text(encoding="ascii").strip())
     except ValueError as error:
+        if service == "strata" and _strata_endpoint_matches(settings):
+            return None
         raise ServiceError(f"invalid pid file; leaving it untouched: {pid_file}") from error
     if not _process_matches(pid, command, cwd):
         if not Path("/proc").joinpath(str(pid)).exists():
             pid_file.unlink(missing_ok=True)
+            if service == "strata" and _strata_endpoint_matches(settings):
+                return None
             return False
+        if service == "strata" and _strata_endpoint_matches(settings):
+            return None
         raise ServiceError(f"pid file does not identify the expected {service} process; leaving it untouched")
 
     os.kill(pid, signal.SIGTERM)

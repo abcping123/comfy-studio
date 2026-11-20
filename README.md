@@ -1,35 +1,23 @@
 # Strata + MiniMax Studio
 
-A local-first browser studio that serializes Strata Qwen3.8-Flash-Next Q2_0 and ComfyUI MiniMax H3 Image on one GPU. MiniMax prompt enhancement is disabled; the API workflow uses Qwen3-VL for image conditioning and contains no Qwen3.5 prompt-enhancement branch.
+A local-first browser studio that runs Strata Qwen3.8-Flash-Next Q2_0 and ComfyUI MiniMax H3 Image on a single GPU. MiniMax prompt enhancement is disabled; the API workflow uses Qwen3-VL for image conditioning and contains no Qwen3.5 prompt-enhancement branch.
 
-The Strata prompt composer follows the local MiniMax-H3-Image T2I prompt-writing skill. Image controls mirror ComfyUI's ResolutionSelector and KSampler options: aspect ratio, megapixel target, 32-pixel alignment, sampler, scheduler, and seed. Dimensions are derived from ratio and megapixels; fixed width/height settings are not used.
-
-中文网页操作说明见 [docs/USER_GUIDE_ZH.md](docs/USER_GUIDE_ZH.md)。
+The prompt composer follows the local MiniMax-H3-Image text-to-image prompt-writing skill. Image controls mirror ComfyUI's ResolutionSelector and KSampler: aspect ratio, megapixel target, 32-pixel alignment, sampler, scheduler, and seed. Width and height are derived from the selected ratio and megapixel target.
 
 ## Setup
 
-Create the project environment and active config first. The initializer copies the API key from the configured Strata JSON file and generates the app access token. It does not read environment variables and does not print either secret.
+On first start, if `config.json` is missing, the app prompts for the Strata and ComfyUI repository paths. It expects the standard repository layouts, including each repository's `.venv` and service entry points. Model locations and other settings come from `data/config.example.json` and can be adjusted in the private `config.json` if needed.
 
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[test]'
-.venv/bin/python studio.py init
-.venv/bin/python studio.py migrate-config
-.venv/bin/python studio.py prepare
-.venv/bin/python studio.py validate
-.venv/bin/python studio.py set-vram-threshold 12000
-.venv/bin/python studio.py start comfyui
-.venv/bin/python studio.py start strata
-.venv/bin/python studio.py status
-.venv/bin/python studio.py serve
-.venv/bin/python studio.py stop strata
-.venv/bin/python studio.py stop comfyui
+.venv/bin/python main.py start
+.venv/bin/python main.py status
+.venv/bin/python main.py stop
 ```
 
-`config.json` is ignored by Git and must stay owner-only (`0600`). Edit its endpoint, path, listener and memory settings directly as needed. The ComfyUI YAML is generated from JSON because ComfyUI's CLI requires YAML; the JSON remains the source of truth.
+First start creates a private `config.json`, imports the API key from the Strata repository's configured source file, and generates the app access token. It does not print either secret or overwrite an existing config.
 
-The current active config serves the token-protected app at `http://10.178.234.58:8765`. Strata and ComfyUI use their default ports, privately on `127.0.0.1:8080` and `127.0.0.1:8188`.
+`start` validates the configured files, prepares the private Strata runtime config, then starts ComfyUI, Strata, and the Studio app. `status` reports all three services. `stop` stops them in reverse order. Open the browser at the address configured under `app` in `config.json` and enter the access token when prompted.
 
-For sign-in, read `app.access_token` from the private `config.json` and enter it in the browser's token prompt. Do not copy it into chat or share it.
-
-`start strata` starts the API with lazy model loading. Services bind only to their configured loopback endpoints; start/stop checks process identity before acting. The first MiniMax acceptance run should use the configured 4MP size. The app binds to localhost by default; LAN HTTP requires an access token and explicit `allow_insecure_lan_http` opt-in.
+Keep `config.json` and the access token private. The config file is ignored by Git and must have owner-only permissions (`0600`). The app listens on loopback by default; enabling LAN HTTP requires explicit opt-in in the local config. ComfyUI's YAML configuration is generated from JSON; JSON remains the source of truth.

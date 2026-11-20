@@ -160,8 +160,8 @@ def validate_config(data: Any) -> dict[str, Any]:
     if generation.get("default_aspect_ratio") not in aspect_options_map:
         raise ConfigError("generation.default_aspect_ratio must match a ResolutionSelector option")
     megapixels = generation.get("default_megapixels")
-    if isinstance(megapixels, bool) or not isinstance(megapixels, (int, float)) or not 0.1 <= megapixels <= 16.0:
-        raise ConfigError("generation.default_megapixels must be between 0.1 and 16.0")
+    if isinstance(megapixels, bool) or not isinstance(megapixels, (int, float)) or not 0.5 <= megapixels <= 20.0:
+        raise ConfigError("generation.default_megapixels must be between 0.5 and 20.0")
     try:
         if Decimal(str(megapixels)) * 100 % 1 != 0:
             raise ConfigError("generation.default_megapixels must use 0.01 MP increments")

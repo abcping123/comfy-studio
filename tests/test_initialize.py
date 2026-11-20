@@ -9,9 +9,7 @@ from strata_comfy_studio.initialize import (
     InitializationError,
     configure_listeners,
     initialize_config,
-    migrate_config,
     prepare_runtime_files,
-    set_vram_threshold,
 )
 from test_settings import sample_config
 from strata_comfy_studio.settings import load_config
@@ -52,20 +50,75 @@ class InitializeTests(unittest.TestCase):
             with self.assertRaisesRegex(InitializationError, "refusing to overwrite"):
                 initialize_config(template_path, destination)
 
-    def test_vram_threshold_updates_only_json_and_keeps_private_mode(self) -> None:
+    def test_initialization_derives_paths_from_repository_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            data = sample_config()
-            data["strata"]["api_key"] = "private-test-key"
-            config_path = root / "config.json"
-            config_path.write_text(json.dumps(data), encoding="utf-8")
+            strata_repo = root / "Strata"
+            comfyui_repo = root / "ComfyUI"
+            for path in (strata_repo / ".venv/bin/python", comfyui_repo / ".venv/bin/python"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("python", encoding="utf-8")
+                path.chmod(0o755)
+            strata_server = strata_repo / "serve/server.py"
+            strata_server.parent.mkdir(parents=True)
+            strata_server.write_text("", encoding="utf-8")
+            (comfyui_repo / "main.py").write_text("", encoding="utf-8")
+            (strata_repo / "strata-q2_0.json").write_text(
+                json.dumps({"api_key": "private-test-key"}), encoding="utf-8",
+            )
 
-            set_vram_threshold(12000, config_path)
+            template = sample_config()
+            template["strata"]["source_config_json"] = "/old/path/strata-q2_0.json"
+            template["strata"]["api_key"] = ""
+            template_path = root / "config.example.json"
+            template_path.write_text(json.dumps(template), encoding="utf-8")
+            destination = root / "config.json"
 
-            updated = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual(updated["strata"]["min_free_vram_mib"], 12000)
-            self.assertEqual(updated["strata"]["api_key"], "private-test-key")
-            self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+            initialize_config(template_path, destination, strata_repo, comfyui_repo)
+
+            active = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(active["strata"]["python"], str(strata_repo / ".venv/bin/python"))
+            self.assertEqual(active["strata"]["server_script"], str(strata_server))
+            self.assertEqual(active["strata"]["source_config_json"],
+                             str(strata_repo / "strata-q2_0.json"))
+            self.assertEqual(active["strata"]["api_key"], "private-test-key")
+            self.assertEqual(active["comfyui"]["python"], str(comfyui_repo / ".venv/bin/python"))
+            self.assertEqual(active["comfyui"]["main_script"], str(comfyui_repo / "main.py"))
+            self.assertEqual(active["comfyui"]["working_directory"], str(comfyui_repo))
+            self.assertEqual(active["comfyui"]["output_directory"], str(comfyui_repo / "output"))
+
+    def test_initialization_derives_paths_from_terminal_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            strata_repo = root / "Strata"
+            terminal_root = strata_repo / "terminal"
+            comfyui_repo = root / "ComfyUI"
+            for path in (terminal_root / ".venv/bin/python", comfyui_repo / ".venv/bin/python"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("python", encoding="utf-8")
+                path.chmod(0o755)
+            strata_server = terminal_root / "serve/server.py"
+            strata_server.parent.mkdir(parents=True)
+            strata_server.write_text("", encoding="utf-8")
+            (terminal_root / "strata-q2_0.json").write_text(
+                json.dumps({"api_key": "private-test-key"}), encoding="utf-8",
+            )
+            (comfyui_repo / "main.py").write_text("", encoding="utf-8")
+
+            template = sample_config()
+            template["strata"]["source_config_json"] = "/old/path/strata-q2_0.json"
+            template["strata"]["api_key"] = ""
+            template_path = root / "config.example.json"
+            template_path.write_text(json.dumps(template), encoding="utf-8")
+            destination = root / "config.json"
+
+            initialize_config(template_path, destination, strata_repo, comfyui_repo)
+
+            active = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(active["strata"]["python"], str(terminal_root / ".venv/bin/python"))
+            self.assertEqual(active["strata"]["server_script"], str(strata_server))
+            self.assertEqual(active["strata"]["source_config_json"],
+                             str(terminal_root / "strata-q2_0.json"))
 
     def test_listener_config_keeps_model_backends_private_and_preserves_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -111,45 +164,6 @@ class InitializeTests(unittest.TestCase):
             self.assertEqual(updated["comfyui"]["endpoint"], "http://127.0.0.1:8188")
             self.assertEqual(updated["strata"]["api_key"], "private-api-key")
             self.assertEqual(updated["app"]["access_token"], "private-app-token")
-
-    def test_config_migration_adds_defaults_and_preserves_existing_secrets(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            current = sample_config()
-            current.pop("coordination")
-            current["generation"]["prompt_skill_version"] = 2
-            current["generation"].pop("system_prompt_file")
-            current["generation"]["system_prompt"] = "Old prompt rules"
-            current["generation"].update({"default_width": 2048, "default_height": 2048,
-                                          "sampler_name": "euler", "scheduler": "simple"})
-            current["strata"]["api_key"] = "keep-this-secret"
-            current["app"]["access_token"] = "keep-this-token"
-            config_path = root / "config.json"
-            config_path.write_text(json.dumps(current), encoding="utf-8")
-            template = sample_config()
-            template["coordination"] = {
-                "handoff_timeout_s": 120,
-                "generation_timeout_s": 1800,
-                "poll_interval_s": 1.0,
-            }
-            template["generation"]["prompt_skill_version"] = 3
-            template["generation"]["system_prompt_file"] = "data/strata/minimax_h3_image_t2i.txt"
-            template_path = root / "config.example.json"
-            template_path.write_text(json.dumps(template), encoding="utf-8")
-
-            migrated_path, added = migrate_config(template_path, config_path)
-
-            migrated = json.loads(migrated_path.read_text(encoding="utf-8"))
-            self.assertIn("coordination", added)
-            self.assertEqual(migrated["strata"]["api_key"], "keep-this-secret")
-            self.assertEqual(migrated["app"]["access_token"], "keep-this-token")
-            self.assertEqual(migrated["generation"]["system_prompt_file"],
-                             "data/strata/minimax_h3_image_t2i.txt")
-            self.assertNotIn("system_prompt", migrated["generation"])
-            self.assertEqual(migrated["generation"]["prompt_skill_version"], 3)
-            self.assertNotIn("default_width", migrated["generation"])
-            self.assertNotIn("default_height", migrated["generation"])
-            self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
 
     def test_runtime_files_are_derived_from_json_and_exclude_qwen35(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

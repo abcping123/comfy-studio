@@ -10,14 +10,13 @@ from typing import Any
 from .initialize import (
     InitializationError,
     initialize_config,
-    configure_listeners,
-    migrate_config,
     prepare_runtime_files,
-    set_vram_threshold,
 )
 from .settings import ConfigError, Settings, default_config_path, load_config
 from .services import ServiceError, service_running, start_service, stop_service
 from .workflow import WorkflowError, build_workflow
+
+MANAGED_SERVICES = ("comfyui", "strata", "studio")
 
 
 def _check_private_config(path: Path) -> None:
@@ -44,7 +43,7 @@ def validate_artifacts(settings: Settings) -> None:
     strata = settings.section("strata")
     comfy = settings.section("comfyui")
     if not strata["api_key"].strip():
-        raise ConfigError("strata.api_key is empty; run `python3 studio.py init` or edit config.json")
+        raise ConfigError("strata.api_key is empty; set it in config.json")
     if not settings.section("app")["access_token"].strip():
         raise ConfigError("app.access_token is empty; set it in config.json")
 
@@ -76,89 +75,80 @@ def validate_artifacts(settings: Settings) -> None:
         raise ConfigError("MiniMax API workflow must not include Qwen3.5 prompt enhancement")
 
 
-def _load_active_config() -> tuple[Path, Settings]:
+def _prompt_repository_path(label: str) -> Path:
+    try:
+        value = input(f"{label} repository path: ").strip()
+    except EOFError as error:
+        raise InitializationError("first startup requires both repository paths") from error
+    if not value:
+        raise InitializationError(f"{label} repository path is required for first startup")
+    return Path(value).expanduser()
+
+
+def _load_active_config(initialize_if_missing: bool = False) -> tuple[Path, Settings]:
     path = default_config_path()
+    if initialize_if_missing and not path.exists():
+        print("No config.json found. Enter the local repository paths to configure the studio.")
+        strata_repo = _prompt_repository_path("Strata")
+        comfyui_repo = _prompt_repository_path("ComfyUI")
+        initialize_config(
+            output_path=path,
+            strata_repo_path=strata_repo,
+            comfyui_repo_path=comfyui_repo,
+        )
+        print("Created private config.json.")
     settings = load_config(path)
     _check_private_config(path)
     return path, settings
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="studio", description="Configure and validate the local image studio")
+    parser = argparse.ArgumentParser(prog="studio", description="Manage the local studio services")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("init", help="create private config.json and import the Strata API key")
-    subparsers.add_parser("prepare", help="generate private Strata runtime config")
-    subparsers.add_parser("validate", help="validate config, model files, workflow and runtime paths")
-    start = subparsers.add_parser("start", help="start one project-managed local model service")
-    start.add_argument("service", choices=("strata", "comfyui"))
-    stop = subparsers.add_parser("stop", help="stop one verified project-managed local model service")
-    stop.add_argument("service", choices=("strata", "comfyui"))
-    status = subparsers.add_parser("status", help="show whether each project-managed service is running")
-    status.add_argument("service", choices=("strata", "comfyui", "all"), default="all", nargs="?")
-    threshold = subparsers.add_parser("set-vram-threshold", help="set Strata's minimum free VRAM in JSON config")
-    threshold.add_argument("mib", type=int)
-    listeners = subparsers.add_parser("set-listeners", help="configure the LAN app listener and private Strata port")
-    listeners.add_argument("--app-host", required=True)
-    listeners.add_argument("--app-port", type=int, required=True)
-    listeners.add_argument("--strata-port", type=int, required=True)
-    listeners.add_argument("--allow-insecure-lan-http", action="store_true")
-    listeners.add_argument("--comfy-port", type=int)
-    subparsers.add_parser("migrate-config", help="add new example defaults without overwriting private settings")
-    subparsers.add_parser("serve", help="run the authenticated browser application")
+    subparsers.add_parser("start", help="start all project-managed services")
+    subparsers.add_parser("status", help="show status for all project-managed services")
+    subparsers.add_parser("stop", help="stop all verified project-managed services")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command == "init":
-            path = initialize_config()
-            print(f"Created private configuration: {path}")
-            print("The Strata API key and app token were stored without displaying their values.")
-            return 0
-        if args.command == "set-vram-threshold":
-            path = set_vram_threshold(args.mib)
-            print(f"Updated strata.min_free_vram_mib in {path}")
-            return 0
-        if args.command == "set-listeners":
-            path = configure_listeners(args.app_host, args.app_port, args.strata_port,
-                                       args.allow_insecure_lan_http, comfy_port=args.comfy_port)
-            print(f"Updated app and Strata listeners in {path}")
-            return 0
-        if args.command == "migrate-config":
-            path, added = migrate_config()
-            print(f"Updated configuration: {path}")
-            print(f"Added {len(added)} missing default field(s); existing values and secrets were preserved.")
-            return 0
-        if args.command == "serve":
-            from .app import run
-            run()
-            return 0
-        config_path, settings = _load_active_config()
-        if args.command == "prepare":
-            validate_artifacts(settings)
-            runtime_path = prepare_runtime_files(settings)
-            print(f"Prepared private Strata config: {runtime_path}")
-            return 0
+        config_path, settings = _load_active_config(initialize_if_missing=args.command == "start")
         if args.command == "start":
             validate_artifacts(settings)
             prepare_runtime_files(settings)
-            pid, log_path = start_service(settings, args.service)
-            print(f"Started {args.service} with PID {pid}; log: {log_path}")
-            return 0
+            failed = False
+            for service in MANAGED_SERVICES:
+                try:
+                    pid, log_path = start_service(settings, service)
+                except (ServiceError, OSError) as error:
+                    print(f"studio: failed to start {service}: {error}", file=sys.stderr)
+                    failed = True
+                    continue
+                if pid is None:
+                    print(f"Using existing {service} service; it is not managed by Studio")
+                else:
+                    print(f"Started {service} with PID {pid}; log: {log_path}")
+            return 2 if failed else 0
         if args.command == "stop":
-            stopped = stop_service(settings, args.service)
-            print(f"Stopped {args.service}" if stopped else f"{args.service} was not running")
-            return 0
+            failed = False
+            for service in reversed(MANAGED_SERVICES):
+                try:
+                    stopped = stop_service(settings, service)
+                except (ServiceError, OSError) as error:
+                    print(f"studio: failed to stop {service}: {error}", file=sys.stderr)
+                    failed = True
+                    continue
+                if stopped is None:
+                    print(f"{service} is running outside Studio; left untouched")
+                else:
+                    print(f"Stopped {service}" if stopped else f"{service} was not running")
+            return 2 if failed else 0
         if args.command == "status":
-            services = ("strata", "comfyui") if args.service == "all" else (args.service,)
-            for service in services:
+            for service in MANAGED_SERVICES:
                 print(f"{service}: {'running' if service_running(settings, service) else 'stopped'}")
             return 0
-        validate_artifacts(settings)
-        print(f"Configuration and model files are valid: {config_path}")
-        print("No services were started and no credentials were displayed.")
-        return 0
     except (ConfigError, InitializationError, ServiceError, WorkflowError, OSError) as error:
         print(f"studio: {error}", file=sys.stderr)
         return 2

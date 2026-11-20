@@ -140,7 +140,7 @@ class FakeComfy:
 
 class OrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
-        data = copy.deepcopy(load_config(project_root() / "config.example.json").data)
+        data = copy.deepcopy(load_config(project_root() / "data" / "config.example.json").data)
         data["strata"]["min_free_vram_mib"] = 12000
         self.temp = tempfile.TemporaryDirectory()
         data["paths"]["strata_sessions"] = str(Path(self.temp.name) / "sessions")
@@ -229,6 +229,23 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(self.comfy.client_id)
         self.assertEqual(self.comfy.client_id, self.comfy.websocket_client_id)
         self.assertTrue(self.comfy.progress_socket.closed)
+
+    def test_generation_keeps_comfy_models_until_strata_handoff(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+
+        result = self.orchestrator.generate(conversation_id, "A red teapot", 42)
+
+        self.assertEqual(result.image["filename"], "generated.png")
+        self.assertEqual(self.comfy.calls.count("free"), 1)
+        self.assertIsNone(result.cleanup_warning)
+
+        self.orchestrator.generate(conversation_id, "A blue vase", 43)
+
+        self.assertEqual(self.comfy.calls.count("free"), 1)
+
+        self.orchestrator.chat(conversation_id, "Adjust the lighting")
+
+        self.assertEqual(self.comfy.calls.count("free"), 2)
 
     def test_generation_falls_back_when_progress_socket_is_unavailable(self) -> None:
         conversation_id = self.store.create_conversation()["id"]

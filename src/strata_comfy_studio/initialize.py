@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import copy
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -52,30 +51,58 @@ def _replace_private_json(path: Path, data: dict[str, Any]) -> None:
     os.chmod(path, 0o600)
 
 
-def _merge_missing(defaults: Any, current: Any, prefix: str = "") -> tuple[Any, list[str]]:
-    if not isinstance(defaults, dict) or not isinstance(current, dict):
-        return current, []
-    merged = dict(current)
-    added: list[str] = []
-    for key, default_value in defaults.items():
-        location = f"{prefix}.{key}" if prefix else key
-        if key not in merged:
-            merged[key] = copy.deepcopy(default_value)
-            added.append(location)
-        elif isinstance(default_value, dict) and isinstance(merged[key], dict):
-            merged[key], nested = _merge_missing(default_value, merged[key], location)
-            added.extend(nested)
-    return merged, added
-
-
-def initialize_config(template_path: Path | None = None, output_path: Path | None = None) -> Path:
-    template = (template_path or project_root() / "config.example.json").resolve()
+def initialize_config(template_path: Path | None = None, output_path: Path | None = None,
+                      strata_repo_path: Path | None = None,
+                      comfyui_repo_path: Path | None = None) -> Path:
+    template = (template_path or project_root() / "data" / "config.example.json").resolve()
     destination = (output_path or default_config_path()).resolve()
     data = _read_json(template)
     source_value = data.get("strata", {}).get("source_config_json")
     if not isinstance(source_value, str) or not source_value.strip():
         raise InitializationError("strata.source_config_json must point to the existing Strata JSON config")
-    source_path = Path(source_value)
+    if (strata_repo_path is None) != (comfyui_repo_path is None):
+        raise InitializationError("both Strata and ComfyUI repository paths are required")
+    if strata_repo_path is not None and comfyui_repo_path is not None:
+        strata_repo = strata_repo_path.expanduser().resolve()
+        comfyui_repo = comfyui_repo_path.expanduser().resolve()
+        for repository, label in ((strata_repo, "Strata"), (comfyui_repo, "ComfyUI")):
+            if not repository.is_dir():
+                raise InitializationError(f"{label} repository does not exist: {repository}")
+
+            terminal_root = strata_repo / "terminal"
+            strata_root = terminal_root if (terminal_root / "serve/server.py").is_file() else strata_repo
+            strata_python = strata_root / ".venv/bin/python"
+            strata_server = strata_root / "serve/server.py"
+            source_path = strata_root / Path(source_value).name
+        comfy_python = comfyui_repo / ".venv/bin/python"
+        comfy_main = comfyui_repo / "main.py"
+        required_files = (
+            (strata_python, "Strata Python"),
+            (strata_server, "Strata server script"),
+            (source_path, "Strata source config"),
+            (comfy_python, "ComfyUI Python"),
+            (comfy_main, "ComfyUI main script"),
+        )
+        for path, label in required_files:
+            if not path.is_file():
+                raise InitializationError(f"{label} does not exist: {path}")
+        if not os.access(strata_python, os.X_OK) or not os.access(comfy_python, os.X_OK):
+            raise InitializationError("repository Python interpreters must be executable")
+
+        data["strata"].update({
+            "python": str(strata_python),
+            "server_script": str(strata_server),
+            "source_config_json": str(source_path),
+        })
+        data["comfyui"].update({
+            "python": str(comfy_python),
+            "main_script": str(comfy_main),
+            "working_directory": str(comfyui_repo),
+            "output_directory": str(comfyui_repo / "output"),
+        })
+
+    configured_source = data["strata"]["source_config_json"]
+    source_path = Path(configured_source)
     if not source_path.is_absolute():
         source_path = template.parent / source_path
     source = _read_json(source_path)
@@ -91,20 +118,6 @@ def initialize_config(template_path: Path | None = None, output_path: Path | Non
     except ConfigError as error:
         raise InitializationError(str(error)) from error
     _write_private_json(destination, data)
-    return destination
-
-
-def set_vram_threshold(mib: int, config_path: Path | None = None) -> Path:
-    if isinstance(mib, bool) or not isinstance(mib, int) or mib < 0:
-        raise InitializationError("VRAM threshold must be a non-negative integer number of MiB")
-    destination = (config_path or default_config_path()).resolve()
-    data = _read_json(destination)
-    data.setdefault("strata", {})["min_free_vram_mib"] = mib
-    try:
-        validate_config(data)
-    except ConfigError as error:
-        raise InitializationError(str(error)) from error
-    _replace_private_json(destination, data)
     return destination
 
 
@@ -132,37 +145,6 @@ def configure_listeners(app_host: str, app_port: int, strata_port: int,
         raise InitializationError(str(error)) from error
     _replace_private_json(destination, data)
     return destination
-
-
-def migrate_config(template_path: Path | None = None, config_path: Path | None = None) -> tuple[Path, list[str]]:
-    template = (template_path or project_root() / "config.example.json").resolve()
-    destination = (config_path or default_config_path()).resolve()
-    current = _read_json(destination)
-    defaults = _read_json(template)
-    current_generation = current.get("generation", {})
-    default_generation = defaults.get("generation", {})
-    current_prompt_version = current_generation.get("prompt_skill_version", 0) if isinstance(current_generation, dict) else 0
-    default_prompt_version = default_generation.get("prompt_skill_version", 0) if isinstance(default_generation, dict) else 0
-    merged, added = _merge_missing(defaults, current)
-    for obsolete in ("default_width", "default_height", "sampler_name", "scheduler"):
-        if obsolete in merged.get("generation", {}):
-            merged["generation"].pop(obsolete)
-            added.append(f"generation.{obsolete} (obsolete)")
-    if "system_prompt" in merged.get("generation", {}):
-        merged["generation"].pop("system_prompt")
-        added.append("generation.system_prompt (moved to file)")
-    if isinstance(default_prompt_version, int) and isinstance(current_prompt_version, int) \
-            and default_prompt_version > current_prompt_version:
-        merged["generation"]["system_prompt_file"] = default_generation["system_prompt_file"]
-        merged["generation"]["prompt_skill_version"] = default_prompt_version
-        added.append("generation.system_prompt_file (prompt skill update)")
-    try:
-        validate_config(merged)
-    except ConfigError as error:
-        raise InitializationError(str(error)) from error
-    if added:
-        _replace_private_json(destination, merged)
-    return destination, added
 
 
 def _validate_single_slot_source(source: dict[str, Any], source_path: Path) -> None:

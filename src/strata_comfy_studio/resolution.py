@@ -52,8 +52,8 @@ def calculate_resolution(aspect_ratio: str, megapixels: float, multiple: int = 3
     ratios = aspect_ratio_map(aspect_ratios)
     if aspect_ratio not in ratios:
         raise ValueError(f"unsupported aspect ratio: {aspect_ratio}")
-    if isinstance(megapixels, bool) or not isinstance(megapixels, (int, float)) or not 0.1 <= megapixels <= 16.0:
-        raise ValueError("megapixels must be between 0.1 and 16.0")
+    if isinstance(megapixels, bool) or not isinstance(megapixels, (int, float)) or not 0.5 <= megapixels <= 20.0:
+        raise ValueError("megapixels must be between 0.5 and 20.0")
     if isinstance(multiple, bool) or not isinstance(multiple, int) or not 8 <= multiple <= 128 or (multiple - 8) % 4:
         raise ValueError("multiple must be 8..128 in steps of 4")
 

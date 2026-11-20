@@ -14,9 +14,9 @@
   },
   "strata": {
     "endpoint": "http://127.0.0.1:8080",
-    "python": "/home/pic1wx/repos/Strata/.venv/bin/python",
-    "server_script": "/home/pic1wx/repos/Strata/serve/server.py",
-    "source_config_json": "/home/pic1wx/repos/Strata/strata-q2_0.json",
+    "python": "/home/pic1wx/repos/Strata/terminal/.venv/bin/python",
+    "server_script": "/home/pic1wx/repos/Strata/terminal/serve/server.py",
+    "source_config_json": "/home/pic1wx/repos/Strata/terminal/strata-q2_0.json",
     "api_key": "",
     "model": "qwen3.8-flash-next-q2_0",
     "min_free_vram_mib": null,

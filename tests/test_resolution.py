@@ -9,7 +9,7 @@ from strata_comfy_studio.settings import load_config, project_root
 class ResolutionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.generation = load_config(project_root() / "config.example.json").data["generation"]
+        cls.generation = load_config(project_root() / "data" / "config.example.json").data["generation"]
 
     def test_comfy_square_four_megapixels_matches_2048(self) -> None:
         self.assertEqual(calculate_resolution("1:1 (Square)", 4.0, 32,
@@ -18,6 +18,17 @@ class ResolutionTests(unittest.TestCase):
     def test_comfy_standard_landscape_matches_rounded_multiple(self) -> None:
         self.assertEqual(calculate_resolution("4:3 (Standard)", 4.0, 32,
                                               self.generation["aspect_ratios"]), (2368, 1760))
+
+    def test_megapixel_target_supports_half_to_twenty_mp(self) -> None:
+        self.assertEqual(calculate_resolution("1:1 (Square)", 0.5, 32,
+                                              self.generation["aspect_ratios"]), (736, 736))
+        self.assertEqual(calculate_resolution("1:1 (Square)", 20.0, 32,
+                                              self.generation["aspect_ratios"]), (4576, 4576))
+        for megapixels in (0.49, 20.01):
+            with self.subTest(megapixels=megapixels):
+                with self.assertRaisesRegex(ValueError, "between 0.5 and 20.0"):
+                    calculate_resolution("1:1 (Square)", megapixels, 32,
+                                         self.generation["aspect_ratios"])
 
     def test_every_ratio_is_aligned_to_configured_multiple(self) -> None:
         multiple = self.generation["resolution_multiple"]

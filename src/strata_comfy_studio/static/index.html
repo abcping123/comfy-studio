@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Strata + MiniMax Studio</title>
-  <link rel="stylesheet" href="/assets/app.css">
-  <script src="/assets/app.js" defer></script>
+  <link rel="stylesheet" href="/assets/app.css?v=3">
+  <script src="/assets/app.js?v=3" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -30,7 +30,6 @@
       <div class="sidebar-section-title">Recent</div>
       <nav id="conversation-list" class="conversation-list" aria-label="Recent conversations"></nav>
       <div class="sidebar-foot" aria-label="System utilization">
-        <div class="system-status-heading"><span>System status</span><span id="system-status-label">Waiting</span></div>
         <div class="system-metric">
           <div class="system-metric-heading"><span>CPU</span><strong id="system-cpu-value">--</strong></div>
           <div id="system-cpu-meter" class="system-meter is-cpu" role="meter" aria-label="CPU utilization" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Unavailable"><span></span></div>
@@ -83,17 +82,20 @@
 
       <div class="settings-block">
         <div class="settings-title">Resolution</div>
-        <div class="selector-grid">
+        <div class="resolution-grid">
           <label class="field-control ratio-control" for="image-aspect-ratio">Aspect ratio
             <select id="image-aspect-ratio" disabled></select>
           </label>
           <label class="field-control" for="image-megapixels">Pixels (MP)
-            <input id="image-megapixels" type="number" min="0.1" max="16" step="0.01" value="4.00">
+            <input id="image-megapixels" type="number" min="0.5" max="20" step="0.01" value="4.00">
           </label>
-        </div>
-        <div class="resolution-preview" aria-live="polite">
-          <span id="resolution-value">2048 x 2048 px</span>
-          <span id="resolution-details">4.00 MP target / 32 px aligned</span>
+          <div class="field-control output-control">
+            <span>Output size</span>
+            <div class="resolution-preview" aria-live="polite">
+              <span id="resolution-value">2048 x 2048 px</span>
+              <span id="resolution-details">4.00 MP target / 32 px aligned</span>
+            </div>
+          </div>
         </div>
         <div class="selector-grid sampling-grid">
           <label class="field-control" for="image-sampler">Sampler
@@ -102,11 +104,13 @@
           <label class="field-control" for="image-scheduler">Scheduler
             <select id="image-scheduler" disabled></select>
           </label>
-        </div>
-        <div class="seed-row">
-          <label for="image-seed">Seed</label>
-          <input id="image-seed" type="number" min="0" max="4294967295" value="42">
-          <button id="random-seed" class="icon-button" type="button" title="Randomize seed" aria-label="Randomize seed">&#8635;</button>
+          <div class="seed-control">
+            <label for="image-seed">Seed</label>
+            <div class="seed-row">
+              <input id="image-seed" type="number" min="0" max="18446744073709551615" step="1" value="42" required>
+              <button id="random-seed" class="icon-button" type="button" title="Randomize seed" aria-label="Randomize seed">&#8635;</button>
+            </div>
+          </div>
         </div>
         <button id="generate-image" class="generate-button" type="button" disabled>
           <span id="generate-image-label" class="generate-button-label" aria-live="polite">Generate image</span>

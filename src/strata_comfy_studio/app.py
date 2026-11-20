@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-from queue import Queue
 import stat
 import threading
 import uuid
@@ -35,7 +34,7 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20000)
     seed: int = Field(ge=0, le=2**64 - 1)
     aspect_ratio: str | None = None
-    megapixels: float | None = Field(default=None, ge=0.1, le=16.0, multiple_of=0.01)
+    megapixels: float | None = Field(default=None, ge=0.5, le=20.0, multiple_of=0.01)
     sampler_name: str | None = None
     scheduler: str | None = None
 
@@ -174,6 +173,98 @@ class ChatRunManager:
             return self._runs.get(run_id)
 
 
+class GenerationRun:
+    def __init__(self, conversation_id: str):
+        self.id = uuid.uuid4().hex
+        self.conversation_id = conversation_id
+        self._events: list[dict[str, Any]] = []
+        self._condition = threading.Condition()
+        self._complete = False
+
+    @property
+    def complete(self) -> bool:
+        with self._condition:
+            return self._complete
+
+    def publish(self, event: dict[str, Any]) -> None:
+        with self._condition:
+            if self._complete:
+                return
+            self._events.append(event)
+            self._condition.notify_all()
+
+    def finish(self, event: dict[str, Any]) -> None:
+        with self._condition:
+            if self._complete:
+                return
+            self._events.append(event)
+            self._complete = True
+            self._condition.notify_all()
+
+    def public_info(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "id": self.id,
+                "conversation_id": self.conversation_id,
+                "sequence": len(self._events),
+                "latest_event": self._events[-1] if self._events else None,
+            }
+
+    def stream(self, after_sequence: int = 0) -> Iterator[str]:
+        index = max(0, after_sequence)
+        while True:
+            with self._condition:
+                if index < len(self._events):
+                    event = self._events[index]
+                    index += 1
+                elif self._complete:
+                    return
+                else:
+                    notified = self._condition.wait(timeout=15)
+                    if notified:
+                        continue
+                    event = None
+            if event is None:
+                yield ": keep-alive\n\n"
+                continue
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if event.get("type") in {"done", "error"}:
+                return
+
+
+class GenerationRunManager:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active: GenerationRun | None = None
+        self._runs: dict[str, GenerationRun] = {}
+
+    def start(self, conversation_id: str) -> GenerationRun:
+        with self._lock:
+            if self._active is not None and not self._active.complete:
+                raise CoordinationError("another model operation is already in progress")
+            run = GenerationRun(conversation_id)
+            self._active = run
+            self._runs[run.id] = run
+            return run
+
+    def finish(self, run: GenerationRun, event: dict[str, Any]) -> None:
+        run.finish(event)
+        with self._lock:
+            if self._active is run:
+                self._active = None
+            completed = [run_id for run_id, item in self._runs.items() if item.complete]
+            for run_id in completed[:-8]:
+                del self._runs[run_id]
+
+    def active(self) -> GenerationRun | None:
+        with self._lock:
+            return self._active if self._active and not self._active.complete else None
+
+    def get(self, run_id: str) -> GenerationRun | None:
+        with self._lock:
+            return self._runs.get(run_id)
+
+
 def create_app(settings: Settings | None = None, store: ConversationStore | None = None,
                strata: StrataClient | None = None, comfy: ComfyUIClient | None = None) -> FastAPI:
     settings = settings or load_config()
@@ -182,6 +273,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
     comfy = comfy or ComfyUIClient(settings)
     orchestrator = Orchestrator(settings, store, strata, comfy)
     chat_runs = ChatRunManager()
+    generation_runs = GenerationRunManager()
     resource_monitor = SystemMetrics(settings.section("comfyui")["gpu_id"])
     static_dir = Path(__file__).resolve().parent / "static"
 
@@ -194,6 +286,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
     app.state.comfy = comfy
     app.state.orchestrator = orchestrator
     app.state.chat_runs = chat_runs
+    app.state.generation_runs = generation_runs
     app.state.resource_monitor = resource_monitor
 
     def authenticated(request: Request) -> None:
@@ -234,11 +327,13 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         except (BackendError, TypeError, KeyError) as error:
             comfy_status = {"available": False, "error": str(error)}
         active_chat = chat_runs.active()
+        active_generation = generation_runs.active()
         return {
             "services": {"strata": strata_status, "comfyui": comfy_status},
             "active_conversation_id": store.selected_conversation_id(),
             "conversations": store.list_conversations(),
             "active_chat": active_chat.public_info() if active_chat else None,
+            "active_generation": active_generation.public_info() if active_generation else None,
         }
 
     @app.get("/api/system-metrics", dependencies=[Depends(authenticated)])
@@ -251,7 +346,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         return {
             "aspect_ratios": generation["aspect_ratios"],
             "default_aspect_ratio": generation["default_aspect_ratio"],
-            "megapixels": {"min": 0.1, "max": 16.0, "step": 0.01,
+            "megapixels": {"min": 0.5, "max": 20.0, "step": 0.01,
                            "default": generation["default_megapixels"]},
             "resolution_multiple": generation["resolution_multiple"],
             "samplers": generation["sampler_options"],
@@ -350,6 +445,17 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/api/generate/runs/{run_id}/stream", dependencies=[Depends(authenticated)])
+    async def resume_generation_stream(run_id: str, after: int = 0) -> StreamingResponse:
+        run = generation_runs.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Generation run not found")
+        return StreamingResponse(
+            run.stream(after),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.post("/api/generate", dependencies=[Depends(authenticated)])
     async def generate(body: GenerateRequest) -> dict[str, Any]:
         try:
@@ -367,43 +473,41 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
 
     @app.post("/api/generate/stream", dependencies=[Depends(authenticated)])
     async def generate_stream(body: GenerateRequest) -> StreamingResponse:
-        def events() -> Any:
-            event_queue: Queue[dict[str, Any] | None] = Queue()
+        try:
+            run = generation_runs.start(body.conversation_id)
+        except CoordinationError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
-            def run_generation() -> None:
-                try:
-                    result = orchestrator.generate(
-                        body.conversation_id, body.prompt, body.seed,
-                        body.aspect_ratio, body.megapixels,
-                        body.sampler_name, body.scheduler,
-                        progress_callback=event_queue.put,
-                    )
-                    event_queue.put({
-                        "type": "done",
-                        "generation_id": result.generation_id,
-                        "prompt_id": result.prompt_id,
-                        "image": result.image,
-                        "cleanup_warning": result.cleanup_warning,
-                    })
-                except (BackendError, CoordinationError, StorageError) as error:
-                    event_queue.put({"type": "error", "message": str(error)})
-                except Exception:
-                    logging.exception("Unexpected streamed image generation failure")
-                    event_queue.put({"type": "error", "message": "Image generation failed unexpectedly."})
-                finally:
-                    event_queue.put(None)
+        def run_generation() -> None:
+            try:
+                result = orchestrator.generate(
+                    body.conversation_id, body.prompt, body.seed,
+                    body.aspect_ratio, body.megapixels,
+                    body.sampler_name, body.scheduler,
+                    progress_callback=run.publish,
+                )
+                generation_runs.finish(run, {
+                    "type": "done",
+                    "generation_id": result.generation_id,
+                    "prompt_id": result.prompt_id,
+                    "image": result.image,
+                    "cleanup_warning": result.cleanup_warning,
+                })
+            except (BackendError, CoordinationError, StorageError) as error:
+                generation_runs.finish(run, {"type": "error", "message": str(error)})
+            except Exception:
+                logging.exception("Unexpected streamed image generation failure")
+                generation_runs.finish(run, {
+                    "type": "error", "message": "Image generation failed unexpectedly.",
+                })
 
-            threading.Thread(target=run_generation, name="studio-generation", daemon=True).start()
-            while True:
-                event = event_queue.get()
-                if event is None:
-                    return
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        threading.Thread(target=run_generation, name="studio-generation", daemon=True).start()
 
         return StreamingResponse(
-            events(),
+            run.stream(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                     "X-Generation-Run-Id": run.id},
         )
 
     @app.get("/api/generations/{generation_id}/image", dependencies=[Depends(authenticated)])

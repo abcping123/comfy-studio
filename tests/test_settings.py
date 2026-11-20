@@ -82,6 +82,20 @@ class SettingsTests(unittest.TestCase):
     def test_valid_local_config(self) -> None:
         self.assertEqual(validate_config(sample_config())["schema_version"], 1)
 
+    def test_default_megapixels_must_be_between_half_and_twenty(self) -> None:
+        data = sample_config()
+        data["generation"]["default_megapixels"] = 0.5
+        self.assertEqual(validate_config(data)["generation"]["default_megapixels"], 0.5)
+        data = sample_config()
+        data["generation"]["default_megapixels"] = 20.0
+        self.assertEqual(validate_config(data)["generation"]["default_megapixels"], 20.0)
+        for megapixels in (0.49, 20.01):
+            data = sample_config()
+            data["generation"]["default_megapixels"] = megapixels
+            with self.subTest(megapixels=megapixels):
+                with self.assertRaisesRegex(ConfigError, "between 0.5 and 20.0"):
+                    validate_config(data)
+
     def test_relative_paths_resolve_from_config_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
