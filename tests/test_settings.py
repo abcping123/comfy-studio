@@ -31,7 +31,6 @@ def sample_config() -> dict:
             "source_config_json": "/srv/strata/config.json",
             "api_key": "test-api-key",
             "model": "qwen-q2",
-            "min_free_vram_mib": None,
             "idle_unload_s": 600,
             "request_timeout_s": 900,
         },
@@ -74,7 +73,6 @@ def sample_config() -> dict:
             "default_scheduler": "simple",
         },
         "coordination": {
-            "handoff_timeout_s": 120,
             "generation_timeout_s": 1800,
             "poll_interval_s": 1.0,
         },

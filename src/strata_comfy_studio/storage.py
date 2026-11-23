@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import os
+from contextlib import contextmanager
 import re
 import secrets
 import sqlite3
 import threading
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .permissions import set_private_permissions
 
 
 _CONVERSATION_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -31,13 +34,25 @@ class ConversationStore:
         self.path = path
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        set_private_permissions(self.path.parent, directory=True)
+        try:
+            with self.path.open("xb"):
+                pass
+        except FileExistsError:
+            pass
+        set_private_permissions(self.path)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _initialize(self) -> None:
         with self._lock, self._connect() as connection:
@@ -139,7 +154,7 @@ class ConversationStore:
             ):
                 if name not in generation_columns:
                     connection.execute(f"ALTER TABLE generations ADD COLUMN {name} {declaration}")
-        os.chmod(self.path, 0o600)
+        set_private_permissions(self.path)
 
     @staticmethod
     def validate_id(conversation_id: str) -> str:

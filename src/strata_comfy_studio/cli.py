@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,6 +11,7 @@ from .initialize import (
     initialize_config,
     prepare_runtime_files,
 )
+from .permissions import set_private_permissions
 from .settings import ConfigError, Settings, default_config_path, load_config
 from .services import ServiceError, preflight_service_start, service_running, start_service, stop_service
 from .workflow import WorkflowError, build_workflow
@@ -20,9 +20,10 @@ MANAGED_SERVICES = ("comfyui", "strata", "studio")
 
 
 def _check_private_config(path: Path) -> None:
-    permissions = stat.S_IMODE(path.stat().st_mode)
-    if permissions & 0o077:
-        raise ConfigError(f"{path} must have owner-only permissions (0600); found {permissions:04o}")
+    try:
+        set_private_permissions(path)
+    except OSError as error:
+        raise ConfigError(f"{path} must have owner-only permissions (0600): {error}") from error
 
 
 def _require_file(value: str, label: str) -> Path:
@@ -118,8 +119,8 @@ def _load_active_config(initialize_if_missing: bool = False) -> tuple[Path, Sett
             comfyui_repo_path=comfyui_repo,
         )
         print("Created private config.json.")
-    settings = load_config(path)
     _check_private_config(path)
+    settings = load_config(path)
     return path, settings
 
 

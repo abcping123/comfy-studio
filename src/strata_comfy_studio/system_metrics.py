@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import platform
 import shutil
 import subprocess
 import threading
@@ -39,6 +40,11 @@ class SystemMetrics:
 
     @staticmethod
     def _read_cpu_times() -> tuple[int, int] | None:
+        if platform.system() == "Windows":
+            import psutil
+
+            cpu_times = psutil.cpu_times()
+            return round(sum(cpu_times) * 1000), round(cpu_times.idle * 1000)
         try:
             fields = Path("/proc/stat").read_text(encoding="ascii").splitlines()[0].split()
             values = [int(value) for value in fields[1:]]
@@ -52,6 +58,10 @@ class SystemMetrics:
 
     @staticmethod
     def _memory_percent() -> float | None:
+        if platform.system() == "Windows":
+            import psutil
+
+            return SystemMetrics._clamp_percent(psutil.virtual_memory().percent)
         values: dict[str, int] = {}
         try:
             for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():

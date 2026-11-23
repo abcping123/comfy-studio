@@ -1,11 +1,30 @@
 from __future__ import annotations
 
-import tempfile
+import os
 import sqlite3
+import stat
+import subprocess
+import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from strata_comfy_studio.storage import ConversationStore, StorageError
+
+
+def _assert_private_file(test_case: unittest.TestCase, path: Path) -> None:
+    if os.name == "nt":
+        result = subprocess.run(
+            ["icacls", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        entries = [line.strip() for line in result.stdout.splitlines() if ":(" in line]
+        test_case.assertEqual(len(entries), 1)
+        test_case.assertTrue(entries[0].endswith(":(F)"))
+    else:
+        test_case.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
 class StorageTests(unittest.TestCase):
@@ -34,7 +53,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.store.active_conversation_id(), conversation_id)
         self.assertEqual(self.store.selected_conversation_id(), conversation_id)
         self.assertEqual(self.store.session_filename(conversation_id), f"{conversation_id}.bin")
-        self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o600)
+        _assert_private_file(self, self.store.path)
 
     def test_context_snapshot_is_stale_after_new_messages(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
@@ -58,7 +77,7 @@ class StorageTests(unittest.TestCase):
 
     def test_existing_database_migrates_reasoning_column(self) -> None:
         path = Path(self.temp.name) / "legacy.sqlite3"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             connection.executescript("""
                 CREATE TABLE conversations (
                     id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -73,10 +92,10 @@ class StorageTests(unittest.TestCase):
             """)
 
         migrated = ConversationStore(path)
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
         self.assertIn("reasoning_content", columns)
-        self.assertEqual(migrated.path.stat().st_mode & 0o777, 0o600)
+        _assert_private_file(self, migrated.path)
 
     def test_generation_lifecycle_is_persisted(self) -> None:
         conversation_id = self.store.create_conversation()["id"]

@@ -12,6 +12,7 @@ dependencies = [
 	"uvicorn>=0.30,<1",
 	"websockets>=15,<16",
 	"Pillow>=11,<13",
+	"psutil>=6,<8; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]

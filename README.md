@@ -18,8 +18,20 @@ python3 -m venv .venv
 .venv/bin/python main.py stop
 ```
 
-First start creates a private `config.json`, imports the API key from the Strata repository's configured source file, and generates the app access token. It does not print either secret or overwrite an existing config.
+On Windows, use the matching PowerShell commands:
 
-`start` validates the configured files, prepares the private Strata runtime config, preflights all service PID files and ports, then starts ComfyUI, Strata, and the Studio app. If preflight finds a live PID that does not match the configured service command and working directory, it leaves that process and PID file untouched and starts no services. Inspect the reported PID with `ps -p <PID> -o pid=,lstart=,args=` and `readlink /proc/<PID>/cwd` before deciding whether to stop the old service or remove a stale PID file. `status` reports all three services. `stop` stops them in reverse order. Open the browser at the address configured under `app` in `config.json` and enter the access token when prompted.
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
+.\.venv\Scripts\python.exe main.py start
+.\.venv\Scripts\python.exe main.py status
+.\.venv\Scripts\python.exe main.py stop
+```
+
+First start creates a private `config.json`, imports an API key from the Strata source config when present (otherwise it generates a private key for the managed Strata service), and generates the app access token. It does not print either secret or overwrite an existing config.
+
+`start` validates the configured files, prepares the private Strata runtime config, preflights all service PID files and ports, then starts ComfyUI, Strata, and the Studio app. If a running Strata or ComfyUI process matches the configured server script and port but is not the process recorded by the local PID file, Studio sends it SIGTERM, waits for its port to be released, and starts the service with the configured command. It never stops an unrecognized PID or port owner; if it cannot identify exactly one matching process, or an unrelated owner blocks the configured endpoint, startup aborts. A matching external Strata endpoint that Studio cannot identify by process is still reused. `status` reports all three services. `stop` stops them in reverse order. Open the browser at the address configured under `app` in `config.json` and enter the access token when prompted.
+
+On Windows, repository virtual environments are expected at `.venv\Scripts\python.exe`; for the Strata terminal layout, Studio also checks the Strata repository root if `terminal\.venv` is absent. Windows private-file ACLs are restricted to the current user with `icacls`.
 
 Keep `config.json` and the access token private. The config file is ignored by Git and must have owner-only permissions (`0600`). The app listens on loopback by default; enabling LAN HTTP requires explicit opt-in in the local config. ComfyUI's YAML configuration is generated from JSON; JSON remains the source of truth.

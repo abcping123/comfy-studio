@@ -76,45 +76,11 @@ class Orchestrator:
         if running or pending:
             raise CoordinationError("ComfyUI queue is busy with other work; no model switch was made")
 
-    def _free_vram_mib(self) -> int:
-        devices = self.comfy.system_stats().get("devices")
-        if not isinstance(devices, list):
-            raise CoordinationError("ComfyUI did not report GPU devices")
-        wanted = self.settings.section("comfyui")["gpu_id"]
-        device = next((entry for entry in devices if isinstance(entry, dict) and entry.get("index") == wanted), None)
-        if device is None:
-            raise CoordinationError(f"ComfyUI did not report configured GPU index {wanted}")
-        free_bytes = device.get("vram_free")
-        if isinstance(free_bytes, bool) or not isinstance(free_bytes, (int, float)) or free_bytes < 0:
-            raise CoordinationError("ComfyUI reported an invalid free-VRAM value")
-        return int(free_bytes // (1024 * 1024))
-
-    def _minimum_free_vram_mib(self) -> int:
-        value = self.settings.section("strata")["min_free_vram_mib"]
-        if value is None:
-            raise CoordinationError("set strata.min_free_vram_mib in config.json before model switching")
-        return value
-
-    def _wait_for_free_vram(self) -> None:
-        minimum = self._minimum_free_vram_mib()
-        coordination = self.settings.section("coordination")
-        deadline = self._clock() + coordination["handoff_timeout_s"]
-        while True:
-            self._require_idle_queue()
-            free = self._free_vram_mib()
-            if free >= minimum:
-                return
-            if self._clock() >= deadline:
-                raise CoordinationError(
-                    f"only {free} MiB VRAM is free; need {minimum} MiB before loading the next model"
-                )
-            self._sleep(coordination["poll_interval_s"])
-
     def _release_comfy(self) -> None:
         self._require_idle_queue()
         self._comfy_models_retained = False
         self.comfy.free_memory()
-        self._wait_for_free_vram()
+        self._require_idle_queue()
 
     def _strata_loaded(self) -> bool:
         response = self.strata.status()

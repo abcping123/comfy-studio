@@ -20,7 +20,6 @@
     "source_config_json": "/home/pic1wx/repos/Strata/terminal/strata-q2_0.json",
     "api_key": "",
     "model": "qwen3.8-flash-next-q2_0",
-    "min_free_vram_mib": null,
     "idle_unload_s": 600,
     "request_timeout_s": 900
   },
@@ -69,7 +68,6 @@
     "default_scheduler": "simple"
   },
   "coordination": {
-    "handoff_timeout_s": 120,
     "generation_timeout_s": 1800,
     "poll_interval_s": 1.0
   }

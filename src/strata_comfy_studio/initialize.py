@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from .permissions import set_private_permissions
 from .settings import ConfigError, Settings, default_config_path, project_root, validate_config
 
 
@@ -34,11 +35,11 @@ def _write_private_json(path: Path, data: dict[str, Any]) -> None:
         raise InitializationError(f"refusing to overwrite existing file: {path}") from error
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            set_private_permissions(path)
             json.dump(data, file, indent=2)
             file.write("\n")
             file.flush()
             os.fsync(file.fileno())
-        os.chmod(path, 0o600)
     except BaseException:
         path.unlink(missing_ok=True)
         raise
@@ -48,7 +49,13 @@ def _replace_private_json(path: Path, data: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     _write_private_json(temporary, data)
     os.replace(temporary, path)
-    os.chmod(path, 0o600)
+    set_private_permissions(path)
+
+
+def _python_executable(root: Path) -> Path:
+    if os.name == "nt":
+        return root / ".venv" / "Scripts" / "python.exe"
+    return root / ".venv" / "bin" / "python"
 
 
 def initialize_config(template_path: Path | None = None, output_path: Path | None = None,
@@ -71,10 +78,18 @@ def initialize_config(template_path: Path | None = None, output_path: Path | Non
 
             terminal_root = strata_repo / "terminal"
             strata_root = terminal_root if (terminal_root / "serve/server.py").is_file() else strata_repo
-            strata_python = strata_root / ".venv/bin/python"
+            strata_roots = (strata_root, strata_repo) if strata_root != strata_repo else (strata_root,)
+            strata_python_candidates = tuple(_python_executable(root) for root in strata_roots)
+            strata_python = next(
+                (path for path in strata_python_candidates if path.is_file()),
+                None,
+            )
+            if strata_python is None:
+                checked = ", ".join(str(path) for path in strata_python_candidates)
+                raise InitializationError(f"Strata Python does not exist; checked: {checked}")
             strata_server = strata_root / "serve/server.py"
             source_path = strata_root / Path(source_value).name
-        comfy_python = comfyui_repo / ".venv/bin/python"
+        comfy_python = _python_executable(comfyui_repo)
         comfy_main = comfyui_repo / "main.py"
         required_files = (
             (strata_python, "Strata Python"),
@@ -86,7 +101,9 @@ def initialize_config(template_path: Path | None = None, output_path: Path | Non
         for path, label in required_files:
             if not path.is_file():
                 raise InitializationError(f"{label} does not exist: {path}")
-        if not os.access(strata_python, os.X_OK) or not os.access(comfy_python, os.X_OK):
+        if os.name != "nt" and (
+            not os.access(strata_python, os.X_OK) or not os.access(comfy_python, os.X_OK)
+        ):
             raise InitializationError("repository Python interpreters must be executable")
 
         data["strata"].update({
@@ -107,8 +124,10 @@ def initialize_config(template_path: Path | None = None, output_path: Path | Non
         source_path = template.parent / source_path
     source = _read_json(source_path)
     api_key = source.get("api_key")
-    if not isinstance(api_key, str) or not api_key.strip():
-        raise InitializationError(f"the Strata JSON config has no API key: {source_path}")
+    if api_key is None or (isinstance(api_key, str) and not api_key.strip()):
+        api_key = secrets.token_urlsafe(32)
+    elif not isinstance(api_key, str):
+        raise InitializationError(f"the Strata JSON config has an invalid API key: {source_path}")
 
     data["strata"]["api_key"] = api_key
     if not data["app"].get("access_token"):
@@ -178,23 +197,18 @@ def prepare_runtime_files(settings: Settings) -> Path:
         "idle_unload_s": strata["idle_unload_s"],
         "lazy_load": True,
     })
-    if strata["min_free_vram_mib"] is None:
-        runtime.pop("min_free_vram_mib", None)
-    else:
-        runtime["min_free_vram_mib"] = strata["min_free_vram_mib"]
-
     runtime_path = settings.path("paths.strata_runtime_config")
     sessions_path = settings.path("paths.strata_sessions")
     temp_root = settings.path("paths.temp_root")
     output_directory = settings.path("comfyui.output_directory")
     input_directory = settings.path("comfyui.input_directory")
-    for directory in (runtime_path.parent, sessions_path, temp_root / "comfyui",
-                      output_directory, input_directory):
+    directories = dict.fromkeys(
+        (temp_root, runtime_path.parent, sessions_path, temp_root / "comfyui",
+         output_directory, input_directory),
+    )
+    for directory in directories:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if directory == sessions_path:
-            os.chmod(directory, 0o700)
-        if directory == input_directory:
-            os.chmod(directory, 0o700)
+        set_private_permissions(directory, directory=True)
 
     _replace_private_json(runtime_path, runtime)
     if not comfy["models"]["text_encoder"].startswith("qwen3vl_"):

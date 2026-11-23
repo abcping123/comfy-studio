@@ -121,10 +121,6 @@ def validate_config(data: Any) -> dict[str, Any]:
     strata_timeout = strata.get("request_timeout_s")
     if isinstance(strata_timeout, bool) or not isinstance(strata_timeout, (int, float)) or strata_timeout <= 0:
         raise ConfigError("strata.request_timeout_s must be a positive number")
-    free_vram = strata.get("min_free_vram_mib")
-    if free_vram is not None and (isinstance(free_vram, bool) or not isinstance(free_vram, int) or free_vram < 0):
-        raise ConfigError("strata.min_free_vram_mib must be a non-negative integer or null")
-
     comfy = _mapping(data, "comfyui")
     _endpoint(comfy, "comfyui")
     for key_name in ("python", "main_script", "working_directory", "diffusion_models_dir",
@@ -191,7 +187,7 @@ def validate_config(data: Any) -> dict[str, Any]:
         if generation.get(selected_key) not in options:
             raise ConfigError(f"generation.{selected_key} must be included in {options_key}")
     coordination = _mapping(data, "coordination")
-    for key_name in ("handoff_timeout_s", "generation_timeout_s", "poll_interval_s"):
+    for key_name in ("generation_timeout_s", "poll_interval_s"):
         value = coordination.get(key_name)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             raise ConfigError(f"coordination.{key_name} must be a positive number")

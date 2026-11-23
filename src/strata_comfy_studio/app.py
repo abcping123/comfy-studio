@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import stat
 import threading
 import uuid
 from pathlib import Path
@@ -17,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 from .clients import BackendError, ComfyUIClient, StrataClient
 from .image_assets import MAX_SOURCE_IMAGE_BYTES, SourceImageError, inspect_source_image
 from .orchestrator import CoordinationError, Orchestrator
+from .permissions import set_private_permissions
 from .security import require_access
 from .settings import ConfigError, Settings, default_config_path, load_config
 from .storage import ConversationStore, StorageConflictError, StorageError
@@ -657,9 +657,8 @@ def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         config_path = default_config_path()
+        set_private_permissions(config_path)
         settings = load_config(config_path)
-        if stat.S_IMODE(config_path.stat().st_mode) & 0o077:
-            raise ConfigError("config.json must have owner-only permissions (0600)")
         app_config = settings.section("app")
         uvicorn.run(create_app(settings), host=app_config["listen_host"], port=app_config["port"],
                     log_level="info", access_log=False, workers=1,

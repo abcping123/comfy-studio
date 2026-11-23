@@ -100,7 +100,6 @@ class FakeComfy:
         self.progress_messages: list[str] = []
         self.progress_socket: FakeProgressSocket | None = None
         self.fail_progress_connection = False
-        self.free_vram_mib = 15000
         self.saved_subfolder = ""
         self.input_directory: Path | None = None
         self.output_directory: Path | None = None
@@ -112,10 +111,6 @@ class FakeComfy:
     def free_memory(self) -> dict:
         self.calls.append("free")
         return {}
-
-    def system_stats(self) -> dict:
-        self.calls.append("stats")
-        return {"devices": [{"index": 0, "vram_free": self.free_vram_mib * 1024 * 1024}]}
 
     def open_progress_socket(self, client_id: str) -> FakeProgressSocket:
         self.calls.append("websocket")
@@ -160,7 +155,6 @@ class FakeComfy:
 class OrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
         data = copy.deepcopy(load_config(project_root() / "data" / "config.example.json").data)
-        data["strata"]["min_free_vram_mib"] = 12000
         self.temp = tempfile.TemporaryDirectory()
         data["paths"]["strata_sessions"] = str(Path(self.temp.name) / "sessions")
         data["paths"]["temp_root"] = str(Path(self.temp.name) / "temp")
@@ -372,9 +366,10 @@ class OrchestratorTests(unittest.TestCase):
         image_urls = [
             part["image_url"]["url"] for part in message_content if part["type"] == "image_url"
         ]
+        input_directory = self.settings.path("comfyui.input_directory")
         self.assertEqual(image_urls, [
-            str(self.settings.path("comfyui.input_directory") / conversation_id / base["filename"]),
-            str(self.settings.path("comfyui.input_directory") / conversation_id / reference["filename"]),
+            str((input_directory / conversation_id / base["filename"]).resolve()),
+            str((input_directory / conversation_id / reference["filename"]).resolve()),
         ])
         self.assertNotIn("不会收到上传图片的像素内容", messages[0]["content"])
 
@@ -488,10 +483,9 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(self.strata.calls, [])
         self.assertNotIn("free", self.comfy.calls)
 
-    def test_loaded_strata_session_does_not_repeat_load_floor_check(self) -> None:
+    def test_loaded_strata_session_does_not_reload(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
         self.orchestrator.chat(conversation_id, "First turn")
-        self.comfy.free_vram_mib = 1024
         second = self.orchestrator.chat(conversation_id, "Continue the same context")
         self.assertTrue(second.context_saved)
         self.assertEqual(sum(name == "load" for name, _ in self.strata.calls), 1)
@@ -541,13 +535,13 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(self.strata.loaded)
         self.assertNotIn("submit", self.comfy.calls)
 
-    def test_unknown_free_vram_threshold_fails_before_loading_strata(self) -> None:
+    def test_legacy_null_free_vram_threshold_does_not_block_chat(self) -> None:
         self.settings.data["strata"]["min_free_vram_mib"] = None
         conversation_id = self.store.create_conversation()["id"]
-        with self.assertRaisesRegex(CoordinationError, "min_free_vram_mib"):
-            self.orchestrator.chat(conversation_id, "Wait for a configured safety floor")
-        self.assertFalse(self.strata.loaded)
-        self.assertFalse(any(name == "load" for name, _ in self.strata.calls))
+        result = self.orchestrator.chat(conversation_id, "Continue without the Studio threshold")
+        self.assertTrue(result.context_saved)
+        self.assertTrue(self.strata.loaded)
+        self.assertIn("free", self.comfy.calls)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ from strata_comfy_studio.services import (
     _strata_endpoint_matches,
     preflight_service_start,
     service_command,
+    _service_process_matches,
+    _process_matches,
     service_running,
     start_service,
     stop_service,
@@ -32,9 +34,12 @@ class ServiceCommandTests(unittest.TestCase):
         self.assertEqual((host, port), ("127.0.0.1", 8080))
         self.assertIn("--host", command)
         self.assertIn("--config", command)
-        self.assertIn("temp/strata/runtime.json", " ".join(command))
+        self.assertIn(str(self.settings.path("paths.strata_runtime_config")), " ".join(command))
         self.assertNotIn(self.settings.section("strata")["api_key"], command)
-        self.assertEqual(cwd, project_root().parent.parent / "repos/Strata/terminal")
+        self.assertEqual(
+            cwd,
+            Path(self.settings.section("strata")["server_script"]).resolve().parent.parent,
+        )
 
     def test_comfy_command_uses_default_model_paths(self) -> None:
         command, cwd, host, port = service_command(self.settings, "comfyui")
@@ -106,6 +111,8 @@ class ExternalStrataTests(unittest.TestCase):
             with (
                 patch("strata_comfy_studio.services._port_open", return_value=True),
                 patch("strata_comfy_studio.services._strata_endpoint_matches", return_value=True),
+                patch("strata_comfy_studio.services._find_service_processes", return_value=[]),
+                patch("strata_comfy_studio.services.set_private_permissions"),
                 patch("strata_comfy_studio.services.subprocess.Popen") as popen,
             ):
                 pid, _ = start_service(settings, "strata")
@@ -113,6 +120,63 @@ class ExternalStrataTests(unittest.TestCase):
             self.assertIsNone(pid)
             self.assertFalse(_pid_path(settings, "strata").exists())
             popen.assert_not_called()
+
+    def test_service_process_matching_uses_script_and_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self._settings(Path(directory))
+            for service in ("comfyui", "strata"):
+                command, cwd, host, port = service_command(settings, service)
+                if service == "comfyui":
+                    args = [command[0], command[1], "--listen", host, "--port", str(port)]
+                else:
+                    args = command
+                with patch(
+                    "strata_comfy_studio.services._process_identity",
+                    return_value=(args, cwd),
+                ):
+                    self.assertTrue(_service_process_matches(settings, service, 1234))
+
+            strata_command, _, _, strata_port = service_command(settings, "strata")
+            wrong_port_args = strata_command.copy()
+            wrong_port_args[wrong_port_args.index("--port") + 1] = str(strata_port + 1)
+            with patch(
+                "strata_comfy_studio.services._process_identity",
+                return_value=(wrong_port_args, cwd),
+            ):
+                self.assertFalse(_service_process_matches(settings, "strata", 1234))
+
+    def test_start_restarts_mismatched_strata_and_comfyui_processes(self) -> None:
+        for service in ("strata", "comfyui"):
+            with self.subTest(service=service), tempfile.TemporaryDirectory() as directory:
+                settings = self._settings(Path(directory))
+                pid_file = _pid_path(settings, service)
+                pid_file.parent.mkdir(parents=True)
+                pid_file.write_text("202\n", encoding="ascii")
+                process = MagicMock()
+                process.pid = 404
+                process.poll.return_value = None
+                popen = MagicMock(return_value=process)
+
+                with (
+                    patch("strata_comfy_studio.services._process_matches", return_value=False),
+                    patch("strata_comfy_studio.services._pid_exists", return_value=True),
+                    patch("strata_comfy_studio.services._find_service_processes", return_value=[303]),
+                    patch(
+                        "strata_comfy_studio.services._service_process_matches",
+                        side_effect=[True, False],
+                    ),
+                    patch("strata_comfy_studio.services._terminate_process") as terminate,
+                    patch("strata_comfy_studio.services._port_open", return_value=False),
+                    patch("strata_comfy_studio.services._strata_endpoint_matches", return_value=True),
+                    patch("strata_comfy_studio.services.set_private_permissions"),
+                    patch("strata_comfy_studio.services.subprocess.Popen", popen),
+                ):
+                    started_pid, _ = start_service(settings, service)
+
+                self.assertEqual(started_pid, 404)
+                terminate.assert_called_once_with(303)
+                popen.assert_called_once()
+                self.assertEqual(pid_file.read_text(encoding="ascii"), "404\n")
 
     def test_start_still_rejects_an_unrelated_listener(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -134,6 +198,7 @@ class ExternalStrataTests(unittest.TestCase):
             secret_argument = "do-not-print-this-token"
             with (
                 patch("strata_comfy_studio.services._process_matches", return_value=False),
+                patch("strata_comfy_studio.services._find_service_processes", return_value=[]),
                 patch(
                     "strata_comfy_studio.services._process_identity",
                     return_value=(["/usr/bin/python", secret_argument], Path("/tmp/other-service")),
@@ -148,7 +213,7 @@ class ExternalStrataTests(unittest.TestCase):
             self.assertIn("studio:", message)
             self.assertIn(f"PID {os.getpid()}", message)
             self.assertIn("arguments differ at index", message)
-            self.assertIn("actual cwd=/tmp/other-service", message)
+            self.assertIn(f"actual cwd={Path('/tmp/other-service')}", message)
             self.assertIn("expected cwd=", message)
             self.assertNotIn(secret_argument, message)
             self.assertTrue(all(pid_file.exists() for pid_file in pid_files))
@@ -159,6 +224,17 @@ class ExternalStrataTests(unittest.TestCase):
             with patch("strata_comfy_studio.services._strata_endpoint_matches", return_value=True):
                 self.assertTrue(service_running(settings, "strata"))
                 self.assertIsNone(stop_service(settings, "strata"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows process inspection only")
+    def test_windows_process_matching_checks_command_and_working_directory(self) -> None:
+        import psutil
+
+        process = psutil.Process()
+        command = process.cmdline()
+        cwd = Path(process.cwd())
+        self.assertTrue(_process_matches(process.pid, command, cwd))
+        self.assertFalse(_process_matches(process.pid, command + ["unexpected"], cwd))
+        self.assertFalse(_process_matches(process.pid, command, cwd / "unexpected"))
 
 
 if __name__ == "__main__":
