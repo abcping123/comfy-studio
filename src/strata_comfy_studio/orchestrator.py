@@ -3,12 +3,17 @@ from __future__ import annotations
 import threading
 import time
 import json
+import os
+import secrets
+import shutil
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .clients import BackendError, ComfyUIClient, StrataClient
+from .resolution import calculate_edit_resolution
 from .settings import Settings
 from .resolution import normalize_aspect_ratio
 from .storage import ConversationStore, StorageError
@@ -123,10 +128,195 @@ class Orchestrator:
         directory = self.settings.path("paths.strata_sessions")
         return directory / filename
 
-    def delete_conversation(self, conversation_id: str) -> None:
+    def _conversation_input_directory(self, conversation_id: str) -> Path:
+        root = self.settings.path("comfyui.input_directory").resolve()
+        directory = root / self.store.validate_id(conversation_id)
+        if directory.is_symlink() or (directory.exists() and directory.resolve().parent != root):
+            raise CoordinationError("refusing to access a source image directory outside ComfyUI input")
+        return directory
+
+    def _studio_output_directory(self, conversation_id: str, create: bool = False) -> Path:
+        conversation_id = self.store.validate_id(conversation_id)
+        root = self.settings.path("paths.temp_root") / "comfyui"
+        if root.is_symlink():
+            raise CoordinationError("refusing to access a symbolic-link generated image directory")
+        if create:
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not root.is_dir():
+            raise CoordinationError("Studio generated image directory does not exist")
+        root = root.resolve(strict=True)
+        directory = root / conversation_id
+        if directory.is_symlink():
+            raise CoordinationError("refusing to access a symbolic-link generated image session")
+        if create:
+            directory.mkdir(mode=0o700, exist_ok=True)
+            os.chmod(directory, 0o700)
+        if not directory.is_dir() or directory.resolve(strict=True).parent != root:
+            raise CoordinationError("refusing to access a generated image directory outside Studio storage")
+        return directory.resolve(strict=True)
+
+    def _relocate_generated_image(self, conversation_id: str, generation_id: str,
+                                  image: dict[str, str]) -> dict[str, str]:
+        conversation_id = self.store.validate_id(conversation_id)
+        generation_id = self.store.validate_id(generation_id)
+        filename = image.get("filename", "")
+        if (image.get("subfolder") != conversation_id or image.get("type") != "output"
+                or not filename or Path(filename).name != filename or "\\" in filename
+                or Path(filename).suffix.lower() != ".png"):
+            raise CoordinationError("ComfyUI returned an unsafe generated image path")
+
+        output_root = self.settings.path("comfyui.output_directory").resolve(strict=True)
+        source_directory = output_root / conversation_id
+        if source_directory.is_symlink() or not source_directory.is_dir():
+            raise CoordinationError("ComfyUI generated image directory is missing or unsafe")
+        source_directory = source_directory.resolve(strict=True)
+        if source_directory.parent != output_root:
+            raise CoordinationError("ComfyUI generated image directory is outside its output directory")
+        source_path = source_directory / filename
+        if source_path.is_symlink():
+            raise CoordinationError("refusing to move a symbolic-link generated image")
+        source_path = source_path.resolve(strict=True)
+        if source_path.parent != source_directory or not source_path.is_file():
+            raise CoordinationError("ComfyUI generated image is missing or unsafe")
+
+        destination_directory = self._studio_output_directory(conversation_id, create=True)
+        if destination_directory == source_directory:
+            raise CoordinationError("ComfyUI and Studio generated image directories must be different")
+        destination_path = destination_directory / f"{generation_id}.png"
+        if destination_path.exists() or destination_path.is_symlink():
+            raise CoordinationError("generated image destination already exists")
+        try:
+            shutil.move(str(source_path), str(destination_path))
+        except OSError as error:
+            raise CoordinationError(f"could not move the generated image into Studio storage: {error}") from error
+        return {"filename": destination_path.name, "subfolder": conversation_id, "type": "output"}
+
+    def generated_image_path(self, generation: dict[str, Any]) -> Path:
+        conversation_id = self.store.validate_id(generation.get("conversation_id", ""))
+        filename = generation.get("filename")
+        if (generation.get("subfolder") != conversation_id or generation.get("image_type") != "output"
+                or not isinstance(filename, str) or not filename or Path(filename).name != filename
+                or "\\" in filename or Path(filename).suffix.lower() != ".png"):
+            raise CoordinationError("generated image metadata has an invalid path")
+        directory = self._studio_output_directory(conversation_id)
+        image_path = directory / filename
+        if image_path.is_symlink():
+            raise CoordinationError("refusing to serve a symbolic-link generated image")
+        try:
+            image_path = image_path.resolve(strict=True)
+        except OSError as error:
+            raise CoordinationError("generated image file is missing") from error
+        if image_path.parent != directory or not image_path.is_file():
+            raise CoordinationError("generated image file is missing or unsafe")
+        return image_path
+
+    def _source_image_file(self, conversation_id: str, filename: str) -> Path:
+        directory = self._conversation_input_directory(conversation_id)
+        if filename in {"", ".", ".."} or Path(filename).name != filename or "\\" in filename:
+            raise CoordinationError("refusing an unsafe source image filename")
+        path = directory / filename
+        if path.is_symlink():
+            raise CoordinationError("refusing to access a symbolic-link source image")
+        return path
+
+    def upload_source_image(self, conversation_id: str, content: bytes, content_type: str,
+                            extension: str, width: int, height: int) -> dict[str, Any]:
         conversation_id = self.store.validate_id(conversation_id)
         if self.store.get_conversation(conversation_id) is None:
             raise StorageError("conversation does not exist")
+        if extension not in {".png", ".jpg", ".webp"}:
+            raise CoordinationError("unsupported source image extension")
+        self._enter()
+        try:
+            if len(self.store.source_images(conversation_id)) >= 5:
+                raise CoordinationError("a conversation can have at most five source images")
+            source_image_id = secrets.token_hex(16)
+            response = self.comfy.upload_image(
+                f"{source_image_id}{extension}", content, content_type, conversation_id,
+            )
+            filename = response.get("name")
+            subfolder = response.get("subfolder")
+            image_type = response.get("type")
+            if (not isinstance(filename, str) or not filename or Path(filename).name != filename
+                    or "\\" in filename or subfolder != conversation_id or image_type != "input"):
+                raise CoordinationError("ComfyUI returned an invalid source image path")
+            file_path = self._source_image_file(conversation_id, filename)
+            try:
+                return self.store.create_source_image(
+                    source_image_id, conversation_id, filename, subfolder,
+                    content_type, len(content), width, height,
+                )
+            except (StorageError, sqlite3.Error) as error:
+                try:
+                    file_path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    raise CoordinationError(
+                        f"source image could not be recorded or removed: {cleanup_error}"
+                    ) from cleanup_error
+                raise
+        finally:
+            self._leave()
+
+    def reorder_source_images(self, conversation_id: str,
+                              source_image_ids: list[str]) -> list[dict[str, Any]]:
+        self._enter()
+        try:
+            return self.store.reorder_source_images(conversation_id, source_image_ids)
+        finally:
+            self._leave()
+
+    def set_conversation_mode(self, conversation_id: str, image_mode: str) -> None:
+        self._enter()
+        try:
+            self.store.set_conversation_mode(conversation_id, image_mode)
+        finally:
+            self._leave()
+
+    def delete_source_image(self, conversation_id: str, source_image_id: str) -> None:
+        conversation_id = self.store.validate_id(conversation_id)
+        source_image = self.store.source_image(conversation_id, source_image_id)
+        if source_image is None:
+            raise StorageError("source image does not exist in this conversation")
+        self._enter()
+        staged_path: Path | None = None
+        try:
+            image_path = self._source_image_file(conversation_id, source_image["filename"])
+            if image_path.exists():
+                staged_path = image_path.with_name(f".{image_path.name}.{source_image_id}.deleting")
+                if staged_path.exists():
+                    raise CoordinationError("a source image cleanup is already in progress")
+                try:
+                    os.replace(image_path, staged_path)
+                except OSError as error:
+                    raise CoordinationError(f"could not stage source image for removal: {error}") from error
+            try:
+                deleted = self.store.delete_source_image(conversation_id, source_image_id)
+            except (StorageError, sqlite3.Error) as error:
+                if staged_path is not None and staged_path.exists():
+                    try:
+                        os.replace(staged_path, image_path)
+                    except OSError as rollback_error:
+                        raise CoordinationError(
+                            f"source image record was not removed and its file could not be restored: {rollback_error}"
+                        ) from rollback_error
+                raise error
+            if deleted is None:
+                raise StorageError("source image does not exist in this conversation")
+            if staged_path is not None:
+                try:
+                    staged_path.unlink(missing_ok=True)
+                except OSError as error:
+                    raise CoordinationError(
+                        f"source image was removed from Studio, but its file could not be erased: {error}"
+                    ) from error
+        finally:
+            self._leave()
+
+    def delete_conversation(self, conversation_id: str) -> str | None:
+        conversation_id = self.store.validate_id(conversation_id)
+        if self.store.get_conversation(conversation_id) is None:
+            raise StorageError("conversation does not exist")
+        source_directory = self._conversation_input_directory(conversation_id)
         self._enter()
         try:
             if self.store.active_conversation_id() == conversation_id:
@@ -142,6 +332,12 @@ class Orchestrator:
                 raise CoordinationError(f"could not remove the saved Strata session; conversation kept: {error}") from error
             if not self.store.delete_conversation(conversation_id):
                 raise StorageError("conversation does not exist")
+            if source_directory.exists():
+                try:
+                    shutil.rmtree(source_directory)
+                except OSError as error:
+                    return f"Conversation deleted, but uploaded source images could not be fully removed: {error}"
+            return None
         finally:
             self._leave()
 
@@ -231,7 +427,8 @@ class Orchestrator:
 
     def _build_chat_messages(self, conversation_id: str, user_text: str,
                              current_image_prompt: str | None,
-                             current_aspect_ratio: str | None) -> tuple[str, str, list[dict[str, Any]]]:
+                             current_aspect_ratio: str | None
+                             ) -> tuple[str, str, list[dict[str, Any]], str | None]:
         conversation_id = self.store.validate_id(conversation_id)
         conversation = self.store.get_conversation(conversation_id)
         if conversation is None:
@@ -249,7 +446,11 @@ class Orchestrator:
         available_ratios = {item["label"] for item in generation["aspect_ratios"]}
         if current_aspect_ratio not in available_ratios:
             raise CoordinationError("current aspect ratio is not supported")
-        system_prompt_path = self.settings.path("generation.system_prompt_file")
+        image_mode = conversation.get("image_mode", "text-to-image")
+        source_images = self.store.source_images(conversation_id) if image_mode == "edit" else []
+        source_image_count = len(source_images)
+        prompt_setting = "edit_system_prompt_file" if image_mode == "edit" else "system_prompt_file"
+        system_prompt_path = self.settings.path(f"generation.{prompt_setting}")
         try:
             system_prompt_text = system_prompt_path.read_text(encoding="utf-8").strip()
         except OSError as error:
@@ -260,28 +461,59 @@ class Orchestrator:
             "\n最新用户消息开头包含 current_editor_state JSON，其中 current_image_prompt 是右侧当前草稿，"
             "current_aspect_ratio 是当前画幅选择。除非用户本轮明确要求更改，否则延续草稿并保留该画幅。"
         )
-        current_editor_state = json.dumps({
+        editor_state = {
             "current_image_prompt": current_image_prompt,
             "current_aspect_ratio": current_aspect_ratio,
-        }, ensure_ascii=False)
+        }
+        preserve_aspect_ratio = None
+        if image_mode == "edit":
+            editor_state.update({"image_mode": "edit", "source_image_count": source_image_count})
+            preserve_aspect_ratio = current_aspect_ratio
+        current_editor_state = json.dumps(editor_state, ensure_ascii=False)
         current_user_message = (
             f"current_editor_state:\n{current_editor_state}\n\n"
             f"user_request:\n{user_text.strip()}"
         )
+        message_content: str | list[dict[str, Any]] = current_user_message
+        if image_mode == "edit" and source_images:
+            image_labels = [
+                f"<Picture {index}> ({'base image' if index == 1 else 'reference image'})"
+                for index in range(1, source_image_count + 1)
+            ]
+            current_user_message += "\n\nattached_source_images_in_order:\n" + "\n".join(image_labels)
+            content_parts: list[dict[str, Any]] = [{"type": "text", "text": current_user_message}]
+            for image in source_images:
+                image_path = self._source_image_file(conversation_id, image["filename"])
+                if not image_path.is_file():
+                    raise CoordinationError(f"source image file is missing: {image['filename']}")
+                try:
+                    resolved_image_path = image_path.resolve(strict=True)
+                except OSError as error:
+                    raise CoordinationError(
+                        f"source image file could not be resolved: {image['filename']}"
+                    ) from error
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": str(resolved_image_path)},
+                })
+            message_content = content_parts
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(self.store.messages(conversation_id))
-        messages.append({"role": "user", "content": current_user_message})
-        return conversation_id, user_text.strip(), messages
+        messages.append({"role": "user", "content": message_content})
+        return conversation_id, user_text.strip(), messages, preserve_aspect_ratio
 
     def _finish_chat(self, conversation_id: str, user_text: str,
-                     response: dict[str, Any]) -> ChatOutcome:
+                     response: dict[str, Any], preserve_aspect_ratio: str | None = None) -> ChatOutcome:
         answer, image_prompt, suggested_ratio, raw_answer, reasoning_content = self._parse_chat_response(response)
-        try:
-            aspect_ratio, was_adjusted = normalize_aspect_ratio(
-                suggested_ratio, self.settings.data["generation"]["aspect_ratios"]
-            )
-        except ValueError as error:
-            raise CoordinationError(str(error)) from error
+        if preserve_aspect_ratio is not None:
+            aspect_ratio, was_adjusted = preserve_aspect_ratio, False
+        else:
+            try:
+                aspect_ratio, was_adjusted = normalize_aspect_ratio(
+                    suggested_ratio, self.settings.data["generation"]["aspect_ratios"]
+                )
+            except ValueError as error:
+                raise CoordinationError(str(error)) from error
         display_answer = answer
         ratio_short = aspect_ratio.split(" ", 1)[0]
         explained_adjustment = suggested_ratio in answer and ratio_short in answer
@@ -303,7 +535,7 @@ class Orchestrator:
              current_image_prompt: str | None = None,
              current_aspect_ratio: str | None = None,
              reasoning_effort: str | None = None) -> ChatOutcome:
-        conversation_id, user_text, messages = self._build_chat_messages(
+        conversation_id, user_text, messages, preserve_aspect_ratio = self._build_chat_messages(
             conversation_id, user_text, current_image_prompt, current_aspect_ratio
         )
         self._enter()
@@ -311,7 +543,7 @@ class Orchestrator:
             self._prepare_strata(conversation_id)
             response = self.strata.chat(messages, max_tokens=max_tokens,
                                         reasoning_effort=reasoning_effort)
-            return self._finish_chat(conversation_id, user_text, response)
+            return self._finish_chat(conversation_id, user_text, response, preserve_aspect_ratio)
         finally:
             self._leave()
 
@@ -319,7 +551,7 @@ class Orchestrator:
                     current_image_prompt: str | None = None,
                     current_aspect_ratio: str | None = None,
                     reasoning_effort: str | None = None) -> Iterator[dict[str, Any]]:
-        conversation_id, user_text, messages = self._build_chat_messages(
+        conversation_id, user_text, messages, preserve_aspect_ratio = self._build_chat_messages(
             conversation_id, user_text, current_image_prompt, current_aspect_ratio
         )
         self._enter()
@@ -349,7 +581,7 @@ class Orchestrator:
                 "content": "".join(content_parts),
                 "reasoning_content": "".join(reasoning_parts),
             }}]}
-            outcome = self._finish_chat(conversation_id, user_text, response)
+            outcome = self._finish_chat(conversation_id, user_text, response, preserve_aspect_ratio)
             yield {
                 "type": "done",
                 "answer": outcome.answer,
@@ -510,23 +742,60 @@ class Orchestrator:
     def generate(self, conversation_id: str, prompt: str, seed: int,
                  aspect_ratio: str | None = None, megapixels: float | None = None,
                  sampler_name: str | None = None, scheduler: str | None = None,
-                 progress_callback: Callable[[dict[str, Any]], None] | None = None) -> GenerationOutcome:
+                 progress_callback: Callable[[dict[str, Any]], None] | None = None,
+                 image_mode: str = "text-to-image",
+                 source_image_ids: list[str] | None = None) -> GenerationOutcome:
         conversation_id = self.store.validate_id(conversation_id)
-        if self.store.get_conversation(conversation_id) is None:
-            raise CoordinationError("conversation does not exist")
-        try:
-            workflow = build_workflow(self.settings, prompt, seed, aspect_ratio, megapixels,
-                                      sampler_name, scheduler)
-        except WorkflowError as error:
-            raise CoordinationError(str(error)) from error
-
         self._enter()
         generation_id: str | None = None
         prompt_id: str | None = None
         completed_image: dict[str, str] | None = None
         failure: Exception | None = None
         progress_socket = None
+        selected_source_images: list[dict[str, Any]] = []
+        width = 0
+        height = 0
         try:
+            conversation = self.store.get_conversation(conversation_id)
+            if conversation is None:
+                raise CoordinationError("conversation does not exist")
+            if conversation.get("image_mode", "text-to-image") != image_mode:
+                raise CoordinationError("image mode changed; reload the conversation before generating")
+            if image_mode == "edit":
+                try:
+                    selected_source_images = self.store.source_images_by_ids(
+                        conversation_id, source_image_ids or [],
+                    )
+                    width, height = calculate_edit_resolution(
+                        selected_source_images[0]["width"],
+                        selected_source_images[0]["height"],
+                        megapixels if megapixels is not None
+                        else self.settings.section("generation")["default_megapixels"],
+                        self.settings.section("generation")["resolution_multiple"],
+                    )
+                except (StorageError, ValueError) as error:
+                    raise CoordinationError(str(error)) from error
+                selected_ratio = "Source image"
+            else:
+                if image_mode != "text-to-image" or source_image_ids:
+                    raise CoordinationError("text-to-image mode does not accept source images")
+                selected_ratio = aspect_ratio or self.settings.section("generation")["default_aspect_ratio"]
+            try:
+                workflow = build_workflow(
+                    self.settings, prompt, seed, aspect_ratio, megapixels,
+                    sampler_name, scheduler, image_mode, selected_source_images or None,
+                )
+            except WorkflowError as error:
+                raise CoordinationError(str(error)) from error
+            if image_mode == "text-to-image":
+                width = workflow["4"]["inputs"]["width"]
+                height = workflow["4"]["inputs"]["height"]
+            save_node = next((node for node in workflow.values()
+                              if isinstance(node, dict) and node.get("class_type") == "SaveImage"), None)
+            if save_node is None or not isinstance(save_node.get("inputs"), dict):
+                raise CoordinationError("workflow must include a valid SaveImage node")
+            save_node["inputs"]["filename_prefix"] = f"{conversation_id}/image"
+
             self._report_generation_event(progress_callback, {
                 "type": "phase", "message": "Preparing GPU resources for ComfyUI",
             })
@@ -545,15 +814,13 @@ class Orchestrator:
             if strata_was_loaded or not self._comfy_models_retained:
                 self._release_comfy()
             generation = self.settings.section("generation")
-            selected_ratio = aspect_ratio or generation["default_aspect_ratio"]
             selected_megapixels = megapixels if megapixels is not None else generation["default_megapixels"]
             selected_sampler = sampler_name or generation["default_sampler"]
             selected_scheduler = scheduler or generation["default_scheduler"]
-            width = workflow["4"]["inputs"]["width"]
-            height = workflow["4"]["inputs"]["height"]
             generation_id = self.store.create_generation(
                 conversation_id, prompt.strip(), seed, selected_ratio, selected_megapixels,
                 width, height, selected_sampler, selected_scheduler,
+                image_mode, [image["id"] for image in selected_source_images],
             )
             client_id = uuid.uuid4().hex
             try:
@@ -577,8 +844,14 @@ class Orchestrator:
             self._report_generation_event(progress_callback, {
                 "type": "phase", "message": "ComfyUI is executing the workflow",
             })
-            completed_image = self._wait_for_generation(prompt_id, workflow, progress_socket,
-                                                       progress_callback)
+            comfy_image = self._wait_for_generation(prompt_id, workflow, progress_socket,
+                                                    progress_callback)
+            self._report_generation_event(progress_callback, {
+                "type": "phase", "message": "Moving generated image into Studio storage",
+            })
+            completed_image = self._relocate_generated_image(
+                conversation_id, generation_id, comfy_image,
+            )
             self.store.update_generation(generation_id, "complete", image=completed_image)
         except Exception as error:
             failure = error

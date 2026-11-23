@@ -130,6 +130,8 @@ def validate_config(data: Any) -> dict[str, Any]:
     for key_name in ("python", "main_script", "working_directory", "diffusion_models_dir",
                      "text_encoders_dir", "vae_dir", "output_directory"):
         _text(comfy, key_name, "comfyui")
+    comfy.setdefault("input_directory", "temp/comfyui/input")
+    _text(comfy, "input_directory", "comfyui")
     gpu_id = comfy.get("gpu_id")
     if isinstance(gpu_id, bool) or not isinstance(gpu_id, int) or gpu_id < 0:
         raise ConfigError("comfyui.gpu_id must be a non-negative integer")
@@ -142,13 +144,17 @@ def validate_config(data: Any) -> dict[str, Any]:
         _text(models, key_name, "comfyui.models")
 
     paths = _mapping(data, "paths")
-    for key_name in ("strata_runtime_config", "strata_sessions", "database", "temp_root", "workflow_api"):
+    paths.setdefault("workflow_edit_api", "data/comfyui/minimax_h3_image_edit.json")
+    for key_name in ("strata_runtime_config", "strata_sessions", "database", "temp_root",
+                     "workflow_api", "workflow_edit_api"):
         _text(paths, key_name, "paths")
 
     generation = _mapping(data, "generation")
+    generation.setdefault("edit_system_prompt_file", "data/strata/minimax_h3_image_edit.txt")
     if generation.get("prompt_enhancement") is not False:
         raise ConfigError("generation.prompt_enhancement must be false")
     _text(generation, "system_prompt_file", "generation")
+    _text(generation, "edit_system_prompt_file", "generation")
     prompt_skill_version = generation.get("prompt_skill_version")
     if isinstance(prompt_skill_version, bool) or not isinstance(prompt_skill_version, int) or prompt_skill_version < 1:
         raise ConfigError("generation.prompt_skill_version must be a positive integer")

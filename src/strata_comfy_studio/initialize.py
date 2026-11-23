@@ -186,9 +186,14 @@ def prepare_runtime_files(settings: Settings) -> Path:
     runtime_path = settings.path("paths.strata_runtime_config")
     sessions_path = settings.path("paths.strata_sessions")
     temp_root = settings.path("paths.temp_root")
-    for directory in (runtime_path.parent, sessions_path, temp_root / "comfyui"):
+    output_directory = settings.path("comfyui.output_directory")
+    input_directory = settings.path("comfyui.input_directory")
+    for directory in (runtime_path.parent, sessions_path, temp_root / "comfyui",
+                      output_directory, input_directory):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if directory == sessions_path:
+            os.chmod(directory, 0o700)
+        if directory == input_directory:
             os.chmod(directory, 0o700)
 
     _replace_private_json(runtime_path, runtime)

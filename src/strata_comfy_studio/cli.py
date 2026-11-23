@@ -13,7 +13,7 @@ from .initialize import (
     prepare_runtime_files,
 )
 from .settings import ConfigError, Settings, default_config_path, load_config
-from .services import ServiceError, service_running, start_service, stop_service
+from .services import ServiceError, preflight_service_start, service_running, start_service, stop_service
 from .workflow import WorkflowError, build_workflow
 
 MANAGED_SERVICES = ("comfyui", "strata", "studio")
@@ -57,15 +57,29 @@ def validate_artifacts(settings: Settings) -> None:
     )
     if not system_prompt_path.read_text(encoding="utf-8").strip():
         raise ConfigError("generation system prompt file is empty")
+    edit_prompt_path = _require_file(
+        str(settings.path("generation.edit_system_prompt_file")), "Image edit system prompt",
+    )
+    if not edit_prompt_path.read_text(encoding="utf-8").strip():
+        raise ConfigError("image edit system prompt file is empty")
     _require_directory(comfy["working_directory"], "ComfyUI working directory")
     for key, model_key in (("diffusion_models_dir", "diffusion_model"),
                            ("text_encoders_dir", "text_encoder"), ("vae_dir", "vae")):
         directory = _require_directory(comfy[key], f"ComfyUI {key}")
         model_path = directory / comfy["models"][model_key]
         _require_file(str(model_path), f"ComfyUI model {model_key}")
-    _require_directory(comfy["output_directory"], "ComfyUI output directory")
+    _require_directory(str(settings.path("comfyui.output_directory")), "ComfyUI output directory")
+    _require_directory(str(settings.path("comfyui.input_directory")), "ComfyUI input directory")
     workflow = _require_file(str(settings.path("paths.workflow_api")), "MiniMax API workflow")
+    edit_workflow = _require_file(str(settings.path("paths.workflow_edit_api")), "MiniMax edit API workflow")
     build_workflow(settings, "configuration validation", 1)
+    build_workflow(settings, "configuration validation", 1, image_mode="edit",
+                   source_images=[{
+                       "filename": "configuration-validation.png",
+                       "subfolder": "0" * 32,
+                       "width": 1024,
+                       "height": 1024,
+                   }])
     try:
         graph = json.loads(workflow.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
@@ -73,6 +87,13 @@ def validate_artifacts(settings: Settings) -> None:
     serialized = json.dumps(graph).lower()
     if "qwen3.5" in serialized or "textgeneratev2" in serialized:
         raise ConfigError("MiniMax API workflow must not include Qwen3.5 prompt enhancement")
+    try:
+        edit_graph = json.loads(edit_workflow.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ConfigError(f"MiniMax edit API workflow is invalid JSON: {error}") from error
+    edit_serialized = json.dumps(edit_graph).lower()
+    if "qwen3.5" in edit_serialized or "textgeneratev2" in edit_serialized:
+        raise ConfigError("MiniMax edit API workflow must not include Qwen3.5 prompt enhancement")
 
 
 def _prompt_repository_path(label: str) -> Path:
@@ -116,8 +137,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config_path, settings = _load_active_config(initialize_if_missing=args.command == "start")
         if args.command == "start":
-            validate_artifacts(settings)
             prepare_runtime_files(settings)
+            validate_artifacts(settings)
+            preflight_service_start(settings, MANAGED_SERVICES)
             failed = False
             for service in MANAGED_SERVICES:
                 try:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from strata_comfy_studio.resolution import calculate_resolution, normalize_aspect_ratio
+from strata_comfy_studio.resolution import calculate_edit_resolution, calculate_resolution, normalize_aspect_ratio
 from strata_comfy_studio.settings import load_config, project_root
 
 
@@ -38,6 +38,15 @@ class ResolutionTests(unittest.TestCase):
                                                      self.generation["aspect_ratios"])
                 self.assertEqual(width % multiple, 0)
                 self.assertEqual(height % multiple, 0)
+
+    def test_edit_dimensions_follow_source_ratio_and_are_aligned(self) -> None:
+        width, height = calculate_edit_resolution(1920, 1080, 4.0, 32)
+        self.assertEqual(width % 32, 0)
+        self.assertEqual(height % 32, 0)
+        self.assertAlmostEqual(width / height, 16 / 9, delta=0.03)
+        self.assertLessEqual(width * height, 4 * 1024 * 1024)
+        with self.assertRaisesRegex(ValueError, "between 0.5 and 16.0"):
+            calculate_edit_resolution(1920, 1080, 16.01, 32)
 
     def test_unsupported_ratio_maps_to_nearest_native_option(self) -> None:
         options = self.generation["aspect_ratios"]

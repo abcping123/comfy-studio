@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from pathlib import PurePosixPath
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
@@ -202,11 +203,67 @@ class ComfyUIClient(JsonHttpClient):
             body["client_id"] = client_id
         return self.request_json("POST", "/prompt", body)
 
+    def upload_image(self, filename: str, content: bytes, content_type: str,
+                     subfolder: str) -> dict[str, Any]:
+        if (filename in {"", ".", ".."} or PurePosixPath(filename).name != filename or "\\" in filename
+                or any(character in filename for character in "\r\n\"")):
+            raise BackendError("ComfyUI", "refusing an unsafe upload filename")
+        if (not subfolder or PurePosixPath(subfolder).is_absolute()
+                or any(part in {"", ".", ".."} for part in PurePosixPath(subfolder).parts)
+                or "\\" in subfolder):
+            raise BackendError("ComfyUI", "refusing an unsafe upload subfolder")
+        if content_type not in {"image/png", "image/jpeg", "image/webp"}:
+            raise BackendError("ComfyUI", "unsupported source image content type")
+
+        boundary = f"----Studio{secrets.token_hex(16)}"
+        parts = [
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{filename}\"\r\n"
+            f"Content-Type: {content_type}\r\n\r\n".encode("ascii"),
+            content,
+            b"\r\n",
+        ]
+        for name, value in (("subfolder", subfolder), ("type", "input"), ("overwrite", "false")):
+            parts.append(
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+                f"{value}\r\n".encode("ascii")
+            )
+        parts.append(f"--{boundary}--\r\n".encode("ascii"))
+        request = Request(
+            f"{self.endpoint}/upload/image",
+            data=b"".join(parts),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        try:
+            with self._opener.open(request, timeout=self.timeout_s) as response:
+                raw = response.read()
+                status = response.status
+        except HTTPError as error:
+            raw = error.read()
+            status = error.code
+        except (URLError, TimeoutError, OSError) as error:
+            raise BackendError("ComfyUI", f"image upload failed: {error}") from error
+
+        try:
+            parsed = json.loads(raw.decode("utf-8")) if raw else {}
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise BackendError("ComfyUI", "returned invalid upload JSON", status=status) from error
+        if status < 200 or status >= 300:
+            detail = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
+            raise BackendError("ComfyUI", f"image upload failed: {detail}", status=status, body=parsed)
+        if not isinstance(parsed, dict):
+            raise BackendError("ComfyUI", "returned a non-object upload response", status=status, body=parsed)
+        return parsed
+
     def history(self, prompt_id: str) -> dict[str, Any]:
         return self.request_json("GET", f"/history/{prompt_id}")
 
     def image(self, filename: str, subfolder: str = "", image_type: str = "output") -> tuple[bytes, str]:
-        if not filename or PurePosixPath(filename).name != filename or "\\" in filename:
+        if (filename in {"", ".", ".."} or PurePosixPath(filename).name != filename
+                or "\\" in filename):
             raise BackendError("ComfyUI", "refusing an unsafe image filename")
         folder = PurePosixPath(subfolder)
         if folder.is_absolute() or ".." in folder.parts or "\\" in subfolder:

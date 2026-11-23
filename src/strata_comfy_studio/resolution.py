@@ -62,3 +62,25 @@ def calculate_resolution(aspect_ratio: str, megapixels: float, multiple: int = 3
     width = round(width_ratio * scale / multiple) * multiple
     height = round(height_ratio * scale / multiple) * multiple
     return width, height
+
+
+def calculate_edit_resolution(width: int, height: int, megapixels: float,
+                              multiple: int = 32) -> tuple[int, int]:
+    """Mirror MiniMax edit's total-pixels then scale-to-multiple resize nodes."""
+    if (isinstance(width, bool) or not isinstance(width, int) or width <= 0
+            or isinstance(height, bool) or not isinstance(height, int) or height <= 0):
+        raise ValueError("source image dimensions must be positive integers")
+    if (isinstance(megapixels, bool) or not isinstance(megapixels, (int, float))
+            or not 0.5 <= megapixels <= 16.0):
+        raise ValueError("edit megapixels must be between 0.5 and 16.0")
+    if isinstance(multiple, bool) or not isinstance(multiple, int) or multiple <= 0:
+        raise ValueError("multiple must be a positive integer")
+
+    scale = math.sqrt(int(megapixels * 1024 * 1024) / (width * height))
+    resized_width = round(width * scale)
+    resized_height = round(height * scale)
+    aligned_width = (resized_width // multiple) * multiple
+    aligned_height = (resized_height // multiple) * multiple
+    if aligned_width == 0 or aligned_height == 0:
+        return resized_width, resized_height
+    return aligned_width, aligned_height

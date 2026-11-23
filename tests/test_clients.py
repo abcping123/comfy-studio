@@ -37,7 +37,14 @@ class FakeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(length) or b"{}")
+        raw_body = self.rfile.read(length)
+        if self.path == "/upload/image":
+            self.calls.append(("POST", self.path, dict(self.headers), {"raw": raw_body}))
+            self._reply(200, {
+                "name": "uploaded.png", "subfolder": "a" * 32, "type": "input",
+            })
+            return
+        body = json.loads(raw_body or b"{}")
         self.calls.append(("POST", self.path, dict(self.headers), body))
         if self.path == "/v1/status":
             self._reply(200, {"loaded": False})
@@ -152,6 +159,26 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(parse_qs(urlsplit(path).query)["subfolder"], ["job/1"])
         with self.assertRaisesRegex(BackendError, "unsafe"):
             client.image("../secret.png")
+
+    def test_comfy_upload_uses_input_subfolder_and_multipart_body(self) -> None:
+        client = ComfyUIClient(self.settings)
+        conversation_id = "a" * 32
+        result = client.upload_image(
+            "b" * 32 + ".png", b"sample-image-bytes", "image/png", conversation_id,
+        )
+
+        self.assertEqual(result, {
+            "name": "uploaded.png", "subfolder": conversation_id, "type": "input",
+        })
+        _, path, headers, body = FakeHandler.calls[-1]
+        self.assertEqual(path, "/upload/image")
+        self.assertTrue(headers["Content-Type"].startswith("multipart/form-data; boundary="))
+        self.assertIn(b'name="subfolder"', body["raw"])
+        self.assertIn(conversation_id.encode(), body["raw"])
+        self.assertIn(b'name="type"', body["raw"])
+        self.assertIn(b"\r\n\r\nsample-image-bytes\r\n", body["raw"])
+        with self.assertRaisesRegex(BackendError, "unsafe"):
+            client.upload_image("../bad.png", b"x", "image/png", conversation_id)
 
     def test_http_errors_keep_status_without_exposing_credentials(self) -> None:
         client = ComfyUIClient(self.settings)

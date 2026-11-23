@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from http.client import HTTPException
 from pathlib import Path
 from urllib.error import URLError
@@ -40,6 +41,8 @@ def service_command(settings: Settings, service: str) -> tuple[list[str], Path, 
         command = [
             config["python"], config["main_script"],
             "--listen", endpoint.hostname or "127.0.0.1", "--port", str(endpoint.port),
+            "--output-directory", str(settings.path("comfyui.output_directory").resolve()),
+            "--input-directory", str(settings.path("comfyui.input_directory").resolve()),
         ]
         cwd = Path(config["working_directory"]).resolve()
     else:
@@ -49,17 +52,57 @@ def service_command(settings: Settings, service: str) -> tuple[list[str], Path, 
 
 
 def _pid_path(settings: Settings, service: str) -> Path:
-    return settings.path("paths.temp_root") / service / "service.pid"
+    temp_root = settings.path("paths.temp_root")
+    service_dir = temp_root if service == "studio" else temp_root / service
+    return service_dir / "service.pid"
 
 
-def _process_matches(pid: int, command: list[str], cwd: Path) -> bool:
+def _process_identity(pid: int) -> tuple[list[str], Path] | None:
     proc = Path("/proc") / str(pid)
     try:
         args = [value.decode("utf-8", errors="replace") for value in (proc / "cmdline").read_bytes().split(b"\0") if value]
         process_cwd = (proc / "cwd").resolve()
-    except (OSError, PermissionError):
-        return False
-    return args == command and process_cwd == cwd.resolve()
+    except OSError:
+        return None
+    return args, process_cwd
+
+
+def _process_matches(pid: int, command: list[str], cwd: Path) -> bool:
+    identity = _process_identity(pid)
+    return identity is not None and identity == (command, cwd.resolve())
+
+
+def _pid_mismatch_error(
+    pid_file: Path,
+    pid: int,
+    service: str,
+    command: list[str],
+    cwd: Path,
+) -> ServiceError:
+    identity = _process_identity(pid)
+    if identity is None:
+        details = f"could not read process details; expected cwd={cwd.resolve()}"
+    else:
+        actual_args, actual_cwd = identity
+        mismatch_index = next(
+            (index for index, (actual, expected) in enumerate(zip(actual_args, command))
+             if actual != expected),
+            min(len(actual_args), len(command)),
+        )
+        if actual_args == command:
+            argv_details = "arguments match exactly"
+        else:
+            argv_details = (
+                f"arguments differ at index {mismatch_index} "
+                f"(actual {len(actual_args)} args, expected {len(command)} args)"
+            )
+        details = f"{argv_details}; actual cwd={actual_cwd}, expected cwd={cwd.resolve()}"
+    return ServiceError(
+        f"pid file {pid_file} points to PID {pid}, but it does not identify the expected "
+        f"{service} process ({details}). No process was stopped and the PID file was left "
+        f"untouched. To inspect arguments locally, run `ps -p {pid} -o pid=,lstart=,args=` "
+        f"and `readlink /proc/{pid}/cwd`; full arguments are omitted here to avoid echoing secrets."
+    )
 
 
 def _port_open(host: str, port: int) -> bool:
@@ -93,6 +136,49 @@ def _strata_endpoint_matches(settings: Settings) -> bool:
     )
 
 
+def _check_service_start(
+    settings: Settings,
+    service: str,
+) -> tuple[int | None, bool, bool]:
+    command, cwd, host, port = service_command(settings, service)
+    pid_file = _pid_path(settings, service)
+    stale_pid_file = False
+
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text(encoding="ascii").strip())
+        except ValueError as error:
+            if service == "strata" and _strata_endpoint_matches(settings):
+                return None, True, False
+            raise ServiceError(f"invalid pid file; inspect before removing it: {pid_file}") from error
+        if _process_matches(old_pid, command, cwd):
+            return old_pid, False, False
+        if (Path("/proc") / str(old_pid)).exists():
+            if service == "strata" and _strata_endpoint_matches(settings):
+                return None, True, False
+            raise _pid_mismatch_error(pid_file, old_pid, service, command, cwd)
+        stale_pid_file = True
+
+    if _port_open(host, port):
+        if service == "strata" and _strata_endpoint_matches(settings):
+            return None, True, stale_pid_file
+        raise ServiceError(f"refusing to start {service}: {host}:{port} is already in use")
+
+    return None, False, stale_pid_file
+
+
+def preflight_service_start(settings: Settings, services: Iterable[str]) -> None:
+    errors: list[str] = []
+    for service in services:
+        try:
+            _check_service_start(settings, service)
+        except (OSError, ServiceError) as error:
+            errors.append(f"{service}: {error}")
+    if errors:
+        details = "\n - ".join(errors)
+        raise ServiceError(f"startup preflight failed; no services were started:\n - {details}")
+
+
 def service_running(settings: Settings, service: str) -> bool:
     command, cwd, _, _ = service_command(settings, service)
     pid_file = _pid_path(settings, service)
@@ -106,28 +192,17 @@ def service_running(settings: Settings, service: str) -> bool:
 
 
 def start_service(settings: Settings, service: str) -> tuple[int | None, Path]:
-    command, cwd, host, port = service_command(settings, service)
+    command, cwd, _, _ = service_command(settings, service)
     pid_file = _pid_path(settings, service)
     log_path = pid_file.parent / "service.log"
     pid_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if pid_file.exists():
-        try:
-            old_pid = int(pid_file.read_text(encoding="ascii").strip())
-        except ValueError as error:
-            if service == "strata" and _strata_endpoint_matches(settings):
-                return None, log_path
-            raise ServiceError(f"invalid pid file; inspect before removing it: {pid_file}") from error
-        if _process_matches(old_pid, command, cwd):
-            return old_pid, log_path
-        if (Path("/proc") / str(old_pid)).exists():
-            if service == "strata" and _strata_endpoint_matches(settings):
-                return None, log_path
-            raise ServiceError(f"pid file does not identify the expected {service} process: {pid_file}")
-        pid_file.unlink()
-    if _port_open(host, port):
-        if service == "strata" and _strata_endpoint_matches(settings):
-            return None, log_path
-        raise ServiceError(f"refusing to start {service}: {host}:{port} is already in use")
+    existing_pid, external, stale_pid_file = _check_service_start(settings, service)
+    if stale_pid_file:
+        pid_file.unlink(missing_ok=True)
+    if external:
+        return None, log_path
+    if existing_pid is not None:
+        return existing_pid, log_path
 
     with log_path.open("ab") as log:
         process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
@@ -166,7 +241,7 @@ def stop_service(settings: Settings, service: str, wait_s: float = 10.0) -> bool
             return False
         if service == "strata" and _strata_endpoint_matches(settings):
             return None
-        raise ServiceError(f"pid file does not identify the expected {service} process; leaving it untouched")
+        raise _pid_mismatch_error(pid_file, pid, service, command, cwd)
 
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + wait_s

@@ -11,10 +11,15 @@ from typing import Any
 
 
 _CONVERSATION_ID = re.compile(r"^[0-9a-f]{32}$")
+_SOURCE_IMAGE_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
 class StorageError(RuntimeError):
     """Persistent app state is missing or invalid."""
+
+
+class StorageConflictError(StorageError):
+    """A persistent operation conflicts with an existing relationship."""
 
 
 def _now() -> str:
@@ -47,7 +52,8 @@ class ConversationStore:
                     context_bytes INTEGER,
                     context_message_count INTEGER,
                     image_prompt TEXT NOT NULL DEFAULT '',
-                    aspect_ratio TEXT NOT NULL DEFAULT '1:1 (Square)'
+                    aspect_ratio TEXT NOT NULL DEFAULT '1:1 (Square)',
+                    image_mode TEXT NOT NULL DEFAULT 'text-to-image'
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +78,7 @@ class ConversationStore:
                     sampler_name TEXT NOT NULL DEFAULT 'euler',
                     scheduler TEXT NOT NULL DEFAULT 'simple',
                     status TEXT NOT NULL,
+                    image_mode TEXT NOT NULL DEFAULT 'text-to-image',
                     prompt_id TEXT,
                     filename TEXT,
                     subfolder TEXT,
@@ -82,6 +89,27 @@ class ConversationStore:
                 );
                 CREATE INDEX IF NOT EXISTS generations_conversation_id_created_at
                     ON generations(conversation_id, created_at);
+                CREATE TABLE IF NOT EXISTS source_images (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL,
+                    subfolder TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS source_images_conversation_id_position
+                    ON source_images(conversation_id, position);
+                CREATE TABLE IF NOT EXISTS generation_sources (
+                    generation_id TEXT NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+                    source_image_id TEXT NOT NULL REFERENCES source_images(id) ON DELETE RESTRICT,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (generation_id, position),
+                    UNIQUE (generation_id, source_image_id)
+                );
                 CREATE TABLE IF NOT EXISTS app_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -94,6 +122,8 @@ class ConversationStore:
                 connection.execute("ALTER TABLE conversations ADD COLUMN image_prompt TEXT NOT NULL DEFAULT ''")
             if "aspect_ratio" not in columns:
                 connection.execute("ALTER TABLE conversations ADD COLUMN aspect_ratio TEXT NOT NULL DEFAULT '1:1 (Square)'")
+            if "image_mode" not in columns:
+                connection.execute("ALTER TABLE conversations ADD COLUMN image_mode TEXT NOT NULL DEFAULT 'text-to-image'")
             message_columns = {row["name"] for row in connection.execute("PRAGMA table_info(messages)")}
             if "display_content" not in message_columns:
                 connection.execute("ALTER TABLE messages ADD COLUMN display_content TEXT")
@@ -105,6 +135,7 @@ class ConversationStore:
                 ("megapixels", "REAL NOT NULL DEFAULT 4.0"),
                 ("sampler_name", "TEXT NOT NULL DEFAULT 'euler'"),
                 ("scheduler", "TEXT NOT NULL DEFAULT 'simple'"),
+                ("image_mode", "TEXT NOT NULL DEFAULT 'text-to-image'"),
             ):
                 if name not in generation_columns:
                     connection.execute(f"ALTER TABLE generations ADD COLUMN {name} {declaration}")
@@ -264,9 +295,150 @@ class ConversationStore:
                     (conversation_id,),
                 )
 
+    def set_conversation_mode(self, conversation_id: str, image_mode: str) -> None:
+        conversation_id = self.validate_id(conversation_id)
+        if image_mode not in {"text-to-image", "edit"}:
+            raise StorageError("image mode must be text-to-image or edit")
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE conversations SET image_mode = ?, updated_at = ? WHERE id = ?",
+                (image_mode, _now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError("conversation does not exist")
+
+    @staticmethod
+    def validate_source_image_id(source_image_id: str) -> str:
+        if not isinstance(source_image_id, str) or not _SOURCE_IMAGE_ID.fullmatch(source_image_id):
+            raise StorageError("invalid source image id")
+        return source_image_id
+
+    def create_source_image(self, source_image_id: str, conversation_id: str, filename: str,
+                            subfolder: str, content_type: str, size_bytes: int,
+                            width: int, height: int) -> dict[str, Any]:
+        source_image_id = self.validate_source_image_id(source_image_id)
+        conversation_id = self.validate_id(conversation_id)
+        if (not isinstance(filename, str) or filename in {"", ".", ".."} or Path(filename).name != filename
+                or "\\" in filename or subfolder != conversation_id):
+            raise StorageError("invalid ComfyUI source image path")
+        if (not isinstance(content_type, str) or not content_type.startswith("image/")
+                or isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes <= 0
+                or isinstance(width, bool) or not isinstance(width, int) or width <= 0
+                or isinstance(height, bool) or not isinstance(height, int) or height <= 0):
+            raise StorageError("invalid source image metadata")
+        with self._lock, self._connect() as connection:
+            conversation = connection.execute(
+                "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise StorageError("conversation does not exist")
+            position = connection.execute(
+                "SELECT coalesce(max(position), -1) + 1 FROM source_images WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT INTO source_images "
+                "(id, conversation_id, filename, subfolder, content_type, size_bytes, width, height, position, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (source_image_id, conversation_id, filename, subfolder, content_type,
+                 size_bytes, width, height, position, _now()),
+            )
+        return self.source_image(conversation_id, source_image_id) or {}
+
+    def source_images(self, conversation_id: str) -> list[dict[str, Any]]:
+        conversation_id = self.validate_id(conversation_id)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT s.*, EXISTS (SELECT 1 FROM generation_sources g "
+                "WHERE g.source_image_id = s.id) AS in_use FROM source_images s "
+                "WHERE s.conversation_id = ? ORDER BY s.position, s.created_at",
+                (conversation_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def source_image(self, conversation_id: str, source_image_id: str) -> dict[str, Any] | None:
+        conversation_id = self.validate_id(conversation_id)
+        source_image_id = self.validate_source_image_id(source_image_id)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT s.*, EXISTS (SELECT 1 FROM generation_sources g "
+                "WHERE g.source_image_id = s.id) AS in_use FROM source_images s "
+                "WHERE s.id = ? AND s.conversation_id = ?",
+                (source_image_id, conversation_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def source_images_by_ids(self, conversation_id: str,
+                             source_image_ids: list[str]) -> list[dict[str, Any]]:
+        conversation_id = self.validate_id(conversation_id)
+        if not 1 <= len(source_image_ids) <= 5:
+            raise StorageError("edit mode requires one base image and at most four reference images")
+        ids = [self.validate_source_image_id(source_id) for source_id in source_image_ids]
+        if len(set(ids)) != len(ids):
+            raise StorageError("source image ids must be unique")
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM source_images WHERE conversation_id = ? AND id IN ({placeholders})",
+                (conversation_id, *ids),
+            ).fetchall()
+        records = {row["id"]: dict(row) for row in rows}
+        if len(records) != len(ids):
+            raise StorageError("source image does not belong to this conversation")
+        return [records[source_id] for source_id in ids]
+
+    def reorder_source_images(self, conversation_id: str, source_image_ids: list[str]) -> list[dict[str, Any]]:
+        conversation_id = self.validate_id(conversation_id)
+        ids = [self.validate_source_image_id(source_id) for source_id in source_image_ids]
+        if len(ids) > 5 or len(set(ids)) != len(ids):
+            raise StorageError("source image order must contain at most five unique ids")
+        with self._lock, self._connect() as connection:
+            conversation = connection.execute(
+                "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise StorageError("conversation does not exist")
+            rows = connection.execute(
+                "SELECT id FROM source_images WHERE conversation_id = ? ORDER BY position, created_at",
+                (conversation_id,),
+            ).fetchall()
+            current_ids = [row["id"] for row in rows]
+            if len(current_ids) != len(ids) or set(current_ids) != set(ids):
+                raise StorageError("source image order must include every image in this conversation")
+            connection.executemany(
+                "UPDATE source_images SET position = ? WHERE conversation_id = ? AND id = ?",
+                ((position, conversation_id, source_id) for position, source_id in enumerate(ids)),
+            )
+        return self.source_images(conversation_id)
+
+    def delete_source_image(self, conversation_id: str, source_image_id: str) -> dict[str, Any] | None:
+        conversation_id = self.validate_id(conversation_id)
+        source_image_id = self.validate_source_image_id(source_image_id)
+        try:
+            with self._lock, self._connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM source_images WHERE id = ? AND conversation_id = ?",
+                    (source_image_id, conversation_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                record = dict(row)
+                connection.execute(
+                    "DELETE FROM source_images WHERE id = ? AND conversation_id = ?",
+                    (source_image_id, conversation_id),
+                )
+        except sqlite3.IntegrityError as error:
+            raise StorageConflictError("source image is used by a generation") from error
+        return record
+
     def delete_conversation(self, conversation_id: str) -> bool:
         conversation_id = self.validate_id(conversation_id)
         with self._lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM generation_sources WHERE generation_id IN "
+                "(SELECT id FROM generations WHERE conversation_id = ?)",
+                (conversation_id,),
+            )
             cursor = connection.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
             if cursor.rowcount != 1:
                 return False
@@ -275,18 +447,38 @@ class ConversationStore:
 
     def create_generation(self, conversation_id: str, prompt: str, seed: int, aspect_ratio: str,
                           megapixels: float, width: int, height: int, sampler_name: str,
-                          scheduler: str) -> str:
+                          scheduler: str, image_mode: str = "text-to-image",
+                          source_image_ids: list[str] | None = None) -> str:
         conversation_id = self.validate_id(conversation_id)
+        if image_mode not in {"text-to-image", "edit"}:
+            raise StorageError("image mode must be text-to-image or edit")
+        source_ids = source_image_ids or []
+        if image_mode == "edit":
+            if not 1 <= len(source_ids) <= 5:
+                raise StorageError("edit mode requires one base image and at most four reference images")
+            source_ids = [self.validate_source_image_id(source_id) for source_id in source_ids]
+            if len(set(source_ids)) != len(source_ids):
+                raise StorageError("source image ids must be unique")
+        elif source_ids:
+            raise StorageError("text-to-image mode does not accept source images")
         generation_id = secrets.token_hex(16)
         now = _now()
         with self._lock, self._connect() as connection:
             connection.execute(
                 "INSERT INTO generations (id, conversation_id, prompt, seed, aspect_ratio, megapixels, width, height, "
-                "sampler_name, scheduler, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+                "sampler_name, scheduler, status, image_mode, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
                 (generation_id, conversation_id, prompt, seed, aspect_ratio, megapixels, width, height,
-                 sampler_name, scheduler, now, now),
+                 sampler_name, scheduler, image_mode, now, now),
             )
+            for position, source_image_id in enumerate(source_ids):
+                cursor = connection.execute(
+                    "INSERT INTO generation_sources (generation_id, source_image_id, position) "
+                    "SELECT ?, id, ? FROM source_images WHERE id = ? AND conversation_id = ?",
+                    (generation_id, position, source_image_id, conversation_id),
+                )
+                if cursor.rowcount != 1:
+                    raise StorageError("source image does not belong to this conversation")
         return generation_id
 
     def update_generation(self, generation_id: str, status: str, prompt_id: str | None = None,
@@ -313,11 +505,21 @@ class ConversationStore:
                 "SELECT * FROM generations WHERE conversation_id = ? ORDER BY created_at DESC",
                 (conversation_id,),
             ).fetchall()
-        return [dict(row) for row in rows]
+            return [self._generation_with_sources(connection, row) for row in rows]
 
     def generation(self, generation_id: str) -> dict[str, Any] | None:
         if not isinstance(generation_id, str) or not re.fullmatch(r"^[0-9a-f]{32}$", generation_id):
             raise StorageError("invalid generation id")
         with self._lock, self._connect() as connection:
             row = connection.execute("SELECT * FROM generations WHERE id = ?", (generation_id,)).fetchone()
-        return dict(row) if row else None
+            return self._generation_with_sources(connection, row) if row else None
+
+    @staticmethod
+    def _generation_with_sources(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        generation = dict(row)
+        sources = connection.execute(
+            "SELECT source_image_id FROM generation_sources WHERE generation_id = ? ORDER BY position",
+            (generation["id"],),
+        ).fetchall()
+        generation["source_image_ids"] = [source["source_image_id"] for source in sources]
+        return generation

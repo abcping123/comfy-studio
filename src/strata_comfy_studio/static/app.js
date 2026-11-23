@@ -7,6 +7,11 @@
     options: null,
     pendingDeleteId: null,
     busy: false,
+    imageMode: "text-to-image",
+    sourceImages: [],
+    sourceImageUrls: new Map(),
+    sourceRenderToken: 0,
+    draggingSourceImageId: null,
     generationRunId: null,
     imageUrls: new Set(),
     imageViewerGenerationId: null,
@@ -257,6 +262,9 @@
       if (event.message?.startsWith("Live progress unavailable")) setGenerationProgress(Number.NaN);
     } else if (event.type === "node" || event.type === "progress") {
       const nodeLabels = {
+        LoadImage: "Loading source image",
+        ResizeImageMaskNode: "Resizing source image",
+        GetImageSize: "Reading source image size",
         UNETLoader: "Loading diffusion model",
         CLIPLoader: "Loading text encoder",
         VAELoader: "Loading VAE",
@@ -311,9 +319,12 @@
     byId("send-message").disabled = busy;
     chatInput.disabled = busy;
     byId("thinking-effort").disabled = busy;
-    byId("generate-image").disabled = busy || !imagePrompt.value.trim() || !calculateResolution();
     byId("new-conversation").disabled = busy;
+    updateResolutionPreview();
+    updateModeControls();
     document.querySelectorAll(".conversation-item, .conversation-delete").forEach((button) => { button.disabled = busy; });
+    document.querySelectorAll(".source-image-action").forEach((button) => { button.disabled = busy || button.dataset.locked === "true"; });
+    document.querySelectorAll(".source-image-card").forEach((card) => { card.draggable = !busy; });
   }
 
   function appendMessage(role, text, label = "", reasoningContent = "", streaming = false) {
@@ -441,11 +452,29 @@
 
   function calculateResolution() {
     if (!state.options) return null;
-    const ratio = state.options.aspect_ratios.find((item) => item.label === byId("image-aspect-ratio").value);
     const megapixels = Number(byId("image-megapixels").value);
+    const maximumMegapixels = state.imageMode === "edit"
+      ? state.options.edit_megapixels.max : state.options.megapixels.max;
+    if (!Number.isFinite(megapixels) || megapixels < state.options.megapixels.min ||
+        megapixels > maximumMegapixels) return null;
     const multiple = state.options.resolution_multiple;
-    if (!ratio || !Number.isFinite(megapixels) || megapixels < state.options.megapixels.min ||
-      megapixels > state.options.megapixels.max) return null;
+    if (state.imageMode === "edit") {
+      const base = state.sourceImages[0];
+      if (!base || !base.width || !base.height) return null;
+      const scale = Math.sqrt(Math.floor(megapixels * 1024 * 1024) / (base.width * base.height));
+      const resizedWidth = roundToEven(base.width * scale);
+      const resizedHeight = roundToEven(base.height * scale);
+      const alignedWidth = Math.floor(resizedWidth / multiple) * multiple;
+      const alignedHeight = Math.floor(resizedHeight / multiple) * multiple;
+      return {
+        width: alignedWidth && alignedHeight ? alignedWidth : resizedWidth,
+        height: alignedWidth && alignedHeight ? alignedHeight : resizedHeight,
+        megapixels,
+        multiple,
+      };
+    }
+    const ratio = state.options.aspect_ratios.find((item) => item.label === byId("image-aspect-ratio").value);
+    if (!ratio) return null;
     const scale = Math.sqrt(megapixels * 1024 * 1024 / (ratio.width * ratio.height));
     return {
       width: roundToEven(ratio.width * scale / multiple) * multiple,
@@ -457,14 +486,86 @@
 
   function updateResolutionPreview() {
     const result = calculateResolution();
-    byId("generate-image").disabled = state.busy || !imagePrompt.value.trim() || !result;
+    const sourceCountValid = state.imageMode !== "edit" ||
+      (state.sourceImages.length >= 1 && state.sourceImages.length <= 5);
+    byId("generate-image").disabled = state.busy || !imagePrompt.value.trim() || !result || !sourceCountValid;
     if (!result) {
-      byId("resolution-value").textContent = "Check resolution settings";
-      byId("resolution-details").textContent = "4–20 MP";
+      byId("resolution-value").textContent = state.imageMode === "edit" && !state.sourceImages.length
+        ? "Upload a base image" : "Check resolution settings";
       return;
     }
     byId("resolution-value").textContent = `${result.width} x ${result.height} px`;
-    byId("resolution-details").textContent = `${result.megapixels.toFixed(2)} MP target / ${result.multiple} px aligned`;
+  }
+
+  function updateModeControls() {
+    const isEdit = state.imageMode === "edit";
+    byId("mode-text-to-image").classList.toggle("is-active", !isEdit);
+    byId("mode-text-to-image").setAttribute("aria-pressed", String(!isEdit));
+    byId("mode-edit").classList.toggle("is-active", isEdit);
+    byId("mode-edit").setAttribute("aria-pressed", String(isEdit));
+    byId("mode-text-to-image").disabled = state.busy;
+    byId("mode-edit").disabled = state.busy;
+    byId("source-image-panel").hidden = !isEdit;
+    byId("source-image-input").disabled = state.busy;
+    const maxCount = state.options?.source_images.max_count || 5;
+    const addButton = byId("upload-source-images");
+    const atLimit = state.sourceImages.length >= maxCount;
+    addButton.disabled = state.busy || !isEdit || atLimit;
+    const addLabel = state.sourceImages.length ? "Add source images" : "Add a base image";
+    addButton.querySelector(".source-image-add-label").textContent =
+      state.sourceImages.length ? "Add source images" : "Base image";
+    addButton.title = atLimit ? `Maximum of ${maxCount} source images reached` : addLabel;
+    addButton.setAttribute("aria-label", addButton.title);
+  }
+
+  function applyImageMode(imageMode) {
+    state.imageMode = imageMode === "edit" ? "edit" : "text-to-image";
+    const isEdit = state.imageMode === "edit";
+    const megapixels = byId("image-megapixels");
+    byId("image-aspect-ratio").disabled = isEdit;
+    if (state.options) {
+      megapixels.min = String(state.options.megapixels.min);
+      megapixels.max = String(isEdit
+        ? state.options.edit_megapixels.max
+        : state.options.megapixels.max);
+    }
+    byId("image-prompt-label").textContent = isEdit ? "Edit prompt" : "Prompt";
+    byId("megapixels-label").textContent = isEdit ? "Target MP" : "Pixels (MP)";
+    byId("composer-hint").textContent = isEdit
+      ? "Strata can inspect uploaded image pixels to help shape the edit prompt"
+      : "Strata will help shape the image prompt";
+    byId("generate-image-label").textContent = isEdit ? "Edit image" : "Generate image";
+    updateModeControls();
+    updateResolutionPreview();
+  }
+
+  async function changeImageMode(imageMode) {
+    if (state.busy || !state.options || !state.conversationId || imageMode === state.imageMode) return;
+    const previousMode = state.imageMode;
+    const previousMegapixels = byId("image-megapixels").value;
+    saveConversationSettings();
+    const saved = readConversationSettings();
+    applyImageMode(imageMode);
+    const savedMegapixels = Number(imageMode === "edit" ? saved.edit_megapixels : saved.megapixels);
+    const maxMegapixels = imageMode === "edit"
+      ? state.options.edit_megapixels.max : state.options.megapixels.max;
+    const selectedMegapixels = Number.isFinite(savedMegapixels) &&
+      savedMegapixels >= state.options.megapixels.min && savedMegapixels <= maxMegapixels
+      ? savedMegapixels : Math.min(Number(previousMegapixels) || state.options.megapixels.default, maxMegapixels);
+    byId("image-megapixels").value = selectedMegapixels.toFixed(2);
+    updateResolutionPreview();
+    try {
+      await api(`/api/conversations/${encodeURIComponent(state.conversationId)}/mode`, {
+        method: "PUT",
+        body: JSON.stringify({ image_mode: imageMode }),
+      });
+      saveConversationSettings();
+    } catch (error) {
+      applyImageMode(previousMode);
+      byId("image-megapixels").value = previousMegapixels;
+      updateResolutionPreview();
+      toast(error.message, true);
+    }
   }
 
   function fillSelect(select, options, valueOf, labelOf, selected) {
@@ -484,15 +585,12 @@
     state.options = options;
     fillSelect(byId("image-aspect-ratio"), options.aspect_ratios,
       (item) => item.label, (item) => item.label, options.default_aspect_ratio);
-    fillSelect(byId("image-sampler"), options.samplers, (item) => item, (item) => item,
-      options.default_sampler);
-    fillSelect(byId("image-scheduler"), options.schedulers, (item) => item, (item) => item,
-      options.default_scheduler);
     const megapixels = byId("image-megapixels");
     megapixels.min = String(options.megapixels.min);
     megapixels.max = String(options.megapixels.max);
     megapixels.step = String(options.megapixels.step);
     megapixels.value = Number(options.megapixels.default).toFixed(2);
+    applyImageMode(state.imageMode);
     updateResolutionPreview();
   }
 
@@ -511,19 +609,17 @@
     const saved = readConversationSettings();
     const aspectRatio = byId("image-aspect-ratio").value;
     const megapixels = Number(byId("image-megapixels").value);
-    const sampler = byId("image-sampler").value;
-    const scheduler = byId("image-scheduler").value;
     const thinkingEffort = byId("thinking-effort").value;
+    const megapixelLimit = state.imageMode === "edit"
+      ? state.options.edit_megapixels.max : state.options.megapixels.max;
 
     if (state.options.aspect_ratios.some((item) => item.label === aspectRatio)) {
       saved.aspect_ratio = aspectRatio;
     }
     if (Number.isFinite(megapixels) && megapixels >= state.options.megapixels.min &&
-        megapixels <= state.options.megapixels.max) {
-      saved.megapixels = megapixels;
+        megapixels <= megapixelLimit) {
+      saved[state.imageMode === "edit" ? "edit_megapixels" : "megapixels"] = megapixels;
     }
-    if (state.options.samplers.includes(sampler)) saved.sampler = sampler;
-    if (state.options.schedulers.includes(scheduler)) saved.scheduler = scheduler;
     if (["none", "low", "medium", "high"].includes(thinkingEffort)) {
       saved.thinking_effort = thinkingEffort;
     }
@@ -542,13 +638,14 @@
     if (state.options.aspect_ratios.some((item) => item.label === saved.aspect_ratio)) {
       byId("image-aspect-ratio").value = saved.aspect_ratio;
     }
-    const megapixels = Number(saved.megapixels);
+    const megapixels = Number(state.imageMode === "edit" ? saved.edit_megapixels : saved.megapixels);
     if (Number.isFinite(megapixels) && megapixels >= state.options.megapixels.min &&
-        megapixels <= state.options.megapixels.max) {
+        megapixels <= (state.imageMode === "edit"
+          ? state.options.edit_megapixels.max : state.options.megapixels.max)) {
       byId("image-megapixels").value = megapixels.toFixed(2);
+    } else if (state.imageMode === "edit") {
+      byId("image-megapixels").value = Number(state.options.edit_megapixels.default).toFixed(2);
     }
-    if (state.options.samplers.includes(saved.sampler)) byId("image-sampler").value = saved.sampler;
-    if (state.options.schedulers.includes(saved.scheduler)) byId("image-scheduler").value = saved.scheduler;
     if (["none", "low", "medium", "high"].includes(saved.thinking_effort)) {
       byId("thinking-effort").value = saved.thinking_effort;
     }
@@ -704,7 +801,7 @@
     setBusy(true);
     byId("confirm-delete").disabled = true;
     try {
-      await api(`/api/conversations/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+      const deletion = await api(`/api/conversations/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
       clearConversationSettings(conversationId);
       deleteDialog.close();
       state.pendingDeleteId = null;
@@ -724,7 +821,8 @@
         if (nextId) await selectConversation(nextId);
         else await createConversation();
       }
-      toast("Conversation deleted. Saved PNG files remain in ComfyUI output.");
+      toast(deletion.cleanup_warning ||
+        "Conversation and uploaded source images deleted. Generated PNG files remain in temp/comfyui.");
     } catch (error) {
       toast(error.message, true);
     } finally {
@@ -737,8 +835,226 @@
     closeImageViewer();
     state.imageUrls.forEach((url) => URL.revokeObjectURL(url));
     state.imageUrls.clear();
+    clearSourceImages();
     byId("image-gallery").replaceChildren(emptyResult);
     showGeneration();
+  }
+
+  function clearSourceImages() {
+    state.sourceRenderToken += 1;
+    state.draggingSourceImageId = null;
+    state.sourceImageUrls.forEach((url) => URL.revokeObjectURL(url));
+    state.sourceImageUrls.clear();
+    state.sourceImages = [];
+    const addButton = byId("upload-source-images");
+    addButton.className = "source-image-add";
+    byId("source-image-list").replaceChildren(addButton);
+    byId("source-image-count").textContent = "0 / 5";
+    updateModeControls();
+  }
+
+  async function renderSourceImages(sourceImages) {
+    const renderToken = ++state.sourceRenderToken;
+    const conversationId = state.conversationId;
+    const ids = new Set(sourceImages.map((sourceImage) => sourceImage.id));
+    state.sourceImageUrls.forEach((url, id) => {
+      if (!ids.has(id)) {
+        URL.revokeObjectURL(url);
+        state.sourceImageUrls.delete(id);
+      }
+    });
+    state.sourceImages = sourceImages;
+    const list = byId("source-image-list");
+    const addButton = byId("upload-source-images");
+    addButton.className = "source-image-add";
+    list.replaceChildren(addButton);
+    byId("source-image-count").textContent = `${sourceImages.length} / 5`;
+    updateModeControls();
+
+    for (const [index, sourceImage] of sourceImages.entries()) {
+      const card = document.createElement("article");
+      card.className = "source-image-card";
+      card.dataset.sourceImageId = sourceImage.id;
+      card.draggable = !state.busy;
+      card.tabIndex = 0;
+      card.setAttribute("aria-keyshortcuts", "Alt+Shift+ArrowLeft Alt+Shift+ArrowRight");
+      card.setAttribute(
+        "aria-label",
+        `Picture ${index + 1}, ${index === 0 ? "base image" : "reference image"}. Drag to reorder; press Alt+Shift+Left or Alt+Shift+Right to move.`,
+      );
+      const preview = document.createElement("div");
+      preview.className = "source-image-preview";
+      const image = document.createElement("img");
+      image.draggable = false;
+      image.alt = `Picture ${index + 1}${index === 0 ? " base image" : " reference image"}`;
+      image.title = `${image.alt} (${sourceImage.width} x ${sourceImage.height})`;
+      const url = state.sourceImageUrls.get(sourceImage.id);
+      if (url) {
+        image.src = url;
+      } else {
+        const response = await fetch(
+          `/api/conversations/${encodeURIComponent(conversationId)}/source-images/${encodeURIComponent(sourceImage.id)}`,
+          { headers: authHeaders(), cache: "no-store" },
+        );
+        if (response.status === 401) {
+          sessionStorage.removeItem(tokenKey);
+          state.token = "";
+          if (!tokenDialog.open) tokenDialog.showModal();
+          return;
+        }
+        if (!response.ok) throw new Error(`Source image fetch failed (${response.status})`);
+        const objectUrl = URL.createObjectURL(await response.blob());
+        if (renderToken !== state.sourceRenderToken || conversationId !== state.conversationId) {
+          URL.revokeObjectURL(objectUrl);
+          return;
+        }
+        state.sourceImageUrls.set(sourceImage.id, objectUrl);
+        image.src = objectUrl;
+      }
+      if (renderToken !== state.sourceRenderToken || conversationId !== state.conversationId) return;
+
+      const details = document.createElement("div");
+      details.className = "source-image-details";
+      const label = document.createElement("span");
+      label.className = "source-image-label";
+      label.textContent = index === 0 ? "Picture 1 - Base" : `Picture ${index + 1} - Reference`;
+      details.append(label);
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "icon-button source-image-action source-image-remove";
+      remove.dataset.locked = String(Boolean(sourceImage.in_use));
+      remove.textContent = "×";
+      remove.title = sourceImage.in_use ? "This image is linked to a generation" : "Remove source image";
+      remove.setAttribute("aria-label", `Remove Picture ${index + 1}`);
+      remove.disabled = state.busy || Boolean(sourceImage.in_use);
+      remove.addEventListener("click", () => removeSourceImage(sourceImage.id));
+
+      preview.append(image, remove);
+      card.append(preview, details);
+
+      card.addEventListener("dragstart", (event) => {
+        if (state.busy || !event.dataTransfer || (event.target instanceof Element && event.target.closest("button"))) {
+          event.preventDefault();
+          return;
+        }
+        state.draggingSourceImageId = sourceImage.id;
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", sourceImage.id);
+        card.classList.add("is-dragging");
+      });
+      card.addEventListener("dragover", (event) => {
+        if (state.busy || !state.draggingSourceImageId || state.draggingSourceImageId === sourceImage.id) return;
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+        card.classList.add("is-drop-target");
+      });
+      card.addEventListener("dragleave", (event) => {
+        if (!(event.relatedTarget instanceof Node) || !card.contains(event.relatedTarget)) {
+          card.classList.remove("is-drop-target");
+        }
+      });
+      card.addEventListener("drop", async (event) => {
+        const draggedId = state.draggingSourceImageId;
+        if (!draggedId || state.busy) return;
+        event.preventDefault();
+        const fromIndex = state.sourceImages.findIndex((imageItem) => imageItem.id === draggedId);
+        const targetIndex = state.sourceImages.findIndex((imageItem) => imageItem.id === sourceImage.id);
+        const targetRect = card.getBoundingClientRect();
+        const afterTarget = event.clientX >= targetRect.left + targetRect.width / 2;
+        const destination = targetIndex + Number(afterTarget) - Number(fromIndex < targetIndex);
+        state.draggingSourceImageId = null;
+        if (fromIndex < 0 || targetIndex < 0 || fromIndex === targetIndex) return;
+        await moveSourceImage(fromIndex, destination);
+      });
+      card.addEventListener("dragend", () => {
+        state.draggingSourceImageId = null;
+        document.querySelectorAll(".source-image-card").forEach((sourceCard) => {
+          sourceCard.classList.remove("is-dragging", "is-drop-target");
+        });
+      });
+      card.addEventListener("keydown", (event) => {
+        if (event.target !== card || !event.altKey || !event.shiftKey) return;
+        const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+        if (!delta || index + delta < 0 || index + delta >= state.sourceImages.length) return;
+        event.preventDefault();
+        void moveSourceImage(index, index + delta);
+      });
+      list.insertBefore(card, addButton);
+    }
+    updateModeControls();
+    updateResolutionPreview();
+  }
+
+  async function moveSourceImage(fromIndex, toIndex) {
+    if (state.busy || !state.conversationId) return;
+    const sourceImageIds = state.sourceImages.map((sourceImage) => sourceImage.id);
+    if (fromIndex < 0 || fromIndex >= sourceImageIds.length || toIndex < 0 || toIndex >= sourceImageIds.length) return;
+    if (fromIndex === toIndex) return;
+    const [sourceImageId] = sourceImageIds.splice(fromIndex, 1);
+    sourceImageIds.splice(toIndex, 0, sourceImageId);
+    state.draggingSourceImageId = null;
+    setBusy(true);
+    try {
+      const response = await api(
+        `/api/conversations/${encodeURIComponent(state.conversationId)}/source-images/order`,
+        { method: "PUT", body: JSON.stringify({ source_image_ids: sourceImageIds }) },
+      );
+      await renderSourceImages(response.source_images);
+      const movedCard = [...byId("source-image-list").querySelectorAll(".source-image-card")]
+        .find((card) => card.dataset.sourceImageId === sourceImageId);
+      movedCard?.focus();
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeSourceImage(sourceImageId) {
+    if (state.busy || !state.conversationId) return;
+    setBusy(true);
+    try {
+      await api(
+        `/api/conversations/${encodeURIComponent(state.conversationId)}/source-images/${encodeURIComponent(sourceImageId)}`,
+        { method: "DELETE" },
+      );
+      await renderSourceImages(state.sourceImages.filter((image) => image.id !== sourceImageId));
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function uploadSourceImages(files) {
+    if (state.busy || !state.conversationId || state.imageMode !== "edit") return;
+    const selectedFiles = [...files];
+    const limits = state.options?.source_images;
+    if (!limits) return;
+    if (state.sourceImages.length + selectedFiles.length > limits.max_count) {
+      toast(`A conversation can have at most ${limits.max_count} source images.`, true);
+      return;
+    }
+    setBusy(true);
+    try {
+      for (const file of selectedFiles) {
+        if (file.size > limits.max_bytes) throw new Error(`${file.name} exceeds the 25 MiB upload limit.`);
+        if (!limits.allowed_types.includes(file.type)) {
+          throw new Error(`${file.name} is not a PNG, JPEG, or WebP image.`);
+        }
+        const uploaded = await api(
+          `/api/conversations/${encodeURIComponent(state.conversationId)}/source-images`,
+          { method: "POST", body: file, headers: { "Content-Type": file.type } },
+        );
+        await renderSourceImages([...state.sourceImages, uploaded]);
+      }
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      byId("source-image-input").value = "";
+      setBusy(false);
+    }
   }
 
   async function addGenerationImage(generation) {
@@ -768,11 +1084,18 @@
     openImage.setAttribute("aria-label", "View full-size image");
     openImage.addEventListener("click", () => openImageViewer(generation.id));
     openImage.append(image);
+    const indexBadge = document.createElement("span");
+    indexBadge.className = "gallery-index";
+    indexBadge.setAttribute("aria-hidden", "true");
+    openImage.append(indexBadge);
     const caption = document.createElement("div");
     caption.className = "gallery-caption";
     const text = document.createElement("span");
-    text.textContent = `${generation.aspect_ratio} · ${Number(generation.megapixels).toFixed(2)} MP · ` +
-      `${generation.width} x ${generation.height} · ${generation.sampler_name} / ${generation.scheduler} · seed ${generation.seed}`;
+    text.textContent = generation.image_mode === "edit"
+      ? `Edit · ${Number(generation.megapixels).toFixed(2)} MP · ${generation.width} x ${generation.height} · ` +
+        `${generation.source_image_ids?.length || 0} source images · seed ${generation.seed}`
+      : `${generation.aspect_ratio} · ${Number(generation.megapixels).toFixed(2)} MP · ` +
+        `${generation.width} x ${generation.height} · ${generation.sampler_name} / ${generation.scheduler} · seed ${generation.seed}`;
     const link = document.createElement("a");
     link.href = url;
     link.download = generation.filename;
@@ -789,6 +1112,9 @@
       ? cards.findIndex((card) => card.dataset.generationId === generationId)
       : cards.findIndex((card) => card.classList.contains("is-active"));
     if (activeIndex < 0) activeIndex = 0;
+    cards.forEach((card, index) => {
+      card.querySelector(".gallery-index").textContent = `${index + 1} / ${cards.length}`;
+    });
     cards.forEach((card, index) => {
       const active = index === activeIndex;
       card.classList.toggle("is-active", active);
@@ -855,18 +1181,17 @@
       renderConversationList((await api("/api/state")).conversations || []);
       byId("conversation-title").textContent = data.conversation.title || "New conversation";
       imagePrompt.value = data.conversation.image_prompt || "";
+      applyImageMode(data.conversation.image_mode || "text-to-image");
       const conversationRatio = data.conversation.aspect_ratio;
       if (state.options?.aspect_ratios.some((item) => item.label === conversationRatio)) {
         byId("image-aspect-ratio").value = conversationRatio;
       }
       const latestGeneration = data.generations[0];
-      if (latestGeneration) {
+      if (latestGeneration && (latestGeneration.image_mode || "text-to-image") === state.imageMode) {
         if (state.options?.aspect_ratios.some((item) => item.label === latestGeneration.aspect_ratio)) {
           byId("image-aspect-ratio").value = latestGeneration.aspect_ratio;
         }
         byId("image-megapixels").value = Number(latestGeneration.megapixels).toFixed(2);
-        byId("image-sampler").value = latestGeneration.sampler_name;
-        byId("image-scheduler").value = latestGeneration.scheduler;
       }
       restoreConversationSettings();
       updatePromptCount();
@@ -889,6 +1214,7 @@
       } else {
         showEmptyChat();
       }
+      await renderSourceImages(data.source_images || []);
       for (const generation of data.generations.slice(0, 8).reverse()) await addGenerationImage(generation);
       showGeneration(revealGenerationId);
       return data;
@@ -902,12 +1228,11 @@
     try {
       const conversation = await api("/api/conversations", { method: "POST", body: "{}" });
       state.conversationId = conversation.id;
+      applyImageMode("text-to-image");
       imagePrompt.value = "";
       if (state.options) {
         byId("image-aspect-ratio").value = state.options.default_aspect_ratio;
         byId("image-megapixels").value = Number(state.options.megapixels.default).toFixed(2);
-        byId("image-sampler").value = state.options.default_sampler;
-        byId("image-scheduler").value = state.options.default_scheduler;
         saveConversationSettings();
       }
       updatePromptCount();
@@ -1110,8 +1435,9 @@
           seed,
           aspect_ratio: byId("image-aspect-ratio").value,
           megapixels: resolution.megapixels,
-          sampler_name: byId("image-sampler").value,
-          scheduler: byId("image-scheduler").value,
+          image_mode: state.imageMode,
+          source_image_ids: state.imageMode === "edit"
+            ? state.sourceImages.map((sourceImage) => sourceImage.id) : [],
         }, updateGenerationMonitor, (runId) => {
           if (runId) state.generationRunId = runId;
         });
@@ -1142,6 +1468,12 @@
     byId("chat-form").requestSubmit();
   });
   byId("generate-image").addEventListener("click", generateImage);
+  byId("mode-text-to-image").addEventListener("click", () => changeImageMode("text-to-image"));
+  byId("mode-edit").addEventListener("click", () => changeImageMode("edit"));
+  byId("upload-source-images").addEventListener("click", () => byId("source-image-input").click());
+  byId("source-image-input").addEventListener("change", (event) => {
+    uploadSourceImages(event.currentTarget.files || []);
+  });
   byId("older-result").addEventListener("click", () => moveGeneration(1));
   byId("newer-result").addEventListener("click", () => moveGeneration(-1));
   byId("lightbox-close").addEventListener("click", closeImageViewer);
@@ -1184,14 +1516,6 @@
     saveConversationSettings();
   });
   byId("image-seed").addEventListener("input", updateSeedValidity);
-  byId("image-sampler").addEventListener("change", () => {
-    updateResolutionPreview();
-    saveConversationSettings();
-  });
-  byId("image-scheduler").addEventListener("change", () => {
-    updateResolutionPreview();
-    saveConversationSettings();
-  });
   byId("random-seed").addEventListener("click", () => {
     const value = new Uint32Array(1);
     crypto.getRandomValues(value);
@@ -1219,6 +1543,7 @@
 
   updatePromptCount();
   resizeChatInput();
+  updateModeControls();
   if (state.token) {
     setBusy(true);
     loadOptions().then(refreshState).catch((error) => toast(error.message, true));

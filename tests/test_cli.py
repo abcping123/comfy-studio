@@ -14,10 +14,15 @@ from strata_comfy_studio.services import ServiceError
 class CliTests(unittest.TestCase):
     def test_start_starts_all_services_comfyui_first(self) -> None:
         settings = object()
+        lifecycle: list[str] = []
         with (
             patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
-            patch("strata_comfy_studio.cli.validate_artifacts") as validate_artifacts,
-            patch("strata_comfy_studio.cli.prepare_runtime_files") as prepare_runtime_files,
+            patch("strata_comfy_studio.cli.validate_artifacts",
+                  side_effect=lambda _: lifecycle.append("validate")) as validate_artifacts,
+            patch("strata_comfy_studio.cli.prepare_runtime_files",
+                  side_effect=lambda _: lifecycle.append("prepare")) as prepare_runtime_files,
+            patch("strata_comfy_studio.cli.preflight_service_start",
+                  side_effect=lambda *_: lifecycle.append("preflight")) as preflight_service_start,
             patch("strata_comfy_studio.cli.start_service", side_effect=[
                 (101, Path("comfyui.log")),
                 (202, Path("strata.log")),
@@ -31,6 +36,8 @@ class CliTests(unittest.TestCase):
         load_active_config.assert_called_once_with(initialize_if_missing=True)
         validate_artifacts.assert_called_once_with(settings)
         prepare_runtime_files.assert_called_once_with(settings)
+        preflight_service_start.assert_called_once_with(settings, ("comfyui", "strata", "studio"))
+        self.assertEqual(lifecycle, ["prepare", "validate", "preflight"])
         self.assertEqual(start_service.call_args_list, [
             call(settings, "comfyui"),
             call(settings, "strata"),
@@ -83,6 +90,7 @@ class CliTests(unittest.TestCase):
             patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
             patch("strata_comfy_studio.cli.validate_artifacts"),
             patch("strata_comfy_studio.cli.prepare_runtime_files"),
+            patch("strata_comfy_studio.cli.preflight_service_start"),
             patch("strata_comfy_studio.cli.start_service", side_effect=[
                 ServiceError("ComfyUI failed"),
                 (202, Path("strata.log")),
@@ -96,6 +104,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(start_service.call_count, 3)
 
+    def test_start_preflight_failure_starts_no_services(self) -> None:
+        settings = object()
+        error_output = io.StringIO()
+        with (
+            patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)),
+            patch("strata_comfy_studio.cli.validate_artifacts"),
+            patch("strata_comfy_studio.cli.prepare_runtime_files"),
+            patch("strata_comfy_studio.cli.preflight_service_start",
+                  side_effect=ServiceError("stale service PID")),
+            patch("strata_comfy_studio.cli.start_service") as start_service,
+            redirect_stderr(error_output),
+        ):
+            result = main(["start"])
+
+        self.assertEqual(result, 2)
+        self.assertIn("stale service PID", error_output.getvalue())
+        start_service.assert_not_called()
+
     def test_start_reuses_external_strata_without_failing(self) -> None:
         settings = object()
         output = io.StringIO()
@@ -103,6 +129,7 @@ class CliTests(unittest.TestCase):
             patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)),
             patch("strata_comfy_studio.cli.validate_artifacts"),
             patch("strata_comfy_studio.cli.prepare_runtime_files"),
+            patch("strata_comfy_studio.cli.preflight_service_start"),
             patch("strata_comfy_studio.cli.start_service", side_effect=[
                 (101, Path("comfyui.log")),
                 (None, Path("strata.log")),

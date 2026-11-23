@@ -10,7 +10,7 @@ from typing import Any
 from strata_comfy_studio.clients import BackendError
 from strata_comfy_studio.orchestrator import CoordinationError, Orchestrator
 from strata_comfy_studio.settings import Settings, load_config, project_root
-from strata_comfy_studio.storage import ConversationStore
+from strata_comfy_studio.storage import ConversationStore, StorageError
 
 
 class FakeStrata:
@@ -101,6 +101,9 @@ class FakeComfy:
         self.progress_socket: FakeProgressSocket | None = None
         self.fail_progress_connection = False
         self.free_vram_mib = 15000
+        self.saved_subfolder = ""
+        self.input_directory: Path | None = None
+        self.output_directory: Path | None = None
 
     def queue(self) -> dict:
         self.calls.append("queue")
@@ -125,17 +128,33 @@ class FakeComfy:
     def submit_prompt(self, workflow: dict, client_id: str | None = None) -> dict:
         self.calls.append("submit")
         self.submitted = workflow
+        self.saved_subfolder = workflow["8"]["inputs"]["filename_prefix"].split("/", 1)[0]
         self.client_id = client_id
         return {"prompt_id": "prompt-123"}
 
     def history(self, prompt_id: str) -> dict:
         self.calls.append("history")
+        if self.output_directory is None:
+            raise RuntimeError("output directory is not configured")
+        output_folder = self.output_directory / self.saved_subfolder
+        output_folder.mkdir(parents=True, exist_ok=True)
+        (output_folder / "generated.png").write_bytes(b"generated image")
         return {prompt_id: {
             "status": {"status_str": "success", "completed": True},
             "outputs": {"8": {"images": [{
-                "filename": "generated.png", "subfolder": "", "type": "output",
+                "filename": "generated.png", "subfolder": self.saved_subfolder, "type": "output",
             }]}},
         }}
+
+    def upload_image(self, filename: str, content: bytes, content_type: str,
+                     subfolder: str) -> dict:
+        if self.input_directory is None:
+            raise RuntimeError("input directory is not configured")
+        directory = self.input_directory / subfolder
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / filename).write_bytes(content)
+        self.calls.append("upload")
+        return {"name": filename, "subfolder": subfolder, "type": "input"}
 
 
 class OrchestratorTests(unittest.TestCase):
@@ -144,10 +163,15 @@ class OrchestratorTests(unittest.TestCase):
         data["strata"]["min_free_vram_mib"] = 12000
         self.temp = tempfile.TemporaryDirectory()
         data["paths"]["strata_sessions"] = str(Path(self.temp.name) / "sessions")
+        data["paths"]["temp_root"] = str(Path(self.temp.name) / "temp")
+        data["comfyui"]["output_directory"] = str(Path(self.temp.name) / "ComfyUI" / "output")
+        data["comfyui"]["input_directory"] = str(Path(self.temp.name) / "temp" / "comfyui" / "input")
         self.settings = Settings(project_root(), data)
         self.store = ConversationStore(Path(self.temp.name) / "studio.sqlite3")
         self.strata = FakeStrata(self.settings)
         self.comfy = FakeComfy()
+        self.comfy.input_directory = self.settings.path("comfyui.input_directory")
+        self.comfy.output_directory = self.settings.path("comfyui.output_directory")
         self.fake_time = [0.0]
         self.orchestrator = Orchestrator(self.settings, self.store, self.strata, self.comfy,
                                          clock=lambda: self.fake_time[0],
@@ -166,7 +190,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(self.store.context_is_current(conversation_id))
 
         result = self.orchestrator.generate(conversation_id, "A red teapot on white", 42)
-        self.assertEqual(result.image["filename"], "generated.png")
+        self.assertEqual(result.image["filename"], f"{result.generation_id}.png")
         self.assertFalse(self.strata.loaded)
 
         second = self.orchestrator.chat(conversation_id, "Make the light warmer")
@@ -235,7 +259,7 @@ class OrchestratorTests(unittest.TestCase):
 
         result = self.orchestrator.generate(conversation_id, "A red teapot", 42)
 
-        self.assertEqual(result.image["filename"], "generated.png")
+        self.assertEqual(result.image["filename"], f"{result.generation_id}.png")
         self.assertEqual(self.comfy.calls.count("free"), 1)
         self.assertIsNone(result.cleanup_warning)
 
@@ -255,10 +279,135 @@ class OrchestratorTests(unittest.TestCase):
         result = self.orchestrator.generate(conversation_id, "A red teapot", 42,
                                             progress_callback=events.append)
 
-        self.assertEqual(result.image["filename"], "generated.png")
+        self.assertEqual(result.image["filename"], f"{result.generation_id}.png")
         self.assertIn("submit", self.comfy.calls)
         self.assertTrue(any(event.get("message", "").startswith("Live progress unavailable")
                             for event in events))
+
+    def test_generation_routes_image_to_conversation_directory(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+
+        result = self.orchestrator.generate(conversation_id, "A red teapot", 42)
+
+        self.assertEqual(
+            self.comfy.submitted["8"]["inputs"]["filename_prefix"],
+            f"{conversation_id}/image",
+        )
+        self.assertEqual(result.image["subfolder"], conversation_id)
+        studio_image = (
+            self.settings.path("paths.temp_root") / "comfyui" / conversation_id
+            / f"{result.generation_id}.png"
+        )
+        comfy_image = self.settings.path("comfyui.output_directory") / conversation_id / "generated.png"
+        self.assertTrue(studio_image.is_file())
+        self.assertEqual(studio_image.read_bytes(), b"generated image")
+        self.assertFalse(comfy_image.exists())
+
+    def test_edit_generation_uploads_ordered_sources_and_persists_provenance(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        self.store.set_conversation_mode(conversation_id, "edit")
+        base = self.orchestrator.upload_source_image(
+            conversation_id, b"base-image", "image/png", ".png", 1920, 1080,
+        )
+        reference = self.orchestrator.upload_source_image(
+            conversation_id, b"reference-image", "image/jpeg", ".jpg", 800, 1200,
+        )
+
+        result = self.orchestrator.generate(
+            conversation_id, "Edit <Picture 1> using <Picture 2>.", 42,
+            megapixels=4.0, image_mode="edit",
+            source_image_ids=[base["id"], reference["id"]],
+        )
+
+        workflow = self.comfy.submitted
+        self.assertEqual(workflow["9"]["inputs"]["image"], f"{conversation_id}/{base['filename']}")
+        self.assertEqual(workflow["13"]["inputs"]["image"],
+                         f"{conversation_id}/{reference['filename']}")
+        self.assertEqual(workflow["4"]["inputs"]["images.image_2"], ["13", 0])
+        generation = self.store.generation(result.generation_id)
+        self.assertEqual(generation["image_mode"], "edit")
+        self.assertEqual(generation["source_image_ids"], [base["id"], reference["id"]])
+        self.assertEqual([name for name in self.comfy.calls if name == "upload"], ["upload", "upload"])
+        with self.assertRaisesRegex(StorageError, "used by a generation"):
+            self.orchestrator.delete_source_image(conversation_id, base["id"])
+        self.assertTrue(
+            (self.settings.path("comfyui.input_directory") / conversation_id / base["filename"]).is_file()
+        )
+
+    def test_removing_unused_source_image_deletes_its_uploaded_file(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        source = self.orchestrator.upload_source_image(
+            conversation_id, b"base-image", "image/png", ".png", 100, 100,
+        )
+        image_path = self.settings.path("comfyui.input_directory") / conversation_id / source["filename"]
+
+        self.orchestrator.delete_source_image(conversation_id, source["id"])
+
+        self.assertFalse(image_path.exists())
+        self.assertIsNone(self.store.source_image(conversation_id, source["id"]))
+
+    def test_edit_chat_forwards_ordered_images_and_keeps_source_ratio(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        self.store.set_conversation_mode(conversation_id, "edit")
+        base = self.orchestrator.upload_source_image(
+            conversation_id, b"base-image", "image/png", ".png", 1920, 1080,
+        )
+        reference = self.orchestrator.upload_source_image(
+            conversation_id, b"reference-image", "image/jpeg", ".jpg", 800, 600,
+        )
+        self.strata.aspect_ratio = "4:3 (Standard)"
+
+        result = self.orchestrator.chat(
+            conversation_id, "Keep the composition and change the colors.",
+            current_aspect_ratio="16:9 (Widescreen)",
+        )
+
+        self.assertEqual(result.aspect_ratio, "16:9 (Widescreen)")
+        messages = self.strata.calls[-2][1]
+        message_content = messages[-1]["content"]
+        self.assertIsInstance(message_content, list)
+        self.assertIn('"source_image_count": 2', message_content[0]["text"])
+        self.assertIn("<Picture 1> (base image)", message_content[0]["text"])
+        self.assertIn("<Picture 2> (reference image)", message_content[0]["text"])
+        image_urls = [
+            part["image_url"]["url"] for part in message_content if part["type"] == "image_url"
+        ]
+        self.assertEqual(image_urls, [
+            str(self.settings.path("comfyui.input_directory") / conversation_id / base["filename"]),
+            str(self.settings.path("comfyui.input_directory") / conversation_id / reference["filename"]),
+        ])
+        self.assertNotIn("不会收到上传图片的像素内容", messages[0]["content"])
+
+    def test_edit_chat_fails_when_an_uploaded_image_file_is_missing(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        self.store.set_conversation_mode(conversation_id, "edit")
+        source = self.orchestrator.upload_source_image(
+            conversation_id, b"base-image", "image/png", ".png", 100, 100,
+        )
+        image_path = self.settings.path("comfyui.input_directory") / conversation_id / source["filename"]
+        image_path.unlink()
+
+        with self.assertRaisesRegex(CoordinationError, "source image file is missing"):
+            self.orchestrator.chat(conversation_id, "Describe and edit the image")
+
+        self.assertNotIn("chat", [name for name, _ in self.strata.calls])
+
+    def test_deleting_conversation_removes_sources_but_keeps_generated_output_folder(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        source = self.orchestrator.upload_source_image(
+            conversation_id, b"base-image", "image/png", ".png", 100, 100,
+        )
+        source_path = self.settings.path("comfyui.input_directory") / conversation_id / source["filename"]
+        output_folder = self.settings.path("paths.temp_root") / "comfyui" / conversation_id
+        output_folder.mkdir(parents=True, exist_ok=True)
+        output_image = output_folder / "image_00001_.png"
+        output_image.write_bytes(b"generated")
+
+        warning = self.orchestrator.delete_conversation(conversation_id)
+
+        self.assertIsNone(warning)
+        self.assertFalse(source_path.exists())
+        self.assertEqual(output_image.read_bytes(), b"generated")
 
     def test_chat_includes_current_editor_prompt_and_aspect_ratio(self) -> None:
         conversation_id = self.store.create_conversation()["id"]

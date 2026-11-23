@@ -86,6 +86,7 @@ class InitializeTests(unittest.TestCase):
             self.assertEqual(active["comfyui"]["main_script"], str(comfyui_repo / "main.py"))
             self.assertEqual(active["comfyui"]["working_directory"], str(comfyui_repo))
             self.assertEqual(active["comfyui"]["output_directory"], str(comfyui_repo / "output"))
+            self.assertEqual(active["comfyui"]["input_directory"], "temp/comfyui/input")
 
     def test_initialization_derives_paths_from_terminal_layout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -172,6 +173,12 @@ class InitializeTests(unittest.TestCase):
             source_path.write_text(json.dumps({
                 "api_key": "source-key",
                 "args": ["--max-context", "32768"],
+                "vision": {
+                    "exe": "strata-vision",
+                    "mmproj": "mmproj.gguf",
+                    "model": "model.gguf",
+                    "gpu": True,
+                },
                 "env": {"SHOULD_NOT_COPY": "value"},
             }), encoding="utf-8")
             data = sample_config()
@@ -185,10 +192,18 @@ class InitializeTests(unittest.TestCase):
 
             self.assertEqual(runtime_path, root / "temp" / "strata" / "runtime.json")
             self.assertTrue((root / "temp" / "comfyui").is_dir())
+            self.assertTrue(settings.path("comfyui.output_directory").is_dir())
+            self.assertTrue(settings.path("comfyui.input_directory").is_dir())
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
             self.assertEqual(runtime["api_key"], "private-key")
             self.assertEqual(runtime["host"], "127.0.0.1")
             self.assertEqual(runtime["port"], 8080)
+            self.assertEqual(runtime["vision"], {
+                "exe": "strata-vision",
+                "mmproj": "mmproj.gguf",
+                "model": "model.gguf",
+                "gpu": True,
+            })
             self.assertNotIn("env", runtime)
             self.assertEqual(runtime_path.stat().st_mode & 0o777, 0o600)
             self.assertFalse((root / "config" / "model_paths.yaml").exists())

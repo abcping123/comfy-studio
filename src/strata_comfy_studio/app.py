@@ -12,12 +12,14 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from .clients import BackendError, ComfyUIClient, StrataClient
+from .image_assets import MAX_SOURCE_IMAGE_BYTES, SourceImageError, inspect_source_image
 from .orchestrator import CoordinationError, Orchestrator
 from .security import require_access
 from .settings import ConfigError, Settings, default_config_path, load_config
-from .storage import ConversationStore, StorageError
+from .storage import ConversationStore, StorageConflictError, StorageError
 from .system_metrics import SystemMetrics
 
 
@@ -37,6 +39,23 @@ class GenerateRequest(BaseModel):
     megapixels: float | None = Field(default=None, ge=0.5, le=20.0, multiple_of=0.01)
     sampler_name: str | None = None
     scheduler: str | None = None
+    image_mode: Literal["text-to-image", "edit"] = "text-to-image"
+    source_image_ids: list[str] = Field(default_factory=list, max_length=5)
+
+
+class ConversationModeRequest(BaseModel):
+    image_mode: Literal["text-to-image", "edit"]
+
+
+class SourceImageOrderRequest(BaseModel):
+    source_image_ids: list[str] = Field(max_length=5)
+
+
+def _public_source_image(source_image: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: source_image[key]
+        for key in ("id", "content_type", "size_bytes", "width", "height", "position", "created_at", "in_use")
+    }
 
 
 def _message_for_ui(message: dict[str, str]) -> dict[str, str]:
@@ -348,12 +367,16 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
             "default_aspect_ratio": generation["default_aspect_ratio"],
             "megapixels": {"min": 0.5, "max": 20.0, "step": 0.01,
                            "default": generation["default_megapixels"]},
+            "edit_megapixels": {"min": 0.5, "max": 16.0, "step": 0.01,
+                                "default": min(generation["default_megapixels"], 16.0)},
             "resolution_multiple": generation["resolution_multiple"],
-            "samplers": generation["sampler_options"],
-            "default_sampler": generation["default_sampler"],
-            "schedulers": generation["scheduler_options"],
-            "default_scheduler": generation["default_scheduler"],
             "prompt_enhancement": False,
+            "source_images": {
+                "max_count": 5,
+                "max_bytes": MAX_SOURCE_IMAGE_BYTES,
+                "max_megapixels": 100,
+                "allowed_types": ["image/png", "image/jpeg", "image/webp"],
+            },
         }
 
     @app.post("/api/conversations", dependencies=[Depends(authenticated)])
@@ -372,17 +395,116 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
             "conversation": conversation,
             "messages": [_message_for_ui(message) for message in store.display_messages(conversation_id)],
             "generations": store.generations(conversation_id),
+            "source_images": [
+                _public_source_image(image) for image in store.source_images(conversation_id)
+            ],
         }
 
-    @app.delete("/api/conversations/{conversation_id}", dependencies=[Depends(authenticated)])
-    async def delete_conversation(conversation_id: str) -> dict[str, bool]:
+    @app.put("/api/conversations/{conversation_id}/mode", dependencies=[Depends(authenticated)])
+    async def set_conversation_mode(conversation_id: str, body: ConversationModeRequest) -> dict[str, str]:
         try:
-            orchestrator.delete_conversation(conversation_id)
+            orchestrator.set_conversation_mode(conversation_id, body.image_mode)
+        except StorageError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except CoordinationError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"image_mode": body.image_mode}
+
+    @app.post("/api/conversations/{conversation_id}/source-images",
+              dependencies=[Depends(authenticated)])
+    async def upload_source_image(conversation_id: str, request: Request) -> dict[str, Any]:
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type not in {"image/png", "image/jpeg", "image/webp"}:
+            raise HTTPException(status_code=415, detail="Only PNG, JPEG, and WebP source images are supported.")
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail="Invalid Content-Length header.") from error
+            if declared_length < 0:
+                raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
+            if declared_length > MAX_SOURCE_IMAGE_BYTES:
+                raise HTTPException(status_code=413, detail="Source images may not exceed 25 MiB.")
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > MAX_SOURCE_IMAGE_BYTES:
+                raise HTTPException(status_code=413, detail="Source images may not exceed 25 MiB.")
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        try:
+            inspected = await run_in_threadpool(inspect_source_image, content, content_type)
+        except SourceImageError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        try:
+            source_image = orchestrator.upload_source_image(
+                conversation_id, content, inspected.content_type, inspected.extension,
+                inspected.width, inspected.height,
+            )
+        except StorageError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except CoordinationError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except BackendError as error:
+            raise HTTPException(status_code=502, detail="ComfyUI source image upload failed.") from error
+        return _public_source_image(source_image)
+
+    @app.put("/api/conversations/{conversation_id}/source-images/order",
+             dependencies=[Depends(authenticated)])
+    async def reorder_source_images(conversation_id: str,
+                                    body: SourceImageOrderRequest) -> dict[str, Any]:
+        try:
+            source_images = orchestrator.reorder_source_images(
+                conversation_id, body.source_image_ids,
+            )
+        except StorageError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except CoordinationError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"source_images": [_public_source_image(image) for image in source_images]}
+
+    @app.delete("/api/conversations/{conversation_id}/source-images/{source_image_id}",
+                dependencies=[Depends(authenticated)])
+    async def delete_source_image(conversation_id: str, source_image_id: str) -> dict[str, bool]:
+        try:
+            orchestrator.delete_source_image(conversation_id, source_image_id)
+        except StorageConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except StorageError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except CoordinationError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"deleted": True}
+
+    @app.get("/api/conversations/{conversation_id}/source-images/{source_image_id}",
+             dependencies=[Depends(authenticated)])
+    async def source_image(conversation_id: str, source_image_id: str) -> Response:
+        try:
+            image_record = store.source_image(conversation_id, source_image_id)
+        except StorageError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        if image_record is None:
+            raise HTTPException(status_code=404, detail="Source image not found.")
+        try:
+            content, media_type = comfy.image(
+                image_record["filename"], image_record["subfolder"], "input",
+            )
+        except BackendError as error:
+            raise HTTPException(status_code=502, detail="ComfyUI source image retrieval failed.") from error
+        return Response(content, media_type=media_type,
+                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+    @app.delete("/api/conversations/{conversation_id}", dependencies=[Depends(authenticated)])
+    async def delete_conversation(conversation_id: str) -> dict[str, Any]:
+        try:
+            cleanup_warning = orchestrator.delete_conversation(conversation_id)
+        except StorageError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except CoordinationError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"deleted": True, "cleanup_warning": cleanup_warning}
 
     @app.post("/api/chat", dependencies=[Depends(authenticated)])
     async def chat(body: ChatRequest) -> dict[str, Any]:
@@ -459,9 +581,11 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
     @app.post("/api/generate", dependencies=[Depends(authenticated)])
     async def generate(body: GenerateRequest) -> dict[str, Any]:
         try:
-            result = orchestrator.generate(body.conversation_id, body.prompt, body.seed,
-                                           body.aspect_ratio, body.megapixels,
-                                           body.sampler_name, body.scheduler)
+            result = orchestrator.generate(
+                body.conversation_id, body.prompt, body.seed,
+                body.aspect_ratio, body.megapixels, body.sampler_name, body.scheduler,
+                image_mode=body.image_mode, source_image_ids=body.source_image_ids,
+            )
         except CoordinationError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {
@@ -485,6 +609,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
                     body.aspect_ratio, body.megapixels,
                     body.sampler_name, body.scheduler,
                     progress_callback=run.publish,
+                    image_mode=body.image_mode, source_image_ids=body.source_image_ids,
                 )
                 generation_runs.finish(run, {
                     "type": "done",
@@ -519,12 +644,11 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         if generation is None or generation["status"] != "complete" or not generation["filename"]:
             raise HTTPException(status_code=404, detail="Generated image not found")
         try:
-            content, media_type = comfy.image(generation["filename"], generation["subfolder"] or "",
-                                              generation["image_type"] or "output")
-        except BackendError as error:
-            raise HTTPException(status_code=502, detail="ComfyUI image retrieval failed") from error
-        return Response(content, media_type=media_type,
-                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+            image_path = orchestrator.generated_image_path(generation)
+        except CoordinationError as error:
+            raise HTTPException(status_code=404, detail="Generated image not found") from error
+        return FileResponse(image_path, media_type="image/png",
+                            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
     return app
 

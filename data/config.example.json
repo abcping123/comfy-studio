@@ -10,7 +10,8 @@
     "strata_sessions": "temp/strata",
     "database": "temp/studio.sqlite3",
     "temp_root": "temp",
-    "workflow_api": "data/comfyui/minimax_h3_image_t2i.json"
+    "workflow_api": "data/comfyui/minimax_h3_image_t2i.json",
+    "workflow_edit_api": "data/comfyui/minimax_h3_image_edit.json"
   },
   "strata": {
     "endpoint": "http://127.0.0.1:8080",
@@ -31,6 +32,7 @@
     "diffusion_models_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/diffusion_models",
     "text_encoders_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3/text_encoders",
     "vae_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/vae",
+    "input_directory": "temp/comfyui/input",
     "models": {
       "diffusion_model": "minimax_h3_image_pruned_int8_convrot.safetensors",
       "text_encoder": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
@@ -45,6 +47,7 @@
     "prompt_enhancement": false,
     "prompt_skill_version": 3,
     "system_prompt_file": "data/strata/minimax_h3_image_t2i.txt",
+    "edit_system_prompt_file": "data/strata/minimax_h3_image_edit.txt",
     "aspect_ratios": [
       {"label": "1:1 (Square)", "width": 1, "height": 1},
       {"label": "2:3 (Portrait Photo)", "width": 2, "height": 3},

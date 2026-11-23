@@ -17,6 +17,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(graph["4"]["inputs"]["prompt"], "A glass greenhouse at dawn")
         self.assertEqual(graph["4"]["inputs"]["width"], 2048)
         self.assertEqual(graph["4"]["inputs"]["height"], 2048)
+        self.assertEqual(graph["6"]["inputs"]["sampler_name"], "euler")
+        self.assertEqual(graph["6"]["inputs"]["scheduler"], "simple")
         self.assertEqual(graph["2"]["inputs"]["clip_name"],
                          self.settings.data["comfyui"]["models"]["text_encoder"])
 
@@ -45,6 +47,53 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(graph["4"]["inputs"]["height"], 1760)
         self.assertEqual(graph["6"]["inputs"]["sampler_name"], "euler_ancestral")
         self.assertEqual(graph["6"]["inputs"]["scheduler"], "normal")
+
+    def test_edit_workflow_resizes_base_and_maps_ordered_reference_images(self) -> None:
+        source_images = [
+            {"filename": "base.png", "subfolder": "a" * 32, "width": 1920, "height": 1080},
+            {"filename": "ref2.jpg", "subfolder": "a" * 32, "width": 800, "height": 1200},
+            {"filename": "ref3.png", "subfolder": "a" * 32, "width": 640, "height": 480},
+            {"filename": "ref4.webp", "subfolder": "a" * 32, "width": 400, "height": 400},
+            {"filename": "ref5.png", "subfolder": "a" * 32, "width": 1280, "height": 720},
+        ]
+        graph = build_workflow(
+            self.settings, "Edit <Picture 1> using <Picture 2>.", 7,
+            megapixels=4.0, image_mode="edit", source_images=source_images,
+        )
+
+        self.assertEqual(graph["9"]["inputs"]["image"], f"{'a' * 32}/base.png")
+        self.assertEqual(graph["10"]["inputs"]["resize_type"], "scale total pixels")
+        self.assertEqual(graph["10"]["inputs"]["resize_type.megapixels"], 4.0)
+        self.assertEqual(graph["11"]["inputs"]["resize_type"], "scale to multiple")
+        self.assertEqual(graph["11"]["inputs"]["resize_type.multiple"], 32)
+        for index, image in enumerate(source_images, start=1):
+            image_node = str(11 + index) if index > 1 else "11"
+            self.assertEqual(graph["4"]["inputs"][f"images.image_{index}"], [image_node, 0])
+            if index > 1:
+                self.assertEqual(
+                    graph[image_node]["inputs"]["image"],
+                    f"{'a' * 32}/{image['filename']}",
+                )
+        self.assertEqual(graph["4"]["inputs"]["width"], ["12", 0])
+        self.assertEqual(graph["4"]["inputs"]["height"], ["12", 1])
+
+    def test_edit_workflow_requires_base_image_and_obeys_resize_limit(self) -> None:
+        with self.assertRaisesRegex(WorkflowError, "requires one base image"):
+            build_workflow(self.settings, "Edit", 7, image_mode="edit", source_images=[])
+        with self.assertRaisesRegex(WorkflowError, "between 0.5 and 16.0"):
+            build_workflow(
+                self.settings, "Edit", 7, megapixels=16.01, image_mode="edit",
+                source_images=[{
+                    "filename": "base.png", "subfolder": "a" * 32, "width": 1024, "height": 1024,
+                }],
+            )
+        with self.assertRaisesRegex(WorkflowError, "unsafe"):
+            build_workflow(
+                self.settings, "Edit", 7, image_mode="edit",
+                source_images=[{
+                    "filename": "../base.png", "subfolder": "a" * 32, "width": 1024, "height": 1024,
+                }],
+            )
 
     def test_unconfigured_sampler_is_rejected(self) -> None:
         with self.assertRaisesRegex(WorkflowError, "KSampler options"):

@@ -96,6 +96,43 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(generation["height"], 2048)
         self.assertEqual(generation["sampler_name"], "euler")
         self.assertEqual(generation["scheduler"], "simple")
+        self.assertEqual(generation["image_mode"], "text-to-image")
+        self.assertEqual(generation["source_image_ids"], [])
+
+    def test_source_images_are_ordered_scoped_and_linked_to_edit_generations(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        other_conversation_id = self.store.create_conversation()["id"]
+        self.store.set_conversation_mode(conversation_id, "edit")
+        base_id = "1" * 32
+        reference_id = "2" * 32
+        self.store.create_source_image(
+            base_id, conversation_id, f"{base_id}.png", conversation_id,
+            "image/png", 100, 1920, 1080,
+        )
+        self.store.create_source_image(
+            reference_id, conversation_id, f"{reference_id}.jpg", conversation_id,
+            "image/jpeg", 200, 800, 1200,
+        )
+
+        generation_id = self.store.create_generation(
+            conversation_id, "Edit <Picture 1>", 7, "Source image", 4.0,
+            2720, 1504, "euler", "simple", "edit", [base_id, reference_id],
+        )
+
+        generation = self.store.generation(generation_id)
+        self.assertEqual(generation["image_mode"], "edit")
+        self.assertEqual(generation["source_image_ids"], [base_id, reference_id])
+        self.assertTrue(self.store.source_images(conversation_id)[0]["in_use"])
+        with self.assertRaisesRegex(StorageError, "does not belong"):
+            self.store.source_images_by_ids(other_conversation_id, [base_id])
+        with self.assertRaisesRegex(StorageError, "used by"):
+            self.store.delete_source_image(conversation_id, base_id)
+
+        reordered = self.store.reorder_source_images(conversation_id, [reference_id, base_id])
+        self.assertEqual([image["id"] for image in reordered], [reference_id, base_id])
+        self.assertTrue(self.store.delete_conversation(conversation_id))
+        self.assertEqual(self.store.source_images(conversation_id), [])
+        self.assertIsNone(self.store.get_conversation(conversation_id))
 
     def test_invalid_ids_and_nonexistent_conversations_are_rejected(self) -> None:
         with self.assertRaisesRegex(StorageError, "invalid conversation id"):

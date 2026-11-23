@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Strata + MiniMax Studio</title>
-  <link rel="stylesheet" href="/assets/app.css?v=3">
-  <script src="/assets/app.js?v=3" defer></script>
+  <link rel="stylesheet" href="/assets/app.css?v=12">
+  <script src="/assets/app.js?v=10" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -27,7 +27,6 @@
       <div class="sidebar-head">
         <button id="new-conversation" class="new-button" type="button" title="New chat"><span aria-hidden="true">+</span><span class="new-button-label">New chat</span></button>
       </div>
-      <div class="sidebar-section-title">Recent</div>
       <nav id="conversation-list" class="conversation-list" aria-label="Recent conversations"></nav>
       <div class="sidebar-foot" aria-label="System utilization">
         <div class="system-metric">
@@ -57,7 +56,7 @@
         <label class="visually-hidden" for="chat-input">Message Strata</label>
         <textarea id="chat-input" rows="2" maxlength="20000" placeholder="Describe the image you have in mind..."></textarea>
         <div class="composer-foot">
-          <span class="composer-hint">Strata will help shape the image prompt</span>
+          <span id="composer-hint" class="composer-hint">Strata will help shape the image prompt</span>
           <div class="composer-actions">
             <label class="thinking-effort" for="thinking-effort"><span>Thinking</span>
               <select id="thinking-effort" aria-label="Thinking effort" title="Thinking effort">
@@ -75,42 +74,54 @@
 
     <aside class="prompt-column" aria-label="Image prompt and output">
       <div class="prompt-editor-wrap">
-        <label for="image-prompt" class="field-label">Prompt</label>
-        <textarea id="image-prompt" class="prompt-editor" maxlength="20000" placeholder="A detailed prompt from your conversation will appear here."></textarea>
-        <div class="prompt-meta"><span id="prompt-count">0 characters</span></div>
+        <div id="image-mode-switch" class="image-mode-switch" role="group" aria-label="Image mode">
+          <button id="mode-text-to-image" class="mode-button is-active" type="button"
+                  aria-pressed="true">Text to image</button>
+          <button id="mode-edit" class="mode-button" type="button" aria-pressed="false">Image edit</button>
+        </div>
+        <section id="source-image-panel" class="source-image-panel" aria-label="Edit source images"
+                 aria-describedby="source-image-help" hidden>
+          <div class="source-image-heading">
+            <span id="source-image-count" class="source-image-count">0 / 5</span>
+          </div>
+          <input id="source-image-input" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+          <p id="source-image-help" class="visually-hidden">
+            Images are ordered. Picture 1 is the edit target; later pictures are references.
+            Drag pictures to change their order. Keyboard users can focus a picture and press Alt+Shift+Left or Alt+Shift+Right.
+          </p>
+          <div id="source-image-list" class="source-image-list">
+            <button id="upload-source-images" class="source-image-add" type="button"
+                    title="Add a base image" aria-label="Add a base image">
+              <span class="source-image-add-icon" aria-hidden="true">+</span>
+              <span class="source-image-add-label visually-hidden">Add a base image</span>
+            </button>
+          </div>
+        </section>
+        <label id="image-prompt-label" for="image-prompt" class="field-label visually-hidden">Prompt</label>
+        <div class="prompt-input-wrap">
+          <textarea id="image-prompt" class="prompt-editor" maxlength="20000" placeholder="A detailed prompt from your conversation will appear here."></textarea>
+          <div class="prompt-meta"><span id="prompt-count">0 characters</span></div>
+        </div>
       </div>
 
       <div class="settings-block">
-        <div class="settings-title">Resolution</div>
         <div class="resolution-grid">
           <label class="field-control ratio-control" for="image-aspect-ratio">Aspect ratio
             <select id="image-aspect-ratio" disabled></select>
           </label>
-          <label class="field-control" for="image-megapixels">Pixels (MP)
+          <label class="field-control" for="image-megapixels"><span id="megapixels-label">Pixels (MP)</span>
             <input id="image-megapixels" type="number" min="0.5" max="20" step="0.01" value="4.00">
           </label>
           <div class="field-control output-control">
             <span>Output size</span>
             <div class="resolution-preview" aria-live="polite">
               <span id="resolution-value">2048 x 2048 px</span>
-              <span id="resolution-details">4.00 MP target / 32 px aligned</span>
             </div>
           </div>
-        </div>
-        <div class="selector-grid sampling-grid">
-          <label class="field-control" for="image-sampler">Sampler
-            <select id="image-sampler" disabled></select>
+          <label class="field-control" for="image-seed">Seed
+            <input id="image-seed" type="number" min="0" max="18446744073709551615" step="1" value="42" required>
           </label>
-          <label class="field-control" for="image-scheduler">Scheduler
-            <select id="image-scheduler" disabled></select>
-          </label>
-          <div class="seed-control">
-            <label for="image-seed">Seed</label>
-            <div class="seed-row">
-              <input id="image-seed" type="number" min="0" max="18446744073709551615" step="1" value="42" required>
-              <button id="random-seed" class="icon-button" type="button" title="Randomize seed" aria-label="Randomize seed">&#8635;</button>
-            </div>
-          </div>
+          <button id="random-seed" class="icon-button" type="button" title="Randomize seed" aria-label="Randomize seed">&#8635;</button>
         </div>
         <button id="generate-image" class="generate-button" type="button" disabled>
           <span id="generate-image-label" class="generate-button-label" aria-live="polite">Generate image</span>
@@ -123,7 +134,7 @@
       </div>
 
       <section class="result-section" aria-label="Generated images">
-        <div class="result-heading"><span class="settings-title">Results</span><span id="result-count" class="result-count" aria-live="polite">0</span></div>
+        <span id="result-count" class="visually-hidden" aria-live="polite">0</span>
         <div id="result-viewer" class="result-viewer">
           <button id="older-result" class="gallery-nav gallery-nav-older" type="button" title="Older image" aria-label="Older image" aria-controls="image-gallery" disabled>
             <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>
@@ -156,7 +167,7 @@
   <dialog id="delete-dialog" class="confirm-dialog">
     <div class="eyebrow">CONVERSATION</div>
     <h2 id="delete-title">Delete conversation?</h2>
-    <p id="delete-copy">The chat and saved Strata context will be removed. Generated PNG files remain in ComfyUI's output folder.</p>
+    <p id="delete-copy">The chat, saved Strata context, and uploaded source images will be removed. Generated PNG files remain in temp/comfyui.</p>
     <div class="dialog-actions">
       <button id="cancel-delete" class="quiet-button" type="button">Cancel</button>
       <button id="confirm-delete" class="danger-button" type="button">Delete</button>

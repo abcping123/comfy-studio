@@ -22,6 +22,7 @@ def sample_config() -> dict:
             "database": "temp/studio.sqlite3",
             "temp_root": "temp",
             "workflow_api": "data/comfyui/minimax_h3_image_t2i.json",
+            "workflow_edit_api": "data/comfyui/minimax_h3_image_edit.json",
         },
         "strata": {
             "endpoint": "http://127.0.0.1:8080",
@@ -42,12 +43,13 @@ def sample_config() -> dict:
             "diffusion_models_dir": "/models/diffusion_models",
             "text_encoders_dir": "/models/text_encoders",
             "vae_dir": "/models/vae",
+            "input_directory": "temp/comfyui/input",
             "models": {
                 "diffusion_model": "minimax.safetensors",
                 "text_encoder": "qwen3vl_minimax.safetensors",
                 "vae": "vae.safetensors",
             },
-            "output_directory": "/srv/comfy/output",
+            "output_directory": "temp/comfyui",
             "gpu_id": 0,
             "request_timeout_s": 1800,
             "poll_interval_s": 1.0,
@@ -56,6 +58,7 @@ def sample_config() -> dict:
             "prompt_enhancement": False,
             "prompt_skill_version": 1,
             "system_prompt_file": "data/strata/minimax_h3_image_t2i.txt",
+            "edit_system_prompt_file": "data/strata/minimax_h3_image_edit.txt",
             "aspect_ratios": [
                 {"label": "1:1 (Square)", "width": 1, "height": 1},
                 {"label": "4:3 (Standard)", "width": 4, "height": 3},
@@ -103,6 +106,20 @@ class SettingsTests(unittest.TestCase):
             settings = load_config(config_path)
             self.assertEqual(settings.path("paths.database"),
                              Path(directory) / "temp/studio.sqlite3")
+
+    def test_older_config_gets_edit_paths_without_losing_existing_settings(self) -> None:
+        data = sample_config()
+        del data["paths"]["workflow_edit_api"]
+        del data["comfyui"]["input_directory"]
+        del data["generation"]["edit_system_prompt_file"]
+
+        validated = validate_config(data)
+
+        self.assertEqual(validated["paths"]["workflow_edit_api"],
+                         "data/comfyui/minimax_h3_image_edit.json")
+        self.assertEqual(validated["comfyui"]["input_directory"], "temp/comfyui/input")
+        self.assertEqual(validated["generation"]["edit_system_prompt_file"],
+                         "data/strata/minimax_h3_image_edit.txt")
 
     def test_non_loopback_backend_is_rejected(self) -> None:
         data = sample_config()

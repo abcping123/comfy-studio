@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 import threading
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from strata_comfy_studio.app import ChatRunManager, GenerationRunManager, create_app
 from strata_comfy_studio.orchestrator import ChatOutcome, GenerationOutcome
@@ -22,11 +24,25 @@ class AppStrata:
 
 
 class AppComfy:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
     def queue(self) -> dict:
         return {"queue_running": [], "queue_pending": []}
 
     def system_stats(self) -> dict:
         return {"devices": [{"index": 0, "vram_free": 12 * 1024 * 1024 * 1024}]}
+
+    def upload_image(self, filename: str, content: bytes, content_type: str,
+                     subfolder: str) -> dict:
+        directory = self.settings.path("comfyui.input_directory") / subfolder
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / filename).write_bytes(content)
+        return {"name": filename, "subfolder": subfolder, "type": "input"}
+
+    def image(self, filename: str, subfolder: str, image_type: str) -> tuple[bytes, str]:
+        path = self.settings.path("comfyui.input_directory") / subfolder / filename
+        return path.read_bytes(), "image/png"
 
 
 class AppTests(unittest.TestCase):
@@ -37,7 +53,7 @@ class AppTests(unittest.TestCase):
         self.data["app"]["access_token"] = "test-access-token"
         self.settings = Settings(self.root, self.data)
         self.store = ConversationStore(self.root / "studio.sqlite3")
-        self.app = create_app(self.settings, self.store, AppStrata(), AppComfy())
+        self.app = create_app(self.settings, self.store, AppStrata(), AppComfy(self.settings))
         self.client = TestClient(self.app)
 
     def tearDown(self) -> None:
@@ -49,6 +65,9 @@ class AppTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn("Fieldnotes", page.text)
         self.assertIn('id="delete-dialog"', page.text)
+        self.assertIn('id="image-mode-switch"', page.text)
+        self.assertNotIn('id="image-sampler"', page.text)
+        self.assertNotIn('id="image-scheduler"', page.text)
         self.assertNotIn("DIRECT PROMPT", page.text)
         self.assertNotIn("Enhancement off", page.text)
         self.assertEqual(self.client.get("/api/state").status_code, 401)
@@ -82,7 +101,13 @@ class AppTests(unittest.TestCase):
         self.assertEqual(options["megapixels"]["min"], 0.5)
         self.assertEqual(options["megapixels"]["max"], 20.0)
         self.assertEqual(options["megapixels"]["default"], 4.0)
+        self.assertEqual(options["edit_megapixels"]["max"], 16.0)
+        self.assertEqual(options["source_images"]["max_count"], 5)
         self.assertEqual(options["resolution_multiple"], 32)
+        self.assertNotIn("samplers", options)
+        self.assertNotIn("default_sampler", options)
+        self.assertNotIn("schedulers", options)
+        self.assertNotIn("default_scheduler", options)
         self.assertFalse(options["prompt_enhancement"])
 
     def test_generate_stream_rejects_megapixels_outside_half_to_twenty(self) -> None:
@@ -249,7 +274,8 @@ class AppTests(unittest.TestCase):
 
         def fake_generate(_orchestrator, _conversation_id, _prompt, _seed,
                           _aspect_ratio=None, _megapixels=None, _sampler_name=None,
-                          _scheduler=None, progress_callback=None):
+                          _scheduler=None, progress_callback=None,
+                          image_mode="text-to-image", source_image_ids=None):
             progress_callback({"type": "phase", "message": "Preparing ComfyUI"})
             progress_callback({"type": "progress", "value": 3, "max": 6})
             return result
@@ -272,6 +298,112 @@ class AppTests(unittest.TestCase):
         self.assertEqual(events[-1]["generation_id"], "generation-1")
         self.assertIsNone(self.app.state.generation_runs.active())
         self.assertEqual(generate.call_args.kwargs["progress_callback"].__class__.__name__, "method")
+        self.assertEqual(generate.call_args.kwargs["image_mode"], "text-to-image")
+        self.assertEqual(generate.call_args.kwargs["source_image_ids"], [])
+        self.assertEqual(generate.call_args.args[6:8], (None, None))
+
+    def test_generated_image_is_served_from_studio_session_storage(self) -> None:
+        headers = {"Authorization": "Bearer test-access-token"}
+        conversation = self.client.post("/api/conversations", headers=headers).json()
+        generation_id = self.store.create_generation(
+            conversation["id"], "A red teapot", 42, "1:1 (Square)", 1.0,
+            1024, 1024, "euler", "simple",
+        )
+        filename = f"{generation_id}.png"
+        self.store.update_generation(generation_id, "complete", image={
+            "filename": filename, "subfolder": conversation["id"], "type": "output",
+        })
+        image_path = (
+            self.settings.path("paths.temp_root") / "comfyui" / conversation["id"] / filename
+        )
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_bytes(b"generated PNG")
+
+        response = self.client.get(f"/api/generations/{generation_id}/image", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/png")
+        self.assertEqual(response.content, b"generated PNG")
+
+    def test_source_upload_requires_auth_and_is_scoped_to_its_conversation(self) -> None:
+        headers = {"Authorization": "Bearer test-access-token"}
+        creation = self.client.post("/api/conversations", headers=headers)
+        self.assertEqual(creation.status_code, 200, creation.text)
+        conversation = creation.json()
+        conversation_id = conversation["id"]
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (4, 3), color=(40, 100, 160)).save(image_buffer, format="PNG")
+        image_bytes = image_buffer.getvalue()
+        path = f"/api/conversations/{conversation_id}/source-images"
+
+        self.assertEqual(self.client.post(path, content=image_bytes,
+                                          headers={"Content-Type": "image/png"}).status_code, 401)
+        uploaded = self.client.post(
+            path, content=image_bytes, headers={**headers, "Content-Type": "image/png"},
+        )
+
+        self.assertEqual(uploaded.status_code, 200)
+        source_image = uploaded.json()
+        self.assertEqual((source_image["width"], source_image["height"]), (4, 3))
+        self.assertNotIn("filename", source_image)
+        self.assertEqual(source_image["in_use"], 0)
+        stored = self.client.get(
+            f"/api/conversations/{conversation_id}", headers=headers,
+        ).json()
+        self.assertEqual([item["id"] for item in stored["source_images"]], [source_image["id"]])
+        image_response = self.client.get(
+            f"{path}/{source_image['id']}", headers=headers,
+        )
+        self.assertEqual(image_response.status_code, 200)
+        self.assertEqual(image_response.content, image_bytes)
+
+        other_response = self.client.post("/api/conversations", headers=headers)
+        self.assertEqual(other_response.status_code, 200, other_response.text)
+        other = other_response.json()
+        self.assertEqual(
+            self.client.get(
+                f"/api/conversations/{other['id']}/source-images/{source_image['id']}",
+                headers=headers,
+            ).status_code,
+            404,
+        )
+
+    def test_source_upload_rejects_bad_content_and_unknown_mime(self) -> None:
+        headers = {"Authorization": "Bearer test-access-token"}
+        creation = self.client.post("/api/conversations", headers=headers)
+        self.assertEqual(creation.status_code, 200, creation.text)
+        conversation = creation.json()
+        path = f"/api/conversations/{conversation['id']}/source-images"
+        unsupported = self.client.post(
+            path, content=b"not an image", headers={**headers, "Content-Type": "image/gif"},
+        )
+        malformed = self.client.post(
+            path, content=b"not an image", headers={**headers, "Content-Type": "image/png"},
+        )
+        self.assertEqual(unsupported.status_code, 415)
+        self.assertEqual(malformed.status_code, 422)
+
+    def test_conversation_mode_persists_and_source_order_is_owned(self) -> None:
+        headers = {"Authorization": "Bearer test-access-token"}
+        creation = self.client.post("/api/conversations", headers=headers)
+        self.assertEqual(creation.status_code, 200, creation.text)
+        conversation = creation.json()
+        conversation_id = conversation["id"]
+        mode = self.client.put(
+            f"/api/conversations/{conversation_id}/mode",
+            headers=headers, json={"image_mode": "edit"},
+        )
+        self.assertEqual(mode.json()["image_mode"], "edit")
+        self.assertEqual(
+            self.client.get(f"/api/conversations/{conversation_id}", headers=headers)
+            .json()["conversation"]["image_mode"],
+            "edit",
+        )
+        order = self.client.put(
+            f"/api/conversations/{conversation_id}/source-images/order",
+            headers=headers, json={"source_image_ids": []},
+        )
+        self.assertEqual(order.status_code, 200)
 
     def test_unknown_asset_is_not_served(self) -> None:
         response = self.client.get("/assets/../../config.json")
