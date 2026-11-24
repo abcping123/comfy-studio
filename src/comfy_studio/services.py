@@ -116,11 +116,14 @@ def _service_command_matches(
     args: list[str],
     process_cwd: Path,
 ) -> bool:
-    if service not in ("strata", "comfyui"):
+    if service not in ("studio", "strata", "comfyui"):
         return False
+    command, service_cwd, _, port = service_command(settings, service)
+    if service == "studio":
+        return len(args) == len(command) and args[1:] == command[1:] and process_cwd == service_cwd
+
     config = settings.section(service)
     script_key = "server_script" if service == "strata" else "main_script"
-    _, service_cwd, _, port = service_command(settings, service)
     script_path = Path(config[script_key])
     if not script_path.is_absolute():
         script_path = service_cwd / script_path
@@ -148,7 +151,7 @@ def _service_process_matches(settings: Settings, service: str, pid: int) -> bool
 
 
 def _find_service_processes(settings: Settings, service: str) -> list[int]:
-    if service not in ("strata", "comfyui"):
+    if service not in ("studio", "strata", "comfyui"):
         return []
     return [
         pid
@@ -225,27 +228,6 @@ def _terminate_process(pid: int) -> None:
     os.kill(pid, signal.SIGTERM)
 
 
-def _stop_mismatched_service(settings: Settings, service: str, pid: int, wait_s: float = 10.0) -> None:
-    _, _, host, port = service_command(settings, service)
-    if not _service_process_matches(settings, service, pid):
-        if not _port_open(host, port):
-            return
-        raise ServiceError(
-            f"{service} process PID {pid} changed before it could be stopped; "
-            f"{host}:{port} is still in use"
-        )
-
-    _terminate_process(pid)
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
-        if not _service_process_matches(settings, service, pid) and not _port_open(host, port):
-            return
-        time.sleep(0.1)
-    raise ServiceError(
-        f"{service} did not stop and release {host}:{port} after SIGTERM; no force kill was sent"
-    )
-
-
 def _strata_endpoint_matches(settings: Settings) -> bool:
     config = settings.section("strata")
     api_key = config.get("api_key")
@@ -269,10 +251,18 @@ def _strata_endpoint_matches(settings: Settings) -> bool:
     )
 
 
+def _reject_unmanageable_strata(settings: Settings, service: str) -> None:
+    if service == "strata" and _strata_endpoint_matches(settings):
+        raise ServiceError(
+            "Strata is responding with the configured model, but no matching local process "
+            "was found; it cannot be taken over safely or stopped on Ctrl+C"
+        )
+
+
 def _check_service_start(
     settings: Settings,
     service: str,
-) -> tuple[int | None, bool, bool, int | None]:
+) -> tuple[int | None, bool, int | None]:
     command, cwd, host, port = service_command(settings, service)
     pid_file = _pid_path(settings, service)
     stale_pid_file = False
@@ -285,8 +275,8 @@ def _check_service_start(
         except ValueError:
             invalid_pid_file = True
         else:
-            if _process_matches(old_pid, command, cwd):
-                return old_pid, False, False, None
+            if _service_process_matches(settings, service, old_pid):
+                return old_pid, False, None
             stale_pid_file = not _pid_exists(old_pid)
 
     matching_pids = _find_service_processes(settings, service)
@@ -294,26 +284,23 @@ def _check_service_start(
         if len(matching_pids) != 1:
             raise ServiceError(
                 f"multiple {service} processes match the configured server script and port; "
-                "refusing to stop any of them"
+                "refusing to take over any of them"
             )
-        return None, False, stale_pid_file, matching_pids[0]
+        return None, stale_pid_file, matching_pids[0]
 
     if invalid_pid_file:
-        if service == "strata" and _strata_endpoint_matches(settings):
-            return None, True, False, None
+        _reject_unmanageable_strata(settings, service)
         raise ServiceError(f"invalid pid file; inspect before removing it: {pid_file}")
 
     if old_pid is not None and not stale_pid_file:
-        if service == "strata" and _strata_endpoint_matches(settings):
-            return None, True, False, None
+        _reject_unmanageable_strata(settings, service)
         raise _pid_mismatch_error(pid_file, old_pid, service, command, cwd)
 
     if _port_open(host, port):
-        if service == "strata" and _strata_endpoint_matches(settings):
-            return None, True, stale_pid_file, None
+        _reject_unmanageable_strata(settings, service)
         raise ServiceError(f"refusing to start {service}: {host}:{port} is already in use")
 
-    return None, False, stale_pid_file, None
+    return None, stale_pid_file, None
 
 
 def preflight_service_start(settings: Settings, services: Iterable[str]) -> None:
@@ -329,48 +316,49 @@ def preflight_service_start(settings: Settings, services: Iterable[str]) -> None
 
 
 def service_running(settings: Settings, service: str) -> bool:
-    command, cwd, _, _ = service_command(settings, service)
     pid_file = _pid_path(settings, service)
     try:
         pid = int(pid_file.read_text(encoding="ascii").strip())
     except (OSError, ValueError):
         pid = None
-    if pid is not None and _process_matches(pid, command, cwd):
+    if pid is not None and _service_process_matches(settings, service, pid):
         return True
     return service == "strata" and _strata_endpoint_matches(settings)
 
 
 def start_service(settings: Settings, service: str) -> tuple[int | None, Path]:
+    pid, log_path, _ = start_service_tracked(settings, service)
+    return pid, log_path
+
+
+def start_service_tracked(settings: Settings, service: str) -> tuple[int | None, Path, bool]:
     command, cwd, _, _ = service_command(settings, service)
     pid_file = _pid_path(settings, service)
     log_path = pid_file.parent / "service.log"
     pid_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     set_private_permissions(pid_file.parent, directory=True)
-    existing_pid, external, stale_pid_file, restart_pid = _check_service_start(settings, service)
-    if restart_pid is not None:
-        _stop_mismatched_service(settings, service, restart_pid)
-        pid_file.unlink(missing_ok=True)
-        stale_pid_file = False
+    existing_pid, stale_pid_file, takeover_pid = _check_service_start(settings, service)
     if stale_pid_file:
         pid_file.unlink(missing_ok=True)
-    if external:
-        return None, log_path
     if existing_pid is not None:
-        return existing_pid, log_path
+        return existing_pid, log_path, False
+    if takeover_pid is not None:
+        if not _service_process_matches(settings, service, takeover_pid):
+            raise ServiceError(
+                f"{service} process PID {takeover_pid} changed before it could be taken over"
+            )
+        pid_file.write_text(f"{takeover_pid}\n", encoding="ascii")
+        set_private_permissions(pid_file)
+        return takeover_pid, log_path, False
 
     with log_path.open("ab") as log:
-        if os.name == "nt":
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                creationflags=subprocess.DETACHED_PROCESS,
-            )
-        else:
-            process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
-                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
     if process.poll() is not None:
         raise ServiceError(f"{service} exited during startup; inspect {log_path}")
     try:
@@ -381,7 +369,7 @@ def start_service(settings: Settings, service: str) -> tuple[int | None, Path]:
         if _process_matches(process.pid, command, cwd):
             _terminate_process(process.pid)
         raise ServiceError(f"could not record the {service} pid: {error}") from error
-    return process.pid, log_path
+    return process.pid, log_path, True
 
 
 def stop_service(settings: Settings, service: str, wait_s: float = 10.0) -> bool | None:
@@ -397,7 +385,7 @@ def stop_service(settings: Settings, service: str, wait_s: float = 10.0) -> bool
         if service == "strata" and _strata_endpoint_matches(settings):
             return None
         raise ServiceError(f"invalid pid file; leaving it untouched: {pid_file}") from error
-    if not _process_matches(pid, command, cwd):
+    if not _service_process_matches(settings, service, pid):
         if not _pid_exists(pid):
             pid_file.unlink(missing_ok=True)
             if service == "strata" and _strata_endpoint_matches(settings):
@@ -410,7 +398,7 @@ def stop_service(settings: Settings, service: str, wait_s: float = 10.0) -> bool
     _terminate_process(pid)
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        if not _process_matches(pid, command, cwd):
+        if not _service_process_matches(settings, service, pid):
             pid_file.unlink(missing_ok=True)
             return True
         time.sleep(0.1)

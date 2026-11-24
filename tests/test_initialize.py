@@ -289,7 +289,10 @@ class InitializeTests(unittest.TestCase):
             self.assertNotIn("env", runtime)
             _assert_private_file(self, runtime_path)
             self.assertFalse((root / "config" / "model_paths.yaml").exists())
-            self.assertTrue(data["comfyui"]["models"]["text_encoder"].startswith("qwen3vl_"))
+            self.assertTrue(
+                data["generation_modes"]["text-to-image"]["models"]["text_encoder"]["file"]
+                .startswith("qwen3vl_")
+            )
 
     def test_runtime_rejects_strata_batch_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

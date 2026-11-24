@@ -74,21 +74,14 @@
 
     <aside class="prompt-column" aria-label="Image prompt and output">
       <div class="prompt-editor-wrap">
-        <div id="image-mode-switch" class="image-mode-switch" role="group" aria-label="Image mode">
-          <button id="mode-text-to-image" class="mode-button is-active" type="button"
-                  aria-pressed="true">Text to image</button>
-          <button id="mode-edit" class="mode-button" type="button" aria-pressed="false">Image edit</button>
-        </div>
-        <section id="source-image-panel" class="source-image-panel" aria-label="Edit source images"
+        <div id="image-mode-switch" class="image-mode-switch" role="group" aria-label="Image mode"></div>
+        <section id="source-image-panel" class="source-image-panel" aria-label="Image mode source images"
                  aria-describedby="source-image-help" hidden>
           <div class="source-image-heading">
             <span id="source-image-count" class="source-image-count">0 / 5</span>
           </div>
           <input id="source-image-input" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
-          <p id="source-image-help" class="visually-hidden">
-            Images are ordered. Picture 1 is the edit target; later pictures are references.
-            Drag pictures to change their order. Keyboard users can focus a picture and press Alt+Shift+Left or Alt+Shift+Right.
-          </p>
+          <p id="source-image-help" class="visually-hidden"></p>
           <div id="source-image-list" class="source-image-list">
             <button id="upload-source-images" class="source-image-add" type="button"
                     title="Add a base image" aria-label="Add a base image">

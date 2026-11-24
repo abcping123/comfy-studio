@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from comfy_studio.app import ChatRunManager, GenerationRunManager, create_app
+from comfy_studio.modes import DEFAULT_MODE_ID, IMAGE_MODES
 from comfy_studio.orchestrator import ChatOutcome, GenerationOutcome
 from comfy_studio.settings import Settings
 from comfy_studio.storage import ConversationStore
@@ -97,6 +98,13 @@ class AppTests(unittest.TestCase):
         response = self.client.get("/api/options", headers={"Authorization": "Bearer test-access-token"})
         self.assertEqual(response.status_code, 200)
         options = response.json()
+        self.assertEqual(options["default_mode"], DEFAULT_MODE_ID)
+        self.assertEqual([mode["id"] for mode in options["modes"]],
+                         [mode.id for mode in IMAGE_MODES])
+        edit_mode = next(mode for mode in options["modes"] if mode["id"] == "edit")
+        self.assertEqual(edit_mode["resolution"]["strategy"], "source-image")
+        self.assertEqual(edit_mode["source_images"]["min_count"], 1)
+        self.assertEqual(edit_mode["source_images"]["max_count"], 5)
         self.assertEqual(options["default_aspect_ratio"], "1:1 (Square)")
         self.assertEqual(options["megapixels"]["min"], 0.5)
         self.assertEqual(options["megapixels"]["max"], 20.0)
@@ -404,6 +412,18 @@ class AppTests(unittest.TestCase):
             headers=headers, json={"source_image_ids": []},
         )
         self.assertEqual(order.status_code, 200)
+
+    def test_unknown_image_mode_is_rejected_by_api(self) -> None:
+        headers = {"Authorization": f"Bearer {self.data['app']['access_token']}"}
+        creation = self.client.post("/api/conversations", headers=headers)
+        self.assertEqual(creation.status_code, 200, creation.text)
+        conversation = creation.json()
+        response = self.client.put(
+            f"/api/conversations/{conversation['id']}/mode",
+            headers=headers,
+            json={"image_mode": "not-registered"},
+        )
+        self.assertEqual(response.status_code, 422)
 
     def test_unknown_asset_is_not_served(self) -> None:
         response = self.client.get("/assets/../../config.json")

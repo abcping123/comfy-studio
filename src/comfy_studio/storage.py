@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .modes import DEFAULT_MODE_ID, MAX_SOURCE_IMAGES, get_mode, validate_source_image_count
 from .permissions import set_private_permissions
 
 
@@ -56,7 +57,7 @@ class ConversationStore:
 
     def _initialize(self) -> None:
         with self._lock, self._connect() as connection:
-            connection.executescript("""
+            connection.executescript(f"""
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
@@ -68,7 +69,7 @@ class ConversationStore:
                     context_message_count INTEGER,
                     image_prompt TEXT NOT NULL DEFAULT '',
                     aspect_ratio TEXT NOT NULL DEFAULT '1:1 (Square)',
-                    image_mode TEXT NOT NULL DEFAULT 'text-to-image'
+                    image_mode TEXT NOT NULL DEFAULT '{DEFAULT_MODE_ID}'
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,7 +94,7 @@ class ConversationStore:
                     sampler_name TEXT NOT NULL DEFAULT 'euler',
                     scheduler TEXT NOT NULL DEFAULT 'simple',
                     status TEXT NOT NULL,
-                    image_mode TEXT NOT NULL DEFAULT 'text-to-image',
+                    image_mode TEXT NOT NULL DEFAULT '{DEFAULT_MODE_ID}',
                     prompt_id TEXT,
                     filename TEXT,
                     subfolder TEXT,
@@ -138,7 +139,9 @@ class ConversationStore:
             if "aspect_ratio" not in columns:
                 connection.execute("ALTER TABLE conversations ADD COLUMN aspect_ratio TEXT NOT NULL DEFAULT '1:1 (Square)'")
             if "image_mode" not in columns:
-                connection.execute("ALTER TABLE conversations ADD COLUMN image_mode TEXT NOT NULL DEFAULT 'text-to-image'")
+                connection.execute(
+                    f"ALTER TABLE conversations ADD COLUMN image_mode TEXT NOT NULL DEFAULT '{DEFAULT_MODE_ID}'"
+                )
             message_columns = {row["name"] for row in connection.execute("PRAGMA table_info(messages)")}
             if "display_content" not in message_columns:
                 connection.execute("ALTER TABLE messages ADD COLUMN display_content TEXT")
@@ -150,7 +153,7 @@ class ConversationStore:
                 ("megapixels", "REAL NOT NULL DEFAULT 4.0"),
                 ("sampler_name", "TEXT NOT NULL DEFAULT 'euler'"),
                 ("scheduler", "TEXT NOT NULL DEFAULT 'simple'"),
-                ("image_mode", "TEXT NOT NULL DEFAULT 'text-to-image'"),
+                ("image_mode", f"TEXT NOT NULL DEFAULT '{DEFAULT_MODE_ID}'"),
             ):
                 if name not in generation_columns:
                     connection.execute(f"ALTER TABLE generations ADD COLUMN {name} {declaration}")
@@ -312,8 +315,10 @@ class ConversationStore:
 
     def set_conversation_mode(self, conversation_id: str, image_mode: str) -> None:
         conversation_id = self.validate_id(conversation_id)
-        if image_mode not in {"text-to-image", "edit"}:
-            raise StorageError("image mode must be text-to-image or edit")
+        try:
+            get_mode(image_mode)
+        except ValueError as error:
+            raise StorageError(str(error)) from error
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE conversations SET image_mode = ?, updated_at = ? WHERE id = ?",
@@ -386,11 +391,13 @@ class ConversationStore:
     def source_images_by_ids(self, conversation_id: str,
                              source_image_ids: list[str]) -> list[dict[str, Any]]:
         conversation_id = self.validate_id(conversation_id)
-        if not 1 <= len(source_image_ids) <= 5:
-            raise StorageError("edit mode requires one base image and at most four reference images")
+        if len(source_image_ids) > MAX_SOURCE_IMAGES:
+            raise StorageError(f"source image ids must contain at most {MAX_SOURCE_IMAGES} ids")
         ids = [self.validate_source_image_id(source_id) for source_id in source_image_ids]
         if len(set(ids)) != len(ids):
             raise StorageError("source image ids must be unique")
+        if not ids:
+            return []
         placeholders = ",".join("?" for _ in ids)
         with self._lock, self._connect() as connection:
             rows = connection.execute(
@@ -405,8 +412,10 @@ class ConversationStore:
     def reorder_source_images(self, conversation_id: str, source_image_ids: list[str]) -> list[dict[str, Any]]:
         conversation_id = self.validate_id(conversation_id)
         ids = [self.validate_source_image_id(source_id) for source_id in source_image_ids]
-        if len(ids) > 5 or len(set(ids)) != len(ids):
-            raise StorageError("source image order must contain at most five unique ids")
+        if len(ids) > MAX_SOURCE_IMAGES or len(set(ids)) != len(ids):
+            raise StorageError(
+                f"source image order must contain at most {MAX_SOURCE_IMAGES} unique ids"
+            )
         with self._lock, self._connect() as connection:
             conversation = connection.execute(
                 "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,),
@@ -462,20 +471,22 @@ class ConversationStore:
 
     def create_generation(self, conversation_id: str, prompt: str, seed: int, aspect_ratio: str,
                           megapixels: float, width: int, height: int, sampler_name: str,
-                          scheduler: str, image_mode: str = "text-to-image",
+                          scheduler: str, image_mode: str = DEFAULT_MODE_ID,
                           source_image_ids: list[str] | None = None) -> str:
         conversation_id = self.validate_id(conversation_id)
-        if image_mode not in {"text-to-image", "edit"}:
-            raise StorageError("image mode must be text-to-image or edit")
+        try:
+            mode = get_mode(image_mode)
+        except ValueError as error:
+            raise StorageError(str(error)) from error
         source_ids = source_image_ids or []
-        if image_mode == "edit":
-            if not 1 <= len(source_ids) <= 5:
-                raise StorageError("edit mode requires one base image and at most four reference images")
+        try:
+            validate_source_image_count(mode, len(source_ids))
+        except ValueError as error:
+            raise StorageError(str(error)) from error
+        if source_ids:
             source_ids = [self.validate_source_image_id(source_id) for source_id in source_ids]
             if len(set(source_ids)) != len(source_ids):
                 raise StorageError("source image ids must be unique")
-        elif source_ids:
-            raise StorageError("text-to-image mode does not accept source images")
         generation_id = secrets.token_hex(16)
         now = _now()
         with self._lock, self._connect() as connection:

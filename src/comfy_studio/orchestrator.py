@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .clients import BackendError, ComfyUIClient, StrataClient
-from .resolution import calculate_edit_resolution
+from .modes import (
+    DEFAULT_MODE_ID,
+    MAX_SOURCE_IMAGES,
+    calculate_mode_dimensions,
+    get_mode,
+    source_image_role,
+    validate_source_image_count,
+)
 from .settings import Settings
 from .resolution import normalize_aspect_ratio
 from .storage import ConversationStore, StorageError
@@ -194,8 +201,10 @@ class Orchestrator:
             raise CoordinationError("unsupported source image extension")
         self._enter()
         try:
-            if len(self.store.source_images(conversation_id)) >= 5:
-                raise CoordinationError("a conversation can have at most five source images")
+            if len(self.store.source_images(conversation_id)) >= MAX_SOURCE_IMAGES:
+                raise CoordinationError(
+                    f"a conversation can have at most {MAX_SOURCE_IMAGES} source images"
+                )
             source_image_id = secrets.token_hex(16)
             response = self.comfy.upload_image(
                 f"{source_image_id}{extension}", content, content_type, conversation_id,
@@ -412,11 +421,19 @@ class Orchestrator:
         available_ratios = {item["label"] for item in generation["aspect_ratios"]}
         if current_aspect_ratio not in available_ratios:
             raise CoordinationError("current aspect ratio is not supported")
-        image_mode = conversation.get("image_mode", "text-to-image")
-        source_images = self.store.source_images(conversation_id) if image_mode == "edit" else []
+        image_mode = conversation.get("image_mode", DEFAULT_MODE_ID)
+        try:
+            mode = get_mode(image_mode)
+        except ValueError as error:
+            raise CoordinationError(str(error)) from error
+        source_images = (
+            self.store.source_images(conversation_id)
+            if mode.send_source_images_to_chat else []
+        )
         source_image_count = len(source_images)
-        prompt_setting = "edit_system_prompt_file" if image_mode == "edit" else "system_prompt_file"
-        system_prompt_path = self.settings.path(f"generation.{prompt_setting}")
+        system_prompt_path = self.settings.path(
+            f"generation_modes.{mode.id}.system_prompt_file"
+        )
         try:
             system_prompt_text = system_prompt_path.read_text(encoding="utf-8").strip()
         except OSError as error:
@@ -432,8 +449,9 @@ class Orchestrator:
             "current_aspect_ratio": current_aspect_ratio,
         }
         preserve_aspect_ratio = None
-        if image_mode == "edit":
-            editor_state.update({"image_mode": "edit", "source_image_count": source_image_count})
+        if mode.send_source_images_to_chat:
+            editor_state.update({"image_mode": mode.id, "source_image_count": source_image_count})
+        if mode.resolution_strategy == "source-image":
             preserve_aspect_ratio = current_aspect_ratio
         current_editor_state = json.dumps(editor_state, ensure_ascii=False)
         current_user_message = (
@@ -441,10 +459,10 @@ class Orchestrator:
             f"user_request:\n{user_text.strip()}"
         )
         message_content: str | list[dict[str, Any]] = current_user_message
-        if image_mode == "edit" and source_images:
+        if mode.send_source_images_to_chat and source_images:
             image_labels = [
-                f"<Picture {index}> ({'base image' if index == 1 else 'reference image'})"
-                for index in range(1, source_image_count + 1)
+                f"<Picture {index + 1}> ({source_image_role(mode, index)})"
+                for index in range(source_image_count)
             ]
             current_user_message += "\n\nattached_source_images_in_order:\n" + "\n".join(image_labels)
             content_parts: list[dict[str, Any]] = [{"type": "text", "text": current_user_message}]
@@ -709,9 +727,13 @@ class Orchestrator:
                  aspect_ratio: str | None = None, megapixels: float | None = None,
                  sampler_name: str | None = None, scheduler: str | None = None,
                  progress_callback: Callable[[dict[str, Any]], None] | None = None,
-                 image_mode: str = "text-to-image",
+                 image_mode: str = DEFAULT_MODE_ID,
                  source_image_ids: list[str] | None = None) -> GenerationOutcome:
         conversation_id = self.store.validate_id(conversation_id)
+        try:
+            mode = get_mode(image_mode)
+        except ValueError as error:
+            raise CoordinationError(str(error)) from error
         self._enter()
         generation_id: str | None = None
         prompt_id: str | None = None
@@ -725,27 +747,28 @@ class Orchestrator:
             conversation = self.store.get_conversation(conversation_id)
             if conversation is None:
                 raise CoordinationError("conversation does not exist")
-            if conversation.get("image_mode", "text-to-image") != image_mode:
+            if conversation.get("image_mode", DEFAULT_MODE_ID) != image_mode:
                 raise CoordinationError("image mode changed; reload the conversation before generating")
-            if image_mode == "edit":
-                try:
-                    selected_source_images = self.store.source_images_by_ids(
-                        conversation_id, source_image_ids or [],
-                    )
-                    width, height = calculate_edit_resolution(
-                        selected_source_images[0]["width"],
-                        selected_source_images[0]["height"],
-                        megapixels if megapixels is not None
-                        else self.settings.section("generation")["default_megapixels"],
-                        self.settings.section("generation")["resolution_multiple"],
-                    )
-                except (StorageError, ValueError) as error:
-                    raise CoordinationError(str(error)) from error
-                selected_ratio = "Source image"
-            else:
-                if image_mode != "text-to-image" or source_image_ids:
-                    raise CoordinationError("text-to-image mode does not accept source images")
-                selected_ratio = aspect_ratio or self.settings.section("generation")["default_aspect_ratio"]
+            selected_source_ids = source_image_ids or []
+            try:
+                validate_source_image_count(mode, len(selected_source_ids))
+                selected_source_images = self.store.source_images_by_ids(
+                    conversation_id, selected_source_ids,
+                )
+                width, height = calculate_mode_dimensions(
+                    mode,
+                    self.settings.section("generation"),
+                    aspect_ratio,
+                    megapixels,
+                    selected_source_images,
+                )
+            except (StorageError, ValueError) as error:
+                raise CoordinationError(str(error)) from error
+            selected_ratio = (
+                mode.stored_aspect_ratio_label
+                or aspect_ratio
+                or self.settings.section("generation")["default_aspect_ratio"]
+            )
             try:
                 workflow = build_workflow(
                     self.settings, prompt, seed, aspect_ratio, megapixels,
@@ -753,9 +776,6 @@ class Orchestrator:
                 )
             except WorkflowError as error:
                 raise CoordinationError(str(error)) from error
-            if image_mode == "text-to-image":
-                width = workflow["4"]["inputs"]["width"]
-                height = workflow["4"]["inputs"]["height"]
             save_node = next((node for node in workflow.values()
                               if isinstance(node, dict) and node.get("class_type") == "SaveImage"), None)
             if save_node is None or not isinstance(save_node.get("inputs"), dict):
@@ -780,7 +800,10 @@ class Orchestrator:
             if strata_was_loaded or not self._comfy_models_retained:
                 self._release_comfy()
             generation = self.settings.section("generation")
-            selected_megapixels = megapixels if megapixels is not None else generation["default_megapixels"]
+            selected_megapixels = (
+                min(generation["default_megapixels"], mode.max_megapixels)
+                if megapixels is None else megapixels
+            )
             selected_sampler = sampler_name or generation["default_sampler"]
             selected_scheduler = scheduler or generation["default_scheduler"]
             generation_id = self.store.create_generation(

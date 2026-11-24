@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "app": {
     "listen_host": "127.0.0.1",
     "port": 8765,
@@ -9,9 +9,7 @@
     "strata_runtime_config": "temp/strata/runtime.json",
     "strata_sessions": "temp/strata",
     "database": "temp/studio.sqlite3",
-    "temp_root": "temp",
-    "workflow_api": "data/comfyui/minimax_h3_image_t2i.json",
-    "workflow_edit_api": "data/comfyui/minimax_h3_image_edit.json"
+    "temp_root": "temp"
   },
   "strata": {
     "endpoint": "http://127.0.0.1:8080",
@@ -28,25 +26,58 @@
     "python": "/home/pic1wx/repos/ComfyUI/.venv/bin/python",
     "main_script": "/home/pic1wx/repos/ComfyUI/main.py",
     "working_directory": "/home/pic1wx/repos/ComfyUI",
-    "diffusion_models_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/diffusion_models",
-    "text_encoders_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/text_encoders",
-    "vae_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/vae",
-    "input_directory": "temp/comfyui/input",
-    "models": {
-      "diffusion_model": "minimax_h3_image_pruned_int8_convrot.safetensors",
-      "text_encoder": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
-      "vae": "minimax_h3_image_vae_fp16.safetensors"
+    "model_directories": {
+      "diffusion_models": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/diffusion_models",
+      "text_encoders": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/text_encoders",
+      "vae": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/vae"
     },
+    "input_directory": "temp/comfyui/input",
     "output_directory": "/home/pic1wx/repos/ComfyUI/output",
     "gpu_id": 0,
     "request_timeout_s": 1800,
     "poll_interval_s": 1.0
   },
+  "generation_modes": {
+    "text-to-image": {
+      "workflow": "data/comfyui/minimax_h3_image_t2i.json",
+      "system_prompt_file": "data/strata/minimax_h3_image_t2i.txt",
+      "models": {
+        "diffusion_model": {
+          "directory": "diffusion_models",
+          "file": "minimax_h3_image_pruned_int8_convrot.safetensors"
+        },
+        "text_encoder": {
+          "directory": "text_encoders",
+          "file": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+        },
+        "vae": {
+          "directory": "vae",
+          "file": "minimax_h3_image_vae_fp16.safetensors"
+        }
+      }
+    },
+    "edit": {
+      "workflow": "data/comfyui/minimax_h3_image_edit.json",
+      "system_prompt_file": "data/strata/minimax_h3_image_edit.txt",
+      "models": {
+        "diffusion_model": {
+          "directory": "diffusion_models",
+          "file": "minimax_h3_image_pruned_int8_convrot.safetensors"
+        },
+        "text_encoder": {
+          "directory": "text_encoders",
+          "file": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+        },
+        "vae": {
+          "directory": "vae",
+          "file": "minimax_h3_image_vae_fp16.safetensors"
+        }
+      }
+    }
+  },
   "generation": {
     "prompt_enhancement": false,
     "prompt_skill_version": 3,
-    "system_prompt_file": "data/strata/minimax_h3_image_t2i.txt",
-    "edit_system_prompt_file": "data/strata/minimax_h3_image_edit.txt",
     "aspect_ratios": [
       {"label": "1:1 (Square)", "width": 1, "height": 1},
       {"label": "2:3 (Portrait Photo)", "width": 2, "height": 3},

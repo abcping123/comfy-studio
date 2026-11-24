@@ -14,6 +14,7 @@ from comfy_studio.services import (
     _strata_endpoint_matches,
     preflight_service_start,
     service_command,
+    start_service_tracked,
     _service_process_matches,
     _process_matches,
     service_running,
@@ -105,7 +106,7 @@ class ExternalStrataTests(unittest.TestCase):
                 response.read.return_value = json.dumps({"data": [{"id": "different-model"}]}).encode("utf-8")
                 self.assertFalse(_strata_endpoint_matches(settings))
 
-    def test_start_reuses_a_matching_external_strata_without_claiming_its_pid(self) -> None:
+    def test_start_rejects_an_unidentifiable_external_strata_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = self._settings(Path(directory))
             with (
@@ -114,16 +115,23 @@ class ExternalStrataTests(unittest.TestCase):
                 patch("comfy_studio.services._find_service_processes", return_value=[]),
                 patch("comfy_studio.services.set_private_permissions"),
                 patch("comfy_studio.services.subprocess.Popen") as popen,
+                self.assertRaisesRegex(ServiceError, "cannot be taken over safely"),
             ):
-                pid, _ = start_service(settings, "strata")
+                start_service_tracked(settings, "strata")
 
-            self.assertIsNone(pid)
             self.assertFalse(_pid_path(settings, "strata").exists())
             popen.assert_not_called()
 
     def test_service_process_matching_uses_script_and_port(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = self._settings(Path(directory))
+            studio_command, studio_cwd, _, _ = service_command(settings, "studio")
+            with patch(
+                "comfy_studio.services._process_identity",
+                return_value=(["/alternate/python", *studio_command[1:]], studio_cwd),
+            ):
+                self.assertTrue(_service_process_matches(settings, "studio", 1234))
+
             for service in ("comfyui", "strata"):
                 command, cwd, host, port = service_command(settings, service)
                 if service == "comfyui":
@@ -145,17 +153,13 @@ class ExternalStrataTests(unittest.TestCase):
             ):
                 self.assertFalse(_service_process_matches(settings, "strata", 1234))
 
-    def test_start_restarts_mismatched_strata_and_comfyui_processes(self) -> None:
+    def test_start_takes_over_matching_strata_and_comfyui_processes(self) -> None:
         for service in ("strata", "comfyui"):
             with self.subTest(service=service), tempfile.TemporaryDirectory() as directory:
                 settings = self._settings(Path(directory))
                 pid_file = _pid_path(settings, service)
                 pid_file.parent.mkdir(parents=True)
                 pid_file.write_text("202\n", encoding="ascii")
-                process = MagicMock()
-                process.pid = 404
-                process.poll.return_value = None
-                popen = MagicMock(return_value=process)
 
                 with (
                     patch("comfy_studio.services._process_matches", return_value=False),
@@ -163,20 +167,56 @@ class ExternalStrataTests(unittest.TestCase):
                     patch("comfy_studio.services._find_service_processes", return_value=[303]),
                     patch(
                         "comfy_studio.services._service_process_matches",
-                        side_effect=[True, False],
+                        side_effect=[False, True],
                     ),
                     patch("comfy_studio.services._terminate_process") as terminate,
-                    patch("comfy_studio.services._port_open", return_value=False),
-                    patch("comfy_studio.services._strata_endpoint_matches", return_value=True),
                     patch("comfy_studio.services.set_private_permissions"),
-                    patch("comfy_studio.services.subprocess.Popen", popen),
+                    patch("comfy_studio.services.subprocess.Popen") as popen,
                 ):
-                    started_pid, _ = start_service(settings, service)
+                    started_pid, _, started_here = start_service_tracked(settings, service)
 
-                self.assertEqual(started_pid, 404)
-                terminate.assert_called_once_with(303)
-                popen.assert_called_once()
-                self.assertEqual(pid_file.read_text(encoding="ascii"), "404\n")
+                self.assertEqual(started_pid, 303)
+                self.assertFalse(started_here)
+                terminate.assert_not_called()
+                popen.assert_not_called()
+                self.assertEqual(pid_file.read_text(encoding="ascii"), "303\n")
+
+    def test_start_takes_over_a_studio_process_without_a_pid_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self._settings(Path(directory))
+            pid_file = _pid_path(settings, "studio")
+            with (
+                patch("comfy_studio.services._find_service_processes", return_value=[303]),
+                patch("comfy_studio.services._service_process_matches", return_value=True),
+                patch("comfy_studio.services.set_private_permissions"),
+                patch("comfy_studio.services.subprocess.Popen") as popen,
+            ):
+                pid, _, started_here = start_service_tracked(settings, "studio")
+
+            self.assertEqual(pid, 303)
+            self.assertFalse(started_here)
+            self.assertEqual(pid_file.read_text(encoding="ascii"), "303\n")
+            popen.assert_not_called()
+
+    def test_stop_stops_a_taken_over_process_by_configured_service_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self._settings(Path(directory))
+            pid_file = _pid_path(settings, "comfyui")
+            pid_file.parent.mkdir(parents=True)
+            pid_file.write_text("303\n", encoding="ascii")
+
+            with (
+                patch(
+                    "comfy_studio.services._service_process_matches",
+                    side_effect=[True, False],
+                ),
+                patch("comfy_studio.services._terminate_process") as terminate,
+                patch("comfy_studio.services.time.monotonic", side_effect=[0, 0]),
+            ):
+                self.assertTrue(stop_service(settings, "comfyui"))
+
+            terminate.assert_called_once_with(303)
+            self.assertFalse(pid_file.exists())
 
     def test_start_still_rejects_an_unrelated_listener(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -184,6 +224,7 @@ class ExternalStrataTests(unittest.TestCase):
             with (
                 patch("comfy_studio.services._port_open", return_value=True),
                 patch("comfy_studio.services._strata_endpoint_matches", return_value=False),
+                patch("comfy_studio.services._find_service_processes", return_value=[]),
                 self.assertRaisesRegex(ServiceError, "already in use"),
             ):
                 start_service(settings, "strata")

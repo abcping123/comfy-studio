@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import argparse
-import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +10,16 @@ from .initialize import (
     initialize_config,
     prepare_runtime_files,
 )
+from .modes import IMAGE_MODES
 from .permissions import set_private_permissions
 from .settings import ConfigError, Settings, default_config_path, load_config
-from .services import ServiceError, preflight_service_start, service_running, start_service, stop_service
+from .services import (
+    ServiceError,
+    preflight_service_start,
+    service_running,
+    start_service_tracked,
+    stop_service,
+)
 from .workflow import WorkflowError, build_workflow
 
 MANAGED_SERVICES = ("comfyui", "strata", "studio")
@@ -53,48 +59,46 @@ def validate_artifacts(settings: Settings) -> None:
         _require_file(strata[key], label)
     for key, label in (("python", "ComfyUI Python"), ("main_script", "ComfyUI main script")):
         _require_file(comfy[key], label)
-    system_prompt_path = _require_file(
-        str(settings.path("generation.system_prompt_file")), "Generation system prompt",
-    )
-    if not system_prompt_path.read_text(encoding="utf-8").strip():
-        raise ConfigError("generation system prompt file is empty")
-    edit_prompt_path = _require_file(
-        str(settings.path("generation.edit_system_prompt_file")), "Image edit system prompt",
-    )
-    if not edit_prompt_path.read_text(encoding="utf-8").strip():
-        raise ConfigError("image edit system prompt file is empty")
+    for mode in IMAGE_MODES:
+        system_prompt_path = _require_file(
+            str(settings.path(f"generation_modes.{mode.id}.system_prompt_file")),
+            f"{mode.label} system prompt",
+        )
+        if not system_prompt_path.read_text(encoding="utf-8").strip():
+            raise ConfigError(f"{mode.label} system prompt file is empty")
     _require_directory(comfy["working_directory"], "ComfyUI working directory")
-    for key, model_key in (("diffusion_models_dir", "diffusion_model"),
-                           ("text_encoders_dir", "text_encoder"), ("vae_dir", "vae")):
-        directory = _require_directory(comfy[key], f"ComfyUI {key}")
-        model_path = directory / comfy["models"][model_key]
-        _require_file(str(model_path), f"ComfyUI model {model_key}")
+    checked_models: set[Path] = set()
+    for mode in IMAGE_MODES:
+        for model_key, model in settings.data["generation_modes"][mode.id]["models"].items():
+            directory = settings.path(f"comfyui.model_directories.{model['directory']}")
+            directory = _require_directory(str(directory), f"ComfyUI model directory {model['directory']}")
+            model_path = directory / model["file"]
+            if model_path not in checked_models:
+                _require_file(str(model_path), f"ComfyUI model {model_key}")
+                checked_models.add(model_path)
     _require_directory(str(settings.path("comfyui.output_directory")), "ComfyUI output directory")
     _require_directory(str(settings.path("comfyui.input_directory")), "ComfyUI input directory")
-    workflow = _require_file(str(settings.path("paths.workflow_api")), "MiniMax API workflow")
-    edit_workflow = _require_file(str(settings.path("paths.workflow_edit_api")), "MiniMax edit API workflow")
-    build_workflow(settings, "configuration validation", 1)
-    build_workflow(settings, "configuration validation", 1, image_mode="edit",
-                   source_images=[{
-                       "filename": "configuration-validation.png",
-                       "subfolder": "0" * 32,
-                       "width": 1024,
-                       "height": 1024,
-                   }])
-    try:
-        graph = json.loads(workflow.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ConfigError(f"MiniMax API workflow is invalid JSON: {error}") from error
-    serialized = json.dumps(graph).lower()
-    if "qwen3.5" in serialized or "textgeneratev2" in serialized:
-        raise ConfigError("MiniMax API workflow must not include Qwen3.5 prompt enhancement")
-    try:
-        edit_graph = json.loads(edit_workflow.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ConfigError(f"MiniMax edit API workflow is invalid JSON: {error}") from error
-    edit_serialized = json.dumps(edit_graph).lower()
-    if "qwen3.5" in edit_serialized or "textgeneratev2" in edit_serialized:
-        raise ConfigError("MiniMax edit API workflow must not include Qwen3.5 prompt enhancement")
+    for mode in IMAGE_MODES:
+        _require_file(
+            str(settings.path(f"generation_modes.{mode.id}.workflow")),
+            f"{mode.label} workflow",
+        )
+        sample_images = [
+            {
+                "filename": f"configuration-validation-{index}.png",
+                "subfolder": "0" * 32,
+                "width": 1024,
+                "height": 1024,
+            }
+            for index in range(mode.source_image_min_count)
+        ]
+        build_workflow(
+            settings,
+            "configuration validation",
+            1,
+            image_mode=mode.id,
+            source_images=sample_images,
+        )
 
 
 def _prompt_repository_path(label: str) -> Path:
@@ -124,54 +128,79 @@ def _load_active_config(initialize_if_missing: bool = False) -> tuple[Path, Sett
     return path, settings
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="studio", description="Manage the local studio services")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("start", help="start all project-managed services")
-    subparsers.add_parser("status", help="show status for all project-managed services")
-    subparsers.add_parser("stop", help="stop all verified project-managed services")
-    return parser
+def _stop_managed_services(settings: Settings, services: list[str]) -> bool:
+    failed = False
+    for service in reversed(services):
+        try:
+            stopped = stop_service(settings, service)
+        except (ServiceError, OSError) as error:
+            print(f"studio: failed to stop {service}: {error}", file=sys.stderr)
+            failed = True
+            continue
+        if stopped is None:
+            print(
+                f"studio: failed to stop {service}; its process is no longer identifiable",
+                file=sys.stderr,
+            )
+            failed = True
+        else:
+            print(f"Stopped {service}" if stopped else f"{service} was not running")
+    return failed
+
+
+def _start_foreground(settings: Settings) -> int:
+    managed_services: list[str] = []
+    exit_code = 0
+    try:
+        prepare_runtime_files(settings)
+        validate_artifacts(settings)
+        preflight_service_start(settings, MANAGED_SERVICES)
+        for service in MANAGED_SERVICES:
+            try:
+                pid, log_path, started_here = start_service_tracked(settings, service)
+            except (ServiceError, OSError) as error:
+                print(f"studio: failed to start {service}: {error}", file=sys.stderr)
+                exit_code = 2
+                break
+
+            if pid is None:
+                raise ServiceError(f"{service} has no identifiable process to supervise")
+            managed_services.append(service)
+            if started_here:
+                print(f"Started {service} with PID {pid}; log: {log_path}")
+            else:
+                print(f"Took over existing {service} with PID {pid}; it will stop with Studio")
+
+        if exit_code == 0:
+            if "studio" not in managed_services:
+                raise ServiceError("Studio was not started or taken over by this invocation")
+            if not service_running(settings, "studio"):
+                raise ServiceError("Studio exited before foreground supervision began")
+
+            print("Studio is running in the foreground; press Ctrl+C to stop managed services.")
+            while service_running(settings, "studio"):
+                time.sleep(0.5)
+            print("Studio stopped; stopping all managed services.")
+    except KeyboardInterrupt:
+        print("\nCtrl+C received; stopping all managed services.")
+        exit_code = 130
+    except (ConfigError, InitializationError, ServiceError, WorkflowError, OSError) as error:
+        print(f"studio: {error}", file=sys.stderr)
+        exit_code = 2
+    finally:
+        if _stop_managed_services(settings, managed_services):
+            exit_code = 2
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments:
+        print("studio: no arguments are supported; run main.py without arguments.", file=sys.stderr)
+        return 2
     try:
-        config_path, settings = _load_active_config(initialize_if_missing=args.command == "start")
-        if args.command == "start":
-            prepare_runtime_files(settings)
-            validate_artifacts(settings)
-            preflight_service_start(settings, MANAGED_SERVICES)
-            failed = False
-            for service in MANAGED_SERVICES:
-                try:
-                    pid, log_path = start_service(settings, service)
-                except (ServiceError, OSError) as error:
-                    print(f"studio: failed to start {service}: {error}", file=sys.stderr)
-                    failed = True
-                    continue
-                if pid is None:
-                    print(f"Using existing {service} service; it is not managed by Studio")
-                else:
-                    print(f"Started {service} with PID {pid}; log: {log_path}")
-            return 2 if failed else 0
-        if args.command == "stop":
-            failed = False
-            for service in reversed(MANAGED_SERVICES):
-                try:
-                    stopped = stop_service(settings, service)
-                except (ServiceError, OSError) as error:
-                    print(f"studio: failed to stop {service}: {error}", file=sys.stderr)
-                    failed = True
-                    continue
-                if stopped is None:
-                    print(f"{service} is running outside Studio; left untouched")
-                else:
-                    print(f"Stopped {service}" if stopped else f"{service} was not running")
-            return 2 if failed else 0
-        if args.command == "status":
-            for service in MANAGED_SERVICES:
-                print(f"{service}: {'running' if service_running(settings, service) else 'stopped'}")
-            return 0
+        _, settings = _load_active_config(initialize_if_missing=True)
+        return _start_foreground(settings)
     except (ConfigError, InitializationError, ServiceError, WorkflowError, OSError) as error:
         print(f"studio: {error}", file=sys.stderr)
         return 2

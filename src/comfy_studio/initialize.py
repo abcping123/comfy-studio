@@ -181,7 +181,6 @@ def _validate_single_slot_source(source: dict[str, Any], source_path: Path) -> N
 def prepare_runtime_files(settings: Settings) -> Path:
     """Create the private Strata runtime JSON from config.json."""
     strata = settings.section("strata")
-    comfy = settings.section("comfyui")
     endpoint = urlsplit(strata["endpoint"])
     source_path = Path(strata["source_config_json"]).resolve()
     source = _read_json(source_path)
@@ -211,6 +210,4 @@ def prepare_runtime_files(settings: Settings) -> Path:
         set_private_permissions(directory, directory=True)
 
     _replace_private_json(runtime_path, runtime)
-    if not comfy["models"]["text_encoder"].startswith("qwen3vl_"):
-        raise InitializationError("comfyui.models.text_encoder must be the MiniMax Qwen3-VL encoder")
     return runtime_path

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import unittest
 
 from comfy_studio.settings import Settings, load_config, project_root
@@ -19,8 +20,27 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(graph["4"]["inputs"]["height"], 2048)
         self.assertEqual(graph["6"]["inputs"]["sampler_name"], "euler")
         self.assertEqual(graph["6"]["inputs"]["scheduler"], "simple")
-        self.assertEqual(graph["2"]["inputs"]["clip_name"],
-                         self.settings.data["comfyui"]["models"]["text_encoder"])
+        text_encoder = self.settings.data["generation_modes"]["text-to-image"]["models"]["text_encoder"]
+        self.assertEqual(graph["2"]["inputs"]["clip_name"], text_encoder["file"])
+
+    def test_edit_workflow_uses_its_mode_specific_model_configuration(self) -> None:
+        config = copy.deepcopy(self.settings.data)
+        config["generation_modes"]["edit"]["models"]["text_encoder"]["file"] = "edit-encoder.safetensors"
+        settings = Settings(self.settings.root, config)
+        graph = build_workflow(
+            settings,
+            "Make the image brighter",
+            7,
+            image_mode="edit",
+            source_images=[{
+                "filename": "base.png",
+                "subfolder": "a" * 32,
+                "width": 1024,
+                "height": 1024,
+            }],
+        )
+
+        self.assertEqual(graph["2"]["inputs"]["clip_name"], "edit-encoder.safetensors")
 
     def test_qwen35_and_prompt_enhancement_branch_are_absent(self) -> None:
         graph = build_workflow(self.settings, "A red bicycle", 99)
@@ -98,6 +118,10 @@ class WorkflowTests(unittest.TestCase):
     def test_unconfigured_sampler_is_rejected(self) -> None:
         with self.assertRaisesRegex(WorkflowError, "KSampler options"):
             build_workflow(self.settings, "A landscape", 5, sampler_name="not-a-sampler")
+
+    def test_unregistered_mode_is_rejected(self) -> None:
+        with self.assertRaisesRegex(WorkflowError, "unsupported image mode"):
+            build_workflow(self.settings, "A scene", 1, image_mode="not-registered")
 
 
 if __name__ == "__main__":

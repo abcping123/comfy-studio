@@ -10,11 +10,18 @@ from typing import Any, Callable, Iterator, Literal
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from .clients import BackendError, ComfyUIClient, StrataClient
 from .image_assets import MAX_SOURCE_IMAGE_BYTES, SourceImageError, inspect_source_image
+from .modes import (
+    DEFAULT_MODE_ID,
+    IMAGE_MODES,
+    MAX_SOURCE_IMAGES,
+    get_mode,
+    public_mode_options,
+)
 from .orchestrator import CoordinationError, Orchestrator
 from .permissions import set_private_permissions
 from .security import require_access
@@ -39,16 +46,28 @@ class GenerateRequest(BaseModel):
     megapixels: float | None = Field(default=None, ge=0.5, le=20.0, multiple_of=0.01)
     sampler_name: str | None = None
     scheduler: str | None = None
-    image_mode: Literal["text-to-image", "edit"] = "text-to-image"
-    source_image_ids: list[str] = Field(default_factory=list, max_length=5)
+    image_mode: str = DEFAULT_MODE_ID
+    source_image_ids: list[str] = Field(default_factory=list, max_length=MAX_SOURCE_IMAGES)
+
+    @field_validator("image_mode")
+    @classmethod
+    def validate_image_mode(cls, value: str) -> str:
+        get_mode(value)
+        return value
 
 
 class ConversationModeRequest(BaseModel):
-    image_mode: Literal["text-to-image", "edit"]
+    image_mode: str
+
+    @field_validator("image_mode")
+    @classmethod
+    def validate_image_mode(cls, value: str) -> str:
+        get_mode(value)
+        return value
 
 
 class SourceImageOrderRequest(BaseModel):
-    source_image_ids: list[str] = Field(max_length=5)
+    source_image_ids: list[str] = Field(max_length=MAX_SOURCE_IMAGES)
 
 
 def _public_source_image(source_image: dict[str, Any]) -> dict[str, Any]:
@@ -362,22 +381,25 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
     @app.get("/api/options", dependencies=[Depends(authenticated)])
     async def options() -> dict[str, Any]:
         generation = settings.section("generation")
-        return {
+        modes = public_mode_options(generation)
+        options: dict[str, Any] = {
+            "default_mode": DEFAULT_MODE_ID,
+            "modes": modes,
             "aspect_ratios": generation["aspect_ratios"],
             "default_aspect_ratio": generation["default_aspect_ratio"],
-            "megapixels": {"min": 0.5, "max": 20.0, "step": 0.01,
-                           "default": generation["default_megapixels"]},
-            "edit_megapixels": {"min": 0.5, "max": 16.0, "step": 0.01,
-                                "default": min(generation["default_megapixels"], 16.0)},
             "resolution_multiple": generation["resolution_multiple"],
             "prompt_enhancement": False,
             "source_images": {
-                "max_count": 5,
+                "max_count": MAX_SOURCE_IMAGES,
                 "max_bytes": MAX_SOURCE_IMAGE_BYTES,
                 "max_megapixels": 100,
                 "allowed_types": ["image/png", "image/jpeg", "image/webp"],
             },
         }
+        for mode, mode_options in zip(IMAGE_MODES, modes, strict=True):
+            if mode.legacy_options_key:
+                options[mode.legacy_options_key] = mode_options["resolution"]["megapixels"]
+        return options
 
     @app.post("/api/conversations", dependencies=[Depends(authenticated)])
     async def create_conversation() -> dict[str, Any]:

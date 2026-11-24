@@ -7,7 +7,7 @@
     options: null,
     pendingDeleteId: null,
     busy: false,
-    imageMode: "text-to-image",
+    imageMode: null,
     sourceImages: [],
     sourceImageUrls: new Map(),
     sourceRenderToken: 0,
@@ -25,6 +25,26 @@
   const deleteDialog = byId("delete-dialog");
   const imageLightbox = byId("image-lightbox");
   const emptyResult = byId("empty-result");
+
+  function getMode(modeId = state.imageMode) {
+    const mode = state.options?.modes.find((item) => item.id === modeId);
+    if (!mode) throw new Error(`Image mode '${modeId}' is not supported.`);
+    return mode;
+  }
+
+  function getSavedMegapixels(saved, mode) {
+    const modeSettings = saved.mode_settings;
+    const modeValue = modeSettings && typeof modeSettings === "object" && !Array.isArray(modeSettings)
+      ? modeSettings[mode.id]?.megapixels : undefined;
+    if (modeValue !== undefined) return Number(modeValue);
+    return mode.legacy_local_storage_key
+      ? Number(saved[mode.legacy_local_storage_key]) : Number.NaN;
+  }
+
+  function sourceImageRole(mode, index) {
+    const roles = mode.source_images.roles;
+    return roles.length ? roles[Math.min(index, roles.length - 1)] : "source image";
+  }
 
   function authHeaders(extra = {}) {
     return state.token ? { ...extra, Authorization: `Bearer ${state.token}` } : extra;
@@ -452,13 +472,13 @@
 
   function calculateResolution() {
     if (!state.options) return null;
+    const mode = getMode();
     const megapixels = Number(byId("image-megapixels").value);
-    const maximumMegapixels = state.imageMode === "edit"
-      ? state.options.edit_megapixels.max : state.options.megapixels.max;
-    if (!Number.isFinite(megapixels) || megapixels < state.options.megapixels.min ||
-        megapixels > maximumMegapixels) return null;
+    const megapixelOptions = mode.resolution.megapixels;
+    if (!Number.isFinite(megapixels) || megapixels < megapixelOptions.min ||
+        megapixels > megapixelOptions.max) return null;
     const multiple = state.options.resolution_multiple;
-    if (state.imageMode === "edit") {
+    if (mode.resolution.strategy === "source-image") {
       const base = state.sourceImages[0];
       if (!base || !base.width || !base.height) return null;
       const scale = Math.sqrt(Math.floor(megapixels * 1024 * 1024) / (base.width * base.height));
@@ -473,6 +493,7 @@
         multiple,
       };
     }
+    if (mode.resolution.strategy !== "aspect-ratio") return null;
     const ratio = state.options.aspect_ratios.find((item) => item.label === byId("image-aspect-ratio").value);
     if (!ratio) return null;
     const scale = Math.sqrt(megapixels * 1024 * 1024 / (ratio.width * ratio.height));
@@ -486,72 +507,98 @@
 
   function updateResolutionPreview() {
     const result = calculateResolution();
-    const sourceCountValid = state.imageMode !== "edit" ||
-      (state.sourceImages.length >= 1 && state.sourceImages.length <= 5);
+    const mode = state.options ? getMode() : null;
+    const sourceCountValid = !mode || mode.source_images.max_count === 0 ||
+      (state.sourceImages.length >= mode.source_images.min_count &&
+       state.sourceImages.length <= mode.source_images.max_count);
     byId("generate-image").disabled = state.busy || !imagePrompt.value.trim() || !result || !sourceCountValid;
     if (!result) {
-      byId("resolution-value").textContent = state.imageMode === "edit" && !state.sourceImages.length
-        ? "Upload a base image" : "Check resolution settings";
+      byId("resolution-value").textContent = mode &&
+        state.sourceImages.length < mode.source_images.min_count
+        ? mode.ui.missing_sources_hint || "Add the required source images"
+        : "Check resolution settings";
       return;
     }
     byId("resolution-value").textContent = `${result.width} x ${result.height} px`;
   }
 
+  function renderModeButtons() {
+    const container = byId("image-mode-switch");
+    container.replaceChildren(...state.options.modes.map((mode) => {
+      const button = document.createElement("button");
+      button.className = "mode-button";
+      button.type = "button";
+      button.dataset.modeId = mode.id;
+      button.textContent = mode.label;
+      button.setAttribute("aria-pressed", "false");
+      button.addEventListener("click", () => changeImageMode(mode.id));
+      return button;
+    }));
+  }
+
   function updateModeControls() {
-    const isEdit = state.imageMode === "edit";
-    byId("mode-text-to-image").classList.toggle("is-active", !isEdit);
-    byId("mode-text-to-image").setAttribute("aria-pressed", String(!isEdit));
-    byId("mode-edit").classList.toggle("is-active", isEdit);
-    byId("mode-edit").setAttribute("aria-pressed", String(isEdit));
-    byId("mode-text-to-image").disabled = state.busy;
-    byId("mode-edit").disabled = state.busy;
-    byId("source-image-panel").hidden = !isEdit;
-    byId("source-image-input").disabled = state.busy;
-    const maxCount = state.options?.source_images.max_count || 5;
+    if (!state.options) return;
+    const mode = getMode();
+    const sourcePolicy = mode.source_images;
+    document.querySelectorAll(".mode-button").forEach((button) => {
+      const active = button.dataset.modeId === mode.id;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-pressed", String(active));
+      button.disabled = state.busy;
+    });
+    const sourcePanel = byId("source-image-panel");
+    sourcePanel.hidden = sourcePolicy.max_count === 0;
+    sourcePanel.setAttribute("aria-label", mode.ui.source_images_label);
+    byId("source-image-help").textContent = mode.ui.source_images_help;
+    byId("source-image-input").disabled = state.busy || sourcePolicy.max_count === 0;
+    const maxCount = sourcePolicy.max_count;
     const addButton = byId("upload-source-images");
     const atLimit = state.sourceImages.length >= maxCount;
-    addButton.disabled = state.busy || !isEdit || atLimit;
-    const addLabel = state.sourceImages.length ? "Add source images" : "Add a base image";
+    addButton.disabled = state.busy || maxCount === 0 || atLimit;
+    const firstRole = sourceImageRole(mode, 0);
+    const addLabel = state.sourceImages.length ? "Add source images" : `Add a ${firstRole}`;
     addButton.querySelector(".source-image-add-label").textContent =
-      state.sourceImages.length ? "Add source images" : "Base image";
+      state.sourceImages.length ? "Add source images" :
+        `${firstRole[0].toUpperCase()}${firstRole.slice(1)}`;
     addButton.title = atLimit ? `Maximum of ${maxCount} source images reached` : addLabel;
     addButton.setAttribute("aria-label", addButton.title);
+    byId("source-image-count").textContent =
+      `${state.sourceImages.length} / ${sourcePolicy.max_count}`;
   }
 
   function applyImageMode(imageMode) {
-    state.imageMode = imageMode === "edit" ? "edit" : "text-to-image";
-    const isEdit = state.imageMode === "edit";
+    const mode = getMode(imageMode);
+    state.imageMode = mode.id;
     const megapixels = byId("image-megapixels");
-    byId("image-aspect-ratio").disabled = isEdit;
-    if (state.options) {
-      megapixels.min = String(state.options.megapixels.min);
-      megapixels.max = String(isEdit
-        ? state.options.edit_megapixels.max
-        : state.options.megapixels.max);
-    }
-    byId("image-prompt-label").textContent = isEdit ? "Edit prompt" : "Prompt";
-    byId("megapixels-label").textContent = isEdit ? "Target MP" : "Pixels (MP)";
-    byId("composer-hint").textContent = isEdit
-      ? "Strata can inspect uploaded image pixels to help shape the edit prompt"
-      : "Strata will help shape the image prompt";
-    byId("generate-image-label").textContent = isEdit ? "Edit image" : "Generate image";
+    const megapixelOptions = mode.resolution.megapixels;
+    byId("image-aspect-ratio").disabled = mode.resolution.strategy !== "aspect-ratio";
+    megapixels.min = String(megapixelOptions.min);
+    megapixels.max = String(megapixelOptions.max);
+    megapixels.step = String(megapixelOptions.step);
+    byId("image-prompt-label").textContent = mode.ui.prompt_label;
+    byId("megapixels-label").textContent = mode.ui.megapixels_label;
+    byId("composer-hint").textContent = mode.ui.composer_hint;
+    byId("generate-image-label").textContent = mode.ui.generate_label;
     updateModeControls();
     updateResolutionPreview();
   }
 
   async function changeImageMode(imageMode) {
     if (state.busy || !state.options || !state.conversationId || imageMode === state.imageMode) return;
+    const mode = getMode(imageMode);
     const previousMode = state.imageMode;
     const previousMegapixels = byId("image-megapixels").value;
     saveConversationSettings();
     const saved = readConversationSettings();
     applyImageMode(imageMode);
-    const savedMegapixels = Number(imageMode === "edit" ? saved.edit_megapixels : saved.megapixels);
-    const maxMegapixels = imageMode === "edit"
-      ? state.options.edit_megapixels.max : state.options.megapixels.max;
+    const megapixelOptions = mode.resolution.megapixels;
+    const savedMegapixels = getSavedMegapixels(saved, mode);
+    const previousValue = Number(previousMegapixels);
     const selectedMegapixels = Number.isFinite(savedMegapixels) &&
-      savedMegapixels >= state.options.megapixels.min && savedMegapixels <= maxMegapixels
-      ? savedMegapixels : Math.min(Number(previousMegapixels) || state.options.megapixels.default, maxMegapixels);
+      savedMegapixels >= megapixelOptions.min && savedMegapixels <= megapixelOptions.max
+      ? savedMegapixels
+      : Number.isFinite(previousValue) && previousValue >= megapixelOptions.min &&
+        previousValue <= megapixelOptions.max ? previousValue : megapixelOptions.default;
     byId("image-megapixels").value = selectedMegapixels.toFixed(2);
     updateResolutionPreview();
     try {
@@ -583,14 +630,14 @@
   async function loadOptions() {
     const options = await api("/api/options");
     state.options = options;
+    renderModeButtons();
     fillSelect(byId("image-aspect-ratio"), options.aspect_ratios,
       (item) => item.label, (item) => item.label, options.default_aspect_ratio);
     const megapixels = byId("image-megapixels");
-    megapixels.min = String(options.megapixels.min);
-    megapixels.max = String(options.megapixels.max);
-    megapixels.step = String(options.megapixels.step);
-    megapixels.value = Number(options.megapixels.default).toFixed(2);
-    applyImageMode(state.imageMode);
+    megapixels.value = Number(getMode(options.default_mode).resolution.megapixels.default).toFixed(2);
+    const selectedMode = options.modes.some((mode) => mode.id === state.imageMode)
+      ? state.imageMode : options.default_mode;
+    applyImageMode(selectedMode);
     updateResolutionPreview();
   }
 
@@ -607,18 +654,29 @@
   function saveConversationSettings() {
     if (!state.conversationId || !state.options) return;
     const saved = readConversationSettings();
+    const mode = getMode();
     const aspectRatio = byId("image-aspect-ratio").value;
     const megapixels = Number(byId("image-megapixels").value);
     const thinkingEffort = byId("thinking-effort").value;
-    const megapixelLimit = state.imageMode === "edit"
-      ? state.options.edit_megapixels.max : state.options.megapixels.max;
+    const megapixelOptions = mode.resolution.megapixels;
 
     if (state.options.aspect_ratios.some((item) => item.label === aspectRatio)) {
       saved.aspect_ratio = aspectRatio;
     }
-    if (Number.isFinite(megapixels) && megapixels >= state.options.megapixels.min &&
-        megapixels <= megapixelLimit) {
-      saved[state.imageMode === "edit" ? "edit_megapixels" : "megapixels"] = megapixels;
+    if (Number.isFinite(megapixels) && megapixels >= megapixelOptions.min &&
+        megapixels <= megapixelOptions.max) {
+      const currentSettings = saved.mode_settings;
+      const modeSettings = currentSettings && typeof currentSettings === "object" &&
+        !Array.isArray(currentSettings) ? currentSettings : {};
+      const currentModeSettings = modeSettings[mode.id];
+      saved.mode_settings = {
+        ...modeSettings,
+        [mode.id]: {
+          ...(currentModeSettings && typeof currentModeSettings === "object" &&
+            !Array.isArray(currentModeSettings) ? currentModeSettings : {}),
+          megapixels,
+        },
+      };
     }
     if (["none", "low", "medium", "high"].includes(thinkingEffort)) {
       saved.thinking_effort = thinkingEffort;
@@ -638,14 +696,12 @@
     if (state.options.aspect_ratios.some((item) => item.label === saved.aspect_ratio)) {
       byId("image-aspect-ratio").value = saved.aspect_ratio;
     }
-    const megapixels = Number(state.imageMode === "edit" ? saved.edit_megapixels : saved.megapixels);
-    if (Number.isFinite(megapixels) && megapixels >= state.options.megapixels.min &&
-        megapixels <= (state.imageMode === "edit"
-          ? state.options.edit_megapixels.max : state.options.megapixels.max)) {
-      byId("image-megapixels").value = megapixels.toFixed(2);
-    } else if (state.imageMode === "edit") {
-      byId("image-megapixels").value = Number(state.options.edit_megapixels.default).toFixed(2);
-    }
+    const mode = getMode();
+    const megapixelOptions = mode.resolution.megapixels;
+    const megapixels = getSavedMegapixels(saved, mode);
+    byId("image-megapixels").value = Number.isFinite(megapixels) &&
+      megapixels >= megapixelOptions.min && megapixels <= megapixelOptions.max
+      ? megapixels.toFixed(2) : Number(megapixelOptions.default).toFixed(2);
     if (["none", "low", "medium", "high"].includes(saved.thinking_effort)) {
       byId("thinking-effort").value = saved.thinking_effort;
     }
@@ -849,7 +905,9 @@
     const addButton = byId("upload-source-images");
     addButton.className = "source-image-add";
     byId("source-image-list").replaceChildren(addButton);
-    byId("source-image-count").textContent = "0 / 5";
+    if (state.options) {
+      byId("source-image-count").textContent = `0 / ${getMode().source_images.max_count}`;
+    }
     updateModeControls();
   }
 
@@ -866,12 +924,14 @@
     state.sourceImages = sourceImages;
     const list = byId("source-image-list");
     const addButton = byId("upload-source-images");
+    const mode = getMode();
     addButton.className = "source-image-add";
     list.replaceChildren(addButton);
-    byId("source-image-count").textContent = `${sourceImages.length} / 5`;
     updateModeControls();
 
     for (const [index, sourceImage] of sourceImages.entries()) {
+      const role = sourceImageRole(mode, index);
+      const formattedRole = `${role[0].toUpperCase()}${role.slice(1)}`;
       const card = document.createElement("article");
       card.className = "source-image-card";
       card.dataset.sourceImageId = sourceImage.id;
@@ -880,13 +940,13 @@
       card.setAttribute("aria-keyshortcuts", "Alt+Shift+ArrowLeft Alt+Shift+ArrowRight");
       card.setAttribute(
         "aria-label",
-        `Picture ${index + 1}, ${index === 0 ? "base image" : "reference image"}. Drag to reorder; press Alt+Shift+Left or Alt+Shift+Right to move.`,
+        `Picture ${index + 1}, ${role}. Drag to reorder; press Alt+Shift+Left or Alt+Shift+Right to move.`,
       );
       const preview = document.createElement("div");
       preview.className = "source-image-preview";
       const image = document.createElement("img");
       image.draggable = false;
-      image.alt = `Picture ${index + 1}${index === 0 ? " base image" : " reference image"}`;
+      image.alt = `Picture ${index + 1} ${role}`;
       image.title = `${image.alt} (${sourceImage.width} x ${sourceImage.height})`;
       const url = state.sourceImageUrls.get(sourceImage.id);
       if (url) {
@@ -917,7 +977,7 @@
       details.className = "source-image-details";
       const label = document.createElement("span");
       label.className = "source-image-label";
-      label.textContent = index === 0 ? "Picture 1 - Base" : `Picture ${index + 1} - Reference`;
+      label.textContent = `Picture ${index + 1} - ${formattedRole}`;
       details.append(label);
 
       const remove = document.createElement("button");
@@ -1028,12 +1088,18 @@
   }
 
   async function uploadSourceImages(files) {
-    if (state.busy || !state.conversationId || state.imageMode !== "edit") return;
+    if (state.busy || !state.conversationId) return;
+    const mode = getMode();
+    if (mode.source_images.max_count === 0) {
+      toast(`${mode.label} does not accept source images.`, true);
+      return;
+    }
     const selectedFiles = [...files];
     const limits = state.options?.source_images;
     if (!limits) return;
-    if (state.sourceImages.length + selectedFiles.length > limits.max_count) {
-      toast(`A conversation can have at most ${limits.max_count} source images.`, true);
+    const maximum = mode.source_images.max_count;
+    if (state.sourceImages.length + selectedFiles.length > maximum) {
+      toast(`This mode supports at most ${maximum} source images.`, true);
       return;
     }
     setBusy(true);
@@ -1091,11 +1157,22 @@
     const caption = document.createElement("div");
     caption.className = "gallery-caption";
     const text = document.createElement("span");
-    text.textContent = generation.image_mode === "edit"
-      ? `Edit · ${Number(generation.megapixels).toFixed(2)} MP · ${generation.width} x ${generation.height} · ` +
-        `${generation.source_image_ids?.length || 0} source images · seed ${generation.seed}`
-      : `${generation.aspect_ratio} · ${Number(generation.megapixels).toFixed(2)} MP · ` +
-        `${generation.width} x ${generation.height} · ${generation.sampler_name} / ${generation.scheduler} · seed ${generation.seed}`;
+    const generationMode = state.options?.modes.find((mode) => mode.id === generation.image_mode);
+    const details = [generationMode?.label || generation.image_mode || "Image generation"];
+    if (generation.aspect_ratio && generation.aspect_ratio !== "Source image") {
+      details.push(generation.aspect_ratio);
+    }
+    details.push(
+      `${Number(generation.megapixels).toFixed(2)} MP`,
+      `${generation.width} x ${generation.height}`,
+    );
+    const sourceCount = generation.source_image_ids?.length || 0;
+    if (sourceCount) details.push(`${sourceCount} source images`);
+    if (generation.sampler_name && generation.scheduler) {
+      details.push(`${generation.sampler_name} / ${generation.scheduler}`);
+    }
+    details.push(`seed ${generation.seed}`);
+    text.textContent = details.join(" · ");
     const link = document.createElement("a");
     link.href = url;
     link.download = generation.filename;
@@ -1181,13 +1258,13 @@
       renderConversationList((await api("/api/state")).conversations || []);
       byId("conversation-title").textContent = data.conversation.title || "New conversation";
       imagePrompt.value = data.conversation.image_prompt || "";
-      applyImageMode(data.conversation.image_mode || "text-to-image");
+      applyImageMode(data.conversation.image_mode || state.options.default_mode);
       const conversationRatio = data.conversation.aspect_ratio;
       if (state.options?.aspect_ratios.some((item) => item.label === conversationRatio)) {
         byId("image-aspect-ratio").value = conversationRatio;
       }
       const latestGeneration = data.generations[0];
-      if (latestGeneration && (latestGeneration.image_mode || "text-to-image") === state.imageMode) {
+      if (latestGeneration && (latestGeneration.image_mode || state.options.default_mode) === state.imageMode) {
         if (state.options?.aspect_ratios.some((item) => item.label === latestGeneration.aspect_ratio)) {
           byId("image-aspect-ratio").value = latestGeneration.aspect_ratio;
         }
@@ -1228,11 +1305,13 @@
     try {
       const conversation = await api("/api/conversations", { method: "POST", body: "{}" });
       state.conversationId = conversation.id;
-      applyImageMode("text-to-image");
+      applyImageMode(state.options.default_mode);
       imagePrompt.value = "";
       if (state.options) {
         byId("image-aspect-ratio").value = state.options.default_aspect_ratio;
-        byId("image-megapixels").value = Number(state.options.megapixels.default).toFixed(2);
+        byId("image-megapixels").value = Number(
+          getMode(state.options.default_mode).resolution.megapixels.default,
+        ).toFixed(2);
         saveConversationSettings();
       }
       updatePromptCount();
@@ -1415,6 +1494,7 @@
 
   async function generateImage() {
     if (state.busy || !state.conversationId || !imagePrompt.value.trim()) return;
+    const mode = getMode();
     const resolution = calculateResolution();
     if (!resolution) return;
     const { seedInput, seedText, valid } = updateSeedValidity();
@@ -1436,7 +1516,7 @@
           aspect_ratio: byId("image-aspect-ratio").value,
           megapixels: resolution.megapixels,
           image_mode: state.imageMode,
-          source_image_ids: state.imageMode === "edit"
+          source_image_ids: mode.source_images.max_count > 0
             ? state.sourceImages.map((sourceImage) => sourceImage.id) : [],
         }, updateGenerationMonitor, (runId) => {
           if (runId) state.generationRunId = runId;
@@ -1468,8 +1548,6 @@
     byId("chat-form").requestSubmit();
   });
   byId("generate-image").addEventListener("click", generateImage);
-  byId("mode-text-to-image").addEventListener("click", () => changeImageMode("text-to-image"));
-  byId("mode-edit").addEventListener("click", () => changeImageMode("edit"));
   byId("upload-source-images").addEventListener("click", () => byId("source-image-input").click());
   byId("source-image-input").addEventListener("change", (event) => {
     uploadSourceImages(event.currentTarget.files || []);
