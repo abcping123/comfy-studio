@@ -296,7 +296,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
     resource_monitor = SystemMetrics(settings.section("comfyui")["gpu_id"])
     static_dir = Path(__file__).resolve().parent / "static"
 
-    app = FastAPI(title="Strata + MiniMax Studio", docs_url=None, redoc_url=None,
+    app = FastAPI(title="Comfy Studio", docs_url=None, redoc_url=None,
                   telemetry={"auto_configure": False, "tracing": False, "metrics": False,
                              "logs": False, "operation_spans": False})
     app.state.settings = settings

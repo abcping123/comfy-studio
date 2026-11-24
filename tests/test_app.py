@@ -11,10 +11,10 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from strata_comfy_studio.app import ChatRunManager, GenerationRunManager, create_app
-from strata_comfy_studio.orchestrator import ChatOutcome, GenerationOutcome
-from strata_comfy_studio.settings import Settings
-from strata_comfy_studio.storage import ConversationStore
+from comfy_studio.app import ChatRunManager, GenerationRunManager, create_app
+from comfy_studio.orchestrator import ChatOutcome, GenerationOutcome
+from comfy_studio.settings import Settings
+from comfy_studio.storage import ConversationStore
 from test_settings import sample_config
 
 
@@ -88,7 +88,7 @@ class AppTests(unittest.TestCase):
             "gpu_percent": 12.0,
             "vram_percent": 36.0,
         }
-        with patch("strata_comfy_studio.app.SystemMetrics.snapshot", return_value=metrics):
+        with patch("comfy_studio.app.SystemMetrics.snapshot", return_value=metrics):
             response = self.client.get(path, headers={"Authorization": "Bearer test-access-token"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), metrics)
@@ -129,7 +129,7 @@ class AppTests(unittest.TestCase):
             "current_image_prompt": "A red teapot on a dark green table.",
             "current_aspect_ratio": "16:9 (Widescreen)",
         }
-        with patch("strata_comfy_studio.app.Orchestrator.chat", autospec=True,
+        with patch("comfy_studio.app.Orchestrator.chat", autospec=True,
                    return_value=ChatOutcome("Reply", "Prompt", "16:9 (Widescreen)", True,
                                             reasoning_content="Consider a wide composition.")) as chat:
             response = self.client.post("/api/chat", headers=headers, json={
@@ -157,7 +157,7 @@ class AppTests(unittest.TestCase):
              "aspect_ratio": "16:9 (Widescreen)", "reasoning_content": "Keep the subject centered. ",
              "context_saved": True, "warning": None},
         ]
-        with patch("strata_comfy_studio.app.Orchestrator.chat_stream", autospec=True,
+        with patch("comfy_studio.app.Orchestrator.chat_stream", autospec=True,
                    return_value=iter(stream_events)) as chat:
             response = self.client.post("/api/chat/stream", headers=headers, json={
                 "conversation_id": conversation["id"],
@@ -280,7 +280,7 @@ class AppTests(unittest.TestCase):
             progress_callback({"type": "progress", "value": 3, "max": 6})
             return result
 
-        with patch("strata_comfy_studio.app.Orchestrator.generate", autospec=True,
+        with patch("comfy_studio.app.Orchestrator.generate", autospec=True,
                    side_effect=fake_generate) as generate:
             response = self.client.post("/api/generate/stream", headers=headers, json={
                 "conversation_id": conversation["id"],

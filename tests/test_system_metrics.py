@@ -6,7 +6,7 @@ from collections import namedtuple
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from strata_comfy_studio.system_metrics import SystemMetrics
+from comfy_studio.system_metrics import SystemMetrics
 
 
 CpuTimes = namedtuple("CpuTimes", ("user", "system", "idle", "interrupt", "dpc"))
@@ -20,7 +20,7 @@ class SystemMetricsTests(unittest.TestCase):
         ]))
         metrics = SystemMetrics(0)
 
-        with patch("strata_comfy_studio.system_metrics.platform.system", return_value="Windows"), \
+        with patch("comfy_studio.system_metrics.platform.system", return_value="Windows"), \
                 patch.dict(sys.modules, {"psutil": psutil}):
             self.assertIsNone(metrics._cpu_percent())
             self.assertEqual(metrics._cpu_percent(), 50.0)
@@ -30,7 +30,7 @@ class SystemMetricsTests(unittest.TestCase):
             virtual_memory=Mock(return_value=SimpleNamespace(percent=42.4))
         )
 
-        with patch("strata_comfy_studio.system_metrics.platform.system", return_value="Windows"), \
+        with patch("comfy_studio.system_metrics.platform.system", return_value="Windows"), \
                 patch.dict(sys.modules, {"psutil": psutil}):
             self.assertEqual(SystemMetrics._memory_percent(), 42.4)
 

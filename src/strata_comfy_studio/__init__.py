@@ -1,1 +1,0 @@
-"""Strata and ComfyUI local image-generation studio."""

@@ -7,8 +7,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import ProxyHandler
 
-from strata_comfy_studio.clients import BackendError, ComfyUIClient, StrataClient
-from strata_comfy_studio.settings import load_config, project_root
+from comfy_studio.clients import BackendError, ComfyUIClient, StrataClient
+from comfy_studio.settings import load_config, project_root
 from test_settings import sample_config
 
 

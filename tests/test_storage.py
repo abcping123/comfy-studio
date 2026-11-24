@@ -9,7 +9,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from strata_comfy_studio.storage import ConversationStore, StorageError
+from comfy_studio.storage import ConversationStore, StorageError
 
 
 def _assert_private_file(test_case: unittest.TestCase, path: Path) -> None:

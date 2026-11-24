@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from strata_comfy_studio.settings import ConfigError, load_config, validate_config
+from comfy_studio.settings import ConfigError, load_config, validate_config
 
 
 def sample_config() -> dict:

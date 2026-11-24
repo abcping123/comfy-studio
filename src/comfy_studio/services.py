@@ -25,7 +25,7 @@ class ServiceError(RuntimeError):
 def service_command(settings: Settings, service: str) -> tuple[list[str], Path, str, int]:
     if service == "studio":
         config = settings.section("app")
-        return ([sys.executable, "-m", "strata_comfy_studio.app"], project_root(),
+        return ([sys.executable, "-m", "comfy_studio.app"], project_root(),
                 config["listen_host"], config["port"])
     if service == "strata":
         config = settings.section("strata")

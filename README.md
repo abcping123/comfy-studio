@@ -1,6 +1,6 @@
-# Strata + MiniMax Studio
+# Comfy Studio
 
-A local-first browser studio that runs Strata Qwen3.8-Flash-Next Q2_0 and ComfyUI MiniMax H3 Image on a single GPU. MiniMax prompt enhancement is disabled; the API workflows use Qwen3-VL for image conditioning and contain no Qwen3.5 prompt-enhancement branch.
+Comfy Studio is a local-first browser studio for ComfyUI image generation. The current setup runs Strata Qwen3.8-Flash-Next Q2_0 and ComfyUI MiniMax H3 Image on a single GPU. MiniMax prompt enhancement is disabled; the API workflows use Qwen3-VL for image conditioning and contain no Qwen3.5 prompt-enhancement branch.
 
 The prompt composer follows the local MiniMax-H3-Image text-to-image prompt-writing skill. Image controls mirror ComfyUI's ResolutionSelector: aspect ratio, megapixel target, 32-pixel alignment, and seed. New generations use the Euler sampler and simple scheduler by default. Width and height are derived from the selected ratio and megapixel target.
 

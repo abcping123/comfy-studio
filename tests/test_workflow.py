@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from strata_comfy_studio.settings import Settings, load_config, project_root
-from strata_comfy_studio.workflow import WorkflowError, build_workflow
+from comfy_studio.settings import Settings, load_config, project_root
+from comfy_studio.workflow import WorkflowError, build_workflow
 
 
 class WorkflowTests(unittest.TestCase):

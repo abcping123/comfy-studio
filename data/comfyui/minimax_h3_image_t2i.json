@@ -61,7 +61,7 @@
   "8": {
     "class_type": "SaveImage",
     "inputs": {
-      "filename_prefix": "strata_comfy_studio",
+      "filename_prefix": "comfy_studio",
       "images": ["7", 0]
     }
   }

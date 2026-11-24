@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from strata_comfy_studio.image_assets import SourceImageError, inspect_source_image
+from comfy_studio.image_assets import SourceImageError, inspect_source_image
 
 
 class ImageAssetTests(unittest.TestCase):
@@ -33,7 +33,7 @@ class ImageAssetTests(unittest.TestCase):
             inspect_source_image(self.make_image("PNG"), "image/jpeg")
 
     def test_upload_size_limit_is_enforced(self) -> None:
-        with patch("strata_comfy_studio.image_assets.MAX_SOURCE_IMAGE_BYTES", 1):
+        with patch("comfy_studio.image_assets.MAX_SOURCE_IMAGE_BYTES", 1):
             with self.assertRaisesRegex(SourceImageError, "25 MiB"):
                 inspect_source_image(self.make_image("PNG"), "image/png")
 

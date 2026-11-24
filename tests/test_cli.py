@@ -7,8 +7,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import call, patch
 
-from strata_comfy_studio.cli import _load_active_config, main
-from strata_comfy_studio.services import ServiceError
+from comfy_studio.cli import _load_active_config, main
+from comfy_studio.services import ServiceError
 
 
 class CliTests(unittest.TestCase):
@@ -16,14 +16,14 @@ class CliTests(unittest.TestCase):
         settings = object()
         lifecycle: list[str] = []
         with (
-            patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
-            patch("strata_comfy_studio.cli.validate_artifacts",
+            patch("comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
+            patch("comfy_studio.cli.validate_artifacts",
                   side_effect=lambda _: lifecycle.append("validate")) as validate_artifacts,
-            patch("strata_comfy_studio.cli.prepare_runtime_files",
+            patch("comfy_studio.cli.prepare_runtime_files",
                   side_effect=lambda _: lifecycle.append("prepare")) as prepare_runtime_files,
-            patch("strata_comfy_studio.cli.preflight_service_start",
+            patch("comfy_studio.cli.preflight_service_start",
                   side_effect=lambda *_: lifecycle.append("preflight")) as preflight_service_start,
-            patch("strata_comfy_studio.cli.start_service", side_effect=[
+            patch("comfy_studio.cli.start_service", side_effect=[
                 (101, Path("comfyui.log")),
                 (202, Path("strata.log")),
                 (303, Path("studio.log")),
@@ -51,10 +51,10 @@ class CliTests(unittest.TestCase):
             strata_repo = Path(directory) / "Strata"
             comfyui_repo = Path(directory) / "ComfyUI"
             with (
-                patch("strata_comfy_studio.cli.default_config_path", return_value=config_path),
-                patch("strata_comfy_studio.cli.initialize_config") as initialize_config,
-                patch("strata_comfy_studio.cli.load_config", return_value=settings),
-                patch("strata_comfy_studio.cli._check_private_config"),
+                patch("comfy_studio.cli.default_config_path", return_value=config_path),
+                patch("comfy_studio.cli.initialize_config") as initialize_config,
+                patch("comfy_studio.cli.load_config", return_value=settings),
+                patch("comfy_studio.cli._check_private_config"),
                 patch("builtins.input", side_effect=[str(strata_repo), str(comfyui_repo)]) as prompt,
                 redirect_stdout(io.StringIO()),
             ):
@@ -73,10 +73,10 @@ class CliTests(unittest.TestCase):
             config_path = Path(directory) / "config.json"
             config_path.touch()
             with (
-                patch("strata_comfy_studio.cli.default_config_path", return_value=config_path),
-                patch("strata_comfy_studio.cli.initialize_config") as initialize_config,
-                patch("strata_comfy_studio.cli.load_config", return_value=object()),
-                patch("strata_comfy_studio.cli._check_private_config"),
+                patch("comfy_studio.cli.default_config_path", return_value=config_path),
+                patch("comfy_studio.cli.initialize_config") as initialize_config,
+                patch("comfy_studio.cli.load_config", return_value=object()),
+                patch("comfy_studio.cli._check_private_config"),
                 patch("builtins.input") as prompt,
             ):
                 _load_active_config(initialize_if_missing=True)
@@ -87,11 +87,11 @@ class CliTests(unittest.TestCase):
     def test_start_continues_after_a_service_fails(self) -> None:
         settings = object()
         with (
-            patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
-            patch("strata_comfy_studio.cli.validate_artifacts"),
-            patch("strata_comfy_studio.cli.prepare_runtime_files"),
-            patch("strata_comfy_studio.cli.preflight_service_start"),
-            patch("strata_comfy_studio.cli.start_service", side_effect=[
+            patch("comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
+            patch("comfy_studio.cli.validate_artifacts"),
+            patch("comfy_studio.cli.prepare_runtime_files"),
+            patch("comfy_studio.cli.preflight_service_start"),
+            patch("comfy_studio.cli.start_service", side_effect=[
                 ServiceError("ComfyUI failed"),
                 (202, Path("strata.log")),
                 (303, Path("studio.log")),
@@ -108,12 +108,12 @@ class CliTests(unittest.TestCase):
         settings = object()
         error_output = io.StringIO()
         with (
-            patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)),
-            patch("strata_comfy_studio.cli.validate_artifacts"),
-            patch("strata_comfy_studio.cli.prepare_runtime_files"),
-            patch("strata_comfy_studio.cli.preflight_service_start",
+            patch("comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)),
+            patch("comfy_studio.cli.validate_artifacts"),
+            patch("comfy_studio.cli.prepare_runtime_files"),
+            patch("comfy_studio.cli.preflight_service_start",
                   side_effect=ServiceError("stale service PID")),
-            patch("strata_comfy_studio.cli.start_service") as start_service,
+            patch("comfy_studio.cli.start_service") as start_service,
             redirect_stderr(error_output),
         ):
             result = main(["start"])
@@ -126,11 +126,11 @@ class CliTests(unittest.TestCase):
         settings = object()
         output = io.StringIO()
         with (
-            patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)),
-            patch("strata_comfy_studio.cli.validate_artifacts"),
-            patch("strata_comfy_studio.cli.prepare_runtime_files"),
-            patch("strata_comfy_studio.cli.preflight_service_start"),
-            patch("strata_comfy_studio.cli.start_service", side_effect=[
+            patch("comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)),
+            patch("comfy_studio.cli.validate_artifacts"),
+            patch("comfy_studio.cli.prepare_runtime_files"),
+            patch("comfy_studio.cli.preflight_service_start"),
+            patch("comfy_studio.cli.start_service", side_effect=[
                 (101, Path("comfyui.log")),
                 (None, Path("strata.log")),
                 (303, Path("studio.log")),
@@ -145,8 +145,8 @@ class CliTests(unittest.TestCase):
     def test_status_checks_all_services(self) -> None:
         settings = object()
         with (
-            patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
-            patch("strata_comfy_studio.cli.service_running", side_effect=[True, False, True]) as service_running,
+            patch("comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
+            patch("comfy_studio.cli.service_running", side_effect=[True, False, True]) as service_running,
             redirect_stdout(io.StringIO()),
         ):
             result = main(["status"])
@@ -162,8 +162,8 @@ class CliTests(unittest.TestCase):
     def test_stop_stops_all_services_in_reverse_order(self) -> None:
         settings = object()
         with (
-            patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
-            patch("strata_comfy_studio.cli.stop_service", side_effect=[True, False, True]) as stop_service,
+            patch("comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)) as load_active_config,
+            patch("comfy_studio.cli.stop_service", side_effect=[True, False, True]) as stop_service,
             redirect_stdout(io.StringIO()),
         ):
             result = main(["stop"])
@@ -180,8 +180,8 @@ class CliTests(unittest.TestCase):
         settings = object()
         output = io.StringIO()
         with (
-            patch("strata_comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)),
-            patch("strata_comfy_studio.cli.stop_service", side_effect=[True, None, True]),
+            patch("comfy_studio.cli._load_active_config", return_value=(Path("config.json"), settings)),
+            patch("comfy_studio.cli.stop_service", side_effect=[True, None, True]),
             redirect_stdout(output),
         ):
             result = main(["stop"])

@@ -8,14 +8,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from strata_comfy_studio.initialize import (
+from comfy_studio.initialize import (
     InitializationError,
     configure_listeners,
     initialize_config,
     prepare_runtime_files,
 )
 from test_settings import sample_config
-from strata_comfy_studio.settings import load_config
+from comfy_studio.settings import load_config
 
 
 def _venv_python(root: Path) -> Path:

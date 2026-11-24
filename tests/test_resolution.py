@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from strata_comfy_studio.resolution import calculate_edit_resolution, calculate_resolution, normalize_aspect_ratio
-from strata_comfy_studio.settings import load_config, project_root
+from comfy_studio.resolution import calculate_edit_resolution, calculate_resolution, normalize_aspect_ratio
+from comfy_studio.settings import load_config, project_root
 
 
 class ResolutionTests(unittest.TestCase):

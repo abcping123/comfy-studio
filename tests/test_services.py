@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from strata_comfy_studio.services import (
+from comfy_studio.services import (
     ServiceError,
     _pid_path,
     _strata_endpoint_matches,
@@ -20,7 +20,7 @@ from strata_comfy_studio.services import (
     start_service,
     stop_service,
 )
-from strata_comfy_studio.settings import Settings, load_config, project_root
+from comfy_studio.settings import Settings, load_config, project_root
 
 
 class ServiceCommandTests(unittest.TestCase):
@@ -56,7 +56,7 @@ class ServiceCommandTests(unittest.TestCase):
 
     def test_studio_command_uses_configured_app_listener(self) -> None:
         command, cwd, host, port = service_command(self.settings, "studio")
-        self.assertEqual(command, [sys.executable, "-m", "strata_comfy_studio.app"])
+        self.assertEqual(command, [sys.executable, "-m", "comfy_studio.app"])
         self.assertEqual(cwd, project_root())
         self.assertEqual((host, port), ("127.0.0.1", 8765))
 
@@ -97,7 +97,7 @@ class ExternalStrataTests(unittest.TestCase):
             opener = MagicMock()
             opener.open.return_value = response
 
-            with patch("strata_comfy_studio.services.build_opener", return_value=opener):
+            with patch("comfy_studio.services.build_opener", return_value=opener):
                 self.assertTrue(_strata_endpoint_matches(settings))
                 request = opener.open.call_args.args[0]
                 self.assertEqual(request.get_header("Authorization"), "Bearer test-api-key")
@@ -109,11 +109,11 @@ class ExternalStrataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = self._settings(Path(directory))
             with (
-                patch("strata_comfy_studio.services._port_open", return_value=True),
-                patch("strata_comfy_studio.services._strata_endpoint_matches", return_value=True),
-                patch("strata_comfy_studio.services._find_service_processes", return_value=[]),
-                patch("strata_comfy_studio.services.set_private_permissions"),
-                patch("strata_comfy_studio.services.subprocess.Popen") as popen,
+                patch("comfy_studio.services._port_open", return_value=True),
+                patch("comfy_studio.services._strata_endpoint_matches", return_value=True),
+                patch("comfy_studio.services._find_service_processes", return_value=[]),
+                patch("comfy_studio.services.set_private_permissions"),
+                patch("comfy_studio.services.subprocess.Popen") as popen,
             ):
                 pid, _ = start_service(settings, "strata")
 
@@ -131,7 +131,7 @@ class ExternalStrataTests(unittest.TestCase):
                 else:
                     args = command
                 with patch(
-                    "strata_comfy_studio.services._process_identity",
+                    "comfy_studio.services._process_identity",
                     return_value=(args, cwd),
                 ):
                     self.assertTrue(_service_process_matches(settings, service, 1234))
@@ -140,7 +140,7 @@ class ExternalStrataTests(unittest.TestCase):
             wrong_port_args = strata_command.copy()
             wrong_port_args[wrong_port_args.index("--port") + 1] = str(strata_port + 1)
             with patch(
-                "strata_comfy_studio.services._process_identity",
+                "comfy_studio.services._process_identity",
                 return_value=(wrong_port_args, cwd),
             ):
                 self.assertFalse(_service_process_matches(settings, "strata", 1234))
@@ -158,18 +158,18 @@ class ExternalStrataTests(unittest.TestCase):
                 popen = MagicMock(return_value=process)
 
                 with (
-                    patch("strata_comfy_studio.services._process_matches", return_value=False),
-                    patch("strata_comfy_studio.services._pid_exists", return_value=True),
-                    patch("strata_comfy_studio.services._find_service_processes", return_value=[303]),
+                    patch("comfy_studio.services._process_matches", return_value=False),
+                    patch("comfy_studio.services._pid_exists", return_value=True),
+                    patch("comfy_studio.services._find_service_processes", return_value=[303]),
                     patch(
-                        "strata_comfy_studio.services._service_process_matches",
+                        "comfy_studio.services._service_process_matches",
                         side_effect=[True, False],
                     ),
-                    patch("strata_comfy_studio.services._terminate_process") as terminate,
-                    patch("strata_comfy_studio.services._port_open", return_value=False),
-                    patch("strata_comfy_studio.services._strata_endpoint_matches", return_value=True),
-                    patch("strata_comfy_studio.services.set_private_permissions"),
-                    patch("strata_comfy_studio.services.subprocess.Popen", popen),
+                    patch("comfy_studio.services._terminate_process") as terminate,
+                    patch("comfy_studio.services._port_open", return_value=False),
+                    patch("comfy_studio.services._strata_endpoint_matches", return_value=True),
+                    patch("comfy_studio.services.set_private_permissions"),
+                    patch("comfy_studio.services.subprocess.Popen", popen),
                 ):
                     started_pid, _ = start_service(settings, service)
 
@@ -182,8 +182,8 @@ class ExternalStrataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = self._settings(Path(directory))
             with (
-                patch("strata_comfy_studio.services._port_open", return_value=True),
-                patch("strata_comfy_studio.services._strata_endpoint_matches", return_value=False),
+                patch("comfy_studio.services._port_open", return_value=True),
+                patch("comfy_studio.services._strata_endpoint_matches", return_value=False),
                 self.assertRaisesRegex(ServiceError, "already in use"),
             ):
                 start_service(settings, "strata")
@@ -197,10 +197,10 @@ class ExternalStrataTests(unittest.TestCase):
                 pid_file.write_text(f"{os.getpid()}\n", encoding="ascii")
             secret_argument = "do-not-print-this-token"
             with (
-                patch("strata_comfy_studio.services._process_matches", return_value=False),
-                patch("strata_comfy_studio.services._find_service_processes", return_value=[]),
+                patch("comfy_studio.services._process_matches", return_value=False),
+                patch("comfy_studio.services._find_service_processes", return_value=[]),
                 patch(
-                    "strata_comfy_studio.services._process_identity",
+                    "comfy_studio.services._process_identity",
                     return_value=(["/usr/bin/python", secret_argument], Path("/tmp/other-service")),
                 ),
                 self.assertRaises(ServiceError) as error,
@@ -221,7 +221,7 @@ class ExternalStrataTests(unittest.TestCase):
     def test_status_and_stop_report_but_do_not_manage_external_strata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = self._settings(Path(directory))
-            with patch("strata_comfy_studio.services._strata_endpoint_matches", return_value=True):
+            with patch("comfy_studio.services._strata_endpoint_matches", return_value=True):
                 self.assertTrue(service_running(settings, "strata"))
                 self.assertIsNone(stop_service(settings, "strata"))
 

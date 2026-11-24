@@ -7,10 +7,10 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from strata_comfy_studio.clients import BackendError
-from strata_comfy_studio.orchestrator import CoordinationError, Orchestrator
-from strata_comfy_studio.settings import Settings, load_config, project_root
-from strata_comfy_studio.storage import ConversationStore, StorageError
+from comfy_studio.clients import BackendError
+from comfy_studio.orchestrator import CoordinationError, Orchestrator
+from comfy_studio.settings import Settings, load_config, project_root
+from comfy_studio.storage import ConversationStore, StorageError
 
 
 class FakeStrata:
