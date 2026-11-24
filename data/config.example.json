@@ -29,7 +29,7 @@
     "main_script": "/home/pic1wx/repos/ComfyUI/main.py",
     "working_directory": "/home/pic1wx/repos/ComfyUI",
     "diffusion_models_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/diffusion_models",
-    "text_encoders_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3/text_encoders",
+    "text_encoders_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/text_encoders",
     "vae_dir": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/vae",
     "input_directory": "temp/comfyui/input",
     "models": {
