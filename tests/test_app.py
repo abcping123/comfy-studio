@@ -11,6 +11,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from comfy_studio.chat_backends import CHAT_BACKEND_REGISTRY, ChatBackendDefinition
 from comfy_studio.app import ChatRunManager, GenerationRunManager, create_app
 from comfy_studio.modes import DEFAULT_MODE_ID, IMAGE_MODES
 from comfy_studio.orchestrator import ChatOutcome, GenerationOutcome
@@ -53,7 +54,10 @@ class AppTests(unittest.TestCase):
         self.data = sample_config()
         self.data["app"]["access_token"] = "test-access-token"
         self.settings = Settings(self.root, self.data)
-        self.store = ConversationStore(self.root / "studio.sqlite3")
+        self.store = ConversationStore(
+            self.settings.path("paths.session_root"),
+            self.settings.path("paths.runtime_root"),
+        )
         self.app = create_app(self.settings, self.store, AppStrata(), AppComfy(self.settings))
         self.client = TestClient(self.app)
 
@@ -99,17 +103,32 @@ class AppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         options = response.json()
         self.assertEqual(options["default_mode"], DEFAULT_MODE_ID)
+        self.assertEqual(options["reasoning_efforts"], [
+            {"value": "none", "label": "Off"},
+            {"value": "low", "label": "Low"},
+            {"value": "medium", "label": "Medium"},
+            {"value": "high", "label": "High"},
+        ])
+        self.assertEqual(options["default_reasoning_effort"], "none")
         self.assertEqual([mode["id"] for mode in options["modes"]],
                          [mode.id for mode in IMAGE_MODES])
         edit_mode = next(mode for mode in options["modes"] if mode["id"] == "edit")
+        text_to_image_mode = next(
+            mode for mode in options["modes"] if mode["id"] == DEFAULT_MODE_ID
+        )
         self.assertEqual(edit_mode["resolution"]["strategy"], "source-image")
+        self.assertEqual(edit_mode["resolution"]["megapixels"]["max"], 16.0)
         self.assertEqual(edit_mode["source_images"]["min_count"], 1)
         self.assertEqual(edit_mode["source_images"]["max_count"], 5)
         self.assertEqual(options["default_aspect_ratio"], "1:1 (Square)")
-        self.assertEqual(options["megapixels"]["min"], 0.5)
-        self.assertEqual(options["megapixels"]["max"], 20.0)
-        self.assertEqual(options["megapixels"]["default"], 4.0)
-        self.assertEqual(options["edit_megapixels"]["max"], 16.0)
+        self.assertEqual(text_to_image_mode["resolution"]["megapixels"], {
+            "min": 0.5,
+            "max": 20.0,
+            "step": 0.01,
+            "default": 4.0,
+        })
+        self.assertNotIn("megapixels", options)
+        self.assertNotIn("edit_megapixels", options)
         self.assertEqual(options["source_images"]["max_count"], 5)
         self.assertEqual(options["resolution_multiple"], 32)
         self.assertNotIn("samplers", options)
@@ -117,6 +136,97 @@ class AppTests(unittest.TestCase):
         self.assertNotIn("schedulers", options)
         self.assertNotIn("default_scheduler", options)
         self.assertFalse(options["prompt_enhancement"])
+
+    def test_bonsai_options_and_chat_use_supported_reasoning_efforts(self) -> None:
+        settings = Settings(self.root, self.data, chat_backend="bonsai")
+        app = create_app(settings, self.store, AppStrata(), AppComfy(settings))
+        headers = {"Authorization": "Bearer test-access-token"}
+        with TestClient(app) as client:
+            options = client.get("/api/options", headers=headers).json()
+            self.assertEqual(options["reasoning_efforts"], [
+                {"value": "none", "label": "Off"},
+                {"value": "medium", "label": "Medium"},
+                {"value": "xhigh", "label": "XHigh"},
+            ])
+            self.assertEqual(options["default_reasoning_effort"], "none")
+
+            conversation = client.post("/api/conversations", headers=headers).json()
+            with patch(
+                "comfy_studio.app.Orchestrator.chat",
+                autospec=True,
+                return_value=ChatOutcome("Reply", "Prompt", "1:1 (Square)", True),
+            ) as chat:
+                response = client.post("/api/chat", headers=headers, json={
+                    "conversation_id": conversation["id"],
+                    "message": "Hello",
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(chat.call_args.kwargs["reasoning_effort"], "none")
+
+                for effort in ("none", "medium", "xhigh"):
+                    response = client.post("/api/chat", headers=headers, json={
+                        "conversation_id": conversation["id"],
+                        "message": "Hello",
+                        "reasoning_effort": effort,
+                    })
+                    self.assertEqual(response.status_code, 200)
+
+                for effort in ("low", "high"):
+                    response = client.post("/api/chat", headers=headers, json={
+                        "conversation_id": conversation["id"],
+                        "message": "Hello",
+                        "reasoning_effort": effort,
+                    })
+                    self.assertEqual(response.status_code, 422)
+
+                self.assertEqual(chat.call_count, 4)
+
+    def test_registered_backend_controls_reasoning_options_without_api_changes(self) -> None:
+        definition = ChatBackendDefinition(
+            id="future-chat",
+            label="Future Chat",
+            reasoning_efforts=("none", "ultra_low"),
+            default_reasoning_effort="none",
+            config_schema="strata",
+            client_factory=lambda _settings: AppStrata(),
+            managed_service=False,
+            service_adapter=None,
+            setup_adapter="preconfigured",
+            runtime_preparer=None,
+            loaded_state="stateless",
+            endpoint_probe=None,
+            chat_preparation="stateless",
+            context_strategy="transcript",
+            image_transport="none",
+            generation_handoff="none",
+        )
+        settings = Settings(self.root, self.data, chat_backend=definition.id)
+        app = create_app(settings, self.store, AppStrata(), AppComfy(settings))
+        headers = {"Authorization": f"Bearer {self.data['app']['access_token']}"}
+
+        with patch.dict(CHAT_BACKEND_REGISTRY, {definition.id: definition}), TestClient(app) as client:
+            options_response = client.get("/api/options", headers=headers)
+            self.assertEqual(options_response.status_code, 200, options_response.text)
+            options = options_response.json()
+            self.assertEqual(options["chat_backend"], {"id": "future-chat", "label": "Future Chat"})
+            self.assertEqual(options["reasoning_efforts"], [
+                {"value": "none", "label": "Off"},
+                {"value": "ultra_low", "label": "Ultra Low"},
+            ])
+
+            conversation = client.post("/api/conversations", headers=headers).json()
+            with patch(
+                "comfy_studio.app.Orchestrator.chat",
+                autospec=True,
+                return_value=ChatOutcome("Reply", "Prompt", "1:1 (Square)", True),
+            ) as chat:
+                response = client.post("/api/chat", headers=headers, json={
+                    "conversation_id": conversation["id"],
+                    "message": "Hello",
+                    "reasoning_effort": "ultra_low",
+                })
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(chat.call_args.kwargs["reasoning_effort"], "ultra_low")
 
     def test_generate_stream_rejects_megapixels_outside_half_to_twenty(self) -> None:
         headers = {"Authorization": "Bearer test-access-token"}
@@ -317,12 +427,12 @@ class AppTests(unittest.TestCase):
             conversation["id"], "A red teapot", 42, "1:1 (Square)", 1.0,
             1024, 1024, "euler", "simple",
         )
-        filename = f"{generation_id}.png"
+        filename = f"generation_{generation_id}.png"
         self.store.update_generation(generation_id, "complete", image={
             "filename": filename, "subfolder": conversation["id"], "type": "output",
         })
         image_path = (
-            self.settings.path("paths.temp_root") / "comfyui" / conversation["id"] / filename
+            self.settings.path("paths.session_root") / conversation["id"] / filename
         )
         image_path.parent.mkdir(parents=True, exist_ok=True)
         image_path.write_bytes(b"generated PNG")
@@ -424,6 +534,26 @@ class AppTests(unittest.TestCase):
             json={"image_mode": "not-registered"},
         )
         self.assertEqual(response.status_code, 422)
+
+    def test_bonsai_state_reports_selected_backend_as_idle_when_unloaded(self) -> None:
+        settings = Settings(self.root, self.data, chat_backend="bonsai")
+        app = create_app(settings, self.store, AppStrata(), AppComfy(settings))
+        client = TestClient(app)
+        try:
+            with patch("comfy_studio.app.service_running", return_value=False):
+                response = client.get(
+                    "/api/state",
+                    headers={"Authorization": "Bearer test-access-token"},
+                )
+        finally:
+            client.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["chat_backend"], "bonsai")
+        self.assertEqual(
+            response.json()["services"]["bonsai"],
+            {"available": True, "loaded": False},
+        )
 
     def test_unknown_asset_is_not_served(self) -> None:
         response = self.client.get("/assets/../../config.json")

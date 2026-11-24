@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal
+from typing import Any, Callable, Iterator
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -13,7 +14,8 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
-from .clients import BackendError, ComfyUIClient, StrataClient
+from .chat_backends import create_chat_backend, get_chat_backend
+from .clients import BackendError, ChatBackend, ComfyUIClient
 from .image_assets import MAX_SOURCE_IMAGE_BYTES, SourceImageError, inspect_source_image
 from .modes import (
     DEFAULT_MODE_ID,
@@ -25,17 +27,25 @@ from .modes import (
 from .orchestrator import CoordinationError, Orchestrator
 from .permissions import set_private_permissions
 from .security import require_access
-from .settings import ConfigError, Settings, default_config_path, load_config
+from .settings import CHAT_BACKENDS, ConfigError, Settings, default_config_path, load_config
+from .services import ServiceError, service_running
 from .storage import ConversationStore, StorageConflictError, StorageError
 from .system_metrics import SystemMetrics
 
 
+REASONING_EFFORT_LABELS = {
+    "none": "Off",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "xhigh": "XHigh",
+}
 class ChatRequest(BaseModel):
     conversation_id: str
     message: str = Field(min_length=1, max_length=20000)
     current_image_prompt: str | None = Field(default=None, max_length=20000)
     current_aspect_ratio: str | None = Field(default=None, max_length=64)
-    reasoning_effort: Literal["none", "low", "medium", "high"] = "none"
+    reasoning_effort: str | None = Field(default=None, max_length=32)
 
 
 class GenerateRequest(BaseModel):
@@ -91,6 +101,19 @@ def _message_for_ui(message: dict[str, str]) -> dict[str, str]:
     if isinstance(parsed, dict) and isinstance(parsed.get("reply"), str):
         display_message["content"] = parsed["reply"]
     return display_message
+
+
+def _resolve_reasoning_effort(settings: Settings, requested: str | None) -> str:
+    backend = get_chat_backend(settings.chat_backend)
+    allowed = backend.reasoning_efforts
+    effort = requested if requested is not None else backend.default_reasoning_effort
+    if effort not in allowed:
+        choices = ", ".join(allowed)
+        raise HTTPException(
+            status_code=422,
+            detail=f"reasoning_effort for {settings.chat_backend} must be one of: {choices}",
+        )
+    return effort
 
 
 class ChatRun:
@@ -304,12 +327,17 @@ class GenerationRunManager:
 
 
 def create_app(settings: Settings | None = None, store: ConversationStore | None = None,
-               strata: StrataClient | None = None, comfy: ComfyUIClient | None = None) -> FastAPI:
+               chat_backend: ChatBackend | None = None,
+               comfy: ComfyUIClient | None = None) -> FastAPI:
     settings = settings or load_config()
-    store = store or ConversationStore(settings.path("paths.database"))
-    strata = strata or StrataClient(settings)
+    store = store or ConversationStore(
+        settings.path("paths.session_root"),
+        settings.path("paths.runtime_root"),
+    )
+    if chat_backend is None:
+        chat_backend = create_chat_backend(settings)
     comfy = comfy or ComfyUIClient(settings)
-    orchestrator = Orchestrator(settings, store, strata, comfy)
+    orchestrator = Orchestrator(settings, store, chat_backend, comfy)
     chat_runs = ChatRunManager()
     generation_runs = GenerationRunManager()
     resource_monitor = SystemMetrics(settings.section("comfyui")["gpu_id"])
@@ -320,7 +348,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
                              "logs": False, "operation_spans": False})
     app.state.settings = settings
     app.state.store = store
-    app.state.strata = strata
+    app.state.chat_backend = chat_backend
     app.state.comfy = comfy
     app.state.orchestrator = orchestrator
     app.state.chat_runs = chat_runs
@@ -342,14 +370,22 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
 
     @app.get("/api/state", dependencies=[Depends(authenticated)])
     async def state() -> dict[str, Any]:
-        strata_status: dict[str, Any]
+        backend_definition = get_chat_backend(settings.chat_backend)
+        chat_backend_status: dict[str, Any]
         comfy_status: dict[str, Any]
         try:
-            response = strata.status()
-            loaded = response.get("loaded")
-            strata_status = {"available": isinstance(loaded, bool), "loaded": loaded}
-        except BackendError as error:
-            strata_status = {"available": False, "error": str(error)}
+            if (backend_definition.loaded_state == "process"
+                    and not service_running(settings, settings.chat_backend)):
+                chat_backend_status = {"available": True, "loaded": False}
+            else:
+                response = chat_backend.status()
+                loaded = response.get("loaded")
+                chat_backend_status = {
+                    "available": isinstance(loaded, bool),
+                    "loaded": loaded,
+                }
+        except (BackendError, ServiceError) as error:
+            chat_backend_status = {"available": False, "error": str(error)}
         try:
             queue = comfy.queue()
             stats = comfy.system_stats()
@@ -367,7 +403,9 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         active_chat = chat_runs.active()
         active_generation = generation_runs.active()
         return {
-            "services": {"strata": strata_status, "comfyui": comfy_status},
+            "chat_backend": settings.chat_backend,
+            "chat_backend_label": backend_definition.label,
+            "services": {settings.chat_backend: chat_backend_status, "comfyui": comfy_status},
             "active_conversation_id": store.selected_conversation_id(),
             "conversations": store.list_conversations(),
             "active_chat": active_chat.public_info() if active_chat else None,
@@ -382,9 +420,24 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
     async def options() -> dict[str, Any]:
         generation = settings.section("generation")
         modes = public_mode_options(generation)
+        backend_definition = get_chat_backend(settings.chat_backend)
         options: dict[str, Any] = {
             "default_mode": DEFAULT_MODE_ID,
             "modes": modes,
+            "reasoning_efforts": [
+                {
+                    "value": effort,
+                    "label": REASONING_EFFORT_LABELS.get(
+                        effort, effort.replace("_", " ").title()
+                    ),
+                }
+                for effort in backend_definition.reasoning_efforts
+            ],
+            "default_reasoning_effort": backend_definition.default_reasoning_effort,
+            "chat_backend": {
+                "id": backend_definition.id,
+                "label": backend_definition.label,
+            },
             "aspect_ratios": generation["aspect_ratios"],
             "default_aspect_ratio": generation["default_aspect_ratio"],
             "resolution_multiple": generation["resolution_multiple"],
@@ -396,9 +449,6 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
                 "allowed_types": ["image/png", "image/jpeg", "image/webp"],
             },
         }
-        for mode, mode_options in zip(IMAGE_MODES, modes, strict=True):
-            if mode.legacy_options_key:
-                options[mode.legacy_options_key] = mode_options["resolution"]["megapixels"]
         return options
 
     @app.post("/api/conversations", dependencies=[Depends(authenticated)])
@@ -530,13 +580,14 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
 
     @app.post("/api/chat", dependencies=[Depends(authenticated)])
     async def chat(body: ChatRequest) -> dict[str, Any]:
+        reasoning_effort = _resolve_reasoning_effort(settings, body.reasoning_effort)
         try:
             result = orchestrator.chat(
                 body.conversation_id,
                 body.message,
                 current_image_prompt=body.current_image_prompt,
                 current_aspect_ratio=body.current_aspect_ratio,
-                reasoning_effort=body.reasoning_effort,
+                reasoning_effort=reasoning_effort,
             )
         except CoordinationError as error:
             status = 409 if "busy" in str(error).lower() or "queue" in str(error).lower() else 503
@@ -552,6 +603,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
 
     @app.post("/api/chat/stream", dependencies=[Depends(authenticated)])
     async def chat_stream(body: ChatRequest) -> StreamingResponse:
+        reasoning_effort = _resolve_reasoning_effort(settings, body.reasoning_effort)
         try:
             base_message_count = len(store.messages(body.conversation_id))
             run = chat_runs.start(
@@ -563,7 +615,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
                     body.message,
                     current_image_prompt=body.current_image_prompt,
                     current_aspect_ratio=body.current_aspect_ratio,
-                    reasoning_effort=body.reasoning_effort,
+                    reasoning_effort=reasoning_effort,
                 ),
             )
         except StorageError as error:
@@ -675,12 +727,17 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
     return app
 
 
-def run() -> None:
+def run(settings: Settings | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        config_path = default_config_path()
-        set_private_permissions(config_path)
-        settings = load_config(config_path)
+        if settings is None:
+            arguments = sys.argv[1:]
+            if len(arguments) > 1 or (arguments and arguments[0] not in CHAT_BACKENDS):
+                raise SystemExit("usage: python -m comfy_studio.app [strata|bonsai]")
+            chat_backend = arguments[0] if arguments else "strata"
+            config_path = default_config_path()
+            set_private_permissions(config_path)
+            settings = load_config(config_path, chat_backend=chat_backend)
         app_config = settings.section("app")
         uvicorn.run(create_app(settings), host=app_config["listen_host"], port=app_config["port"],
                     log_level="info", access_log=False, workers=1,

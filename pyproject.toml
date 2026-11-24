@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "comfy-studio"
 version = "0.1.0"
-description = "A local-first browser studio for ComfyUI image generation with a Strata chat backend"
+description = "A local-first browser studio for ComfyUI image generation with Strata or Bonsai chat backends"
 requires-python = ">=3.12"
 dependencies = [
 	"fastapi>=0.115,<1",

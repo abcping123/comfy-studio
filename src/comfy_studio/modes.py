@@ -43,10 +43,6 @@ class ModeDefinition:
     forbidden_model_markers: tuple[str, ...]
     required_model_keys: tuple[str, ...]
     required_model_prefixes: tuple[tuple[str, str], ...] = ()
-    legacy_workflow_path_key: str | None = None
-    legacy_system_prompt_key: str | None = None
-    legacy_local_storage_key: str | None = None
-    legacy_options_key: str | None = None
 
 
 IMAGE_MODES = (
@@ -54,7 +50,7 @@ IMAGE_MODES = (
         id="text-to-image",
         label="Text to image",
         default_workflow_path="data/comfyui/minimax_h3_image_t2i.json",
-        default_system_prompt_file="data/strata/minimax_h3_image_t2i.txt",
+        default_system_prompt_file="data/prompts/minimax_h3_image_t2i.txt",
         workflow_strategy="minimax-h3-text-to-image",
         resolution_strategy="aspect-ratio",
         max_megapixels=20.0,
@@ -78,16 +74,12 @@ IMAGE_MODES = (
         forbidden_model_markers=("qwen3.5",),
         required_model_keys=("diffusion_model", "text_encoder", "vae"),
         required_model_prefixes=(("text_encoder", "qwen3vl_"),),
-        legacy_workflow_path_key="workflow_api",
-        legacy_system_prompt_key="system_prompt_file",
-        legacy_local_storage_key="megapixels",
-        legacy_options_key="megapixels",
     ),
     ModeDefinition(
         id="edit",
         label="Image edit",
         default_workflow_path="data/comfyui/minimax_h3_image_edit.json",
-        default_system_prompt_file="data/strata/minimax_h3_image_edit.txt",
+        default_system_prompt_file="data/prompts/minimax_h3_image_edit.txt",
         workflow_strategy="minimax-h3-image-edit",
         resolution_strategy="source-image",
         max_megapixels=16.0,
@@ -115,10 +107,6 @@ IMAGE_MODES = (
         forbidden_model_markers=("qwen3.5",),
         required_model_keys=("diffusion_model", "text_encoder", "vae"),
         required_model_prefixes=(("text_encoder", "qwen3vl_"),),
-        legacy_workflow_path_key="workflow_edit_api",
-        legacy_system_prompt_key="edit_system_prompt_file",
-        legacy_local_storage_key="edit_megapixels",
-        legacy_options_key="edit_megapixels",
     ),
 )
 
@@ -220,7 +208,5 @@ def public_mode_options(generation: dict[str, Any]) -> list[dict[str, Any]]:
                 "source_images_label": mode.presentation.source_images_label,
                 "source_images_help": mode.presentation.source_images_help,
             },
-            "legacy_local_storage_key": mode.legacy_local_storage_key,
-            "legacy_options_key": mode.legacy_options_key,
         })
     return options

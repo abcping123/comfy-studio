@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>Comfy Studio</title>
   <link rel="stylesheet" href="/assets/app.css?v=12">
-  <script src="/assets/app.js?v=10" defer></script>
+  <script src="/assets/app.js?v=11" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -15,7 +15,7 @@
       <span>Fieldnotes <span class="wordmark-sub">IMAGE STUDIO</span></span>
     </a>
     <div class="service-strip" aria-label="Model service status">
-      <span class="service-pill"><i id="strata-dot" class="status-dot"></i><span id="strata-status">Strata</span></span>
+      <span class="service-pill"><i id="chat-backend-dot" class="status-dot"></i><span id="chat-backend-status">Chat model</span></span>
       <span class="service-divider" aria-hidden="true"></span>
       <span class="service-pill"><i id="comfy-dot" class="status-dot"></i><span id="comfy-status">MiniMax</span></span>
     </div>
@@ -53,18 +53,13 @@
       <span id="context-badge" class="context-badge visually-hidden" role="status"><i></i> Context ready</span>
       <section id="messages" class="messages" aria-live="polite" aria-label="Conversation messages"></section>
       <form id="chat-form" class="composer">
-        <label class="visually-hidden" for="chat-input">Message Strata</label>
+        <label class="visually-hidden" for="chat-input">Message image assistant</label>
         <textarea id="chat-input" rows="2" maxlength="20000" placeholder="Describe the image you have in mind..."></textarea>
         <div class="composer-foot">
-          <span id="composer-hint" class="composer-hint">Strata will help shape the image prompt</span>
+          <span id="composer-hint" class="composer-hint">Your image assistant will help shape the prompt</span>
           <div class="composer-actions">
             <label class="thinking-effort" for="thinking-effort"><span>Thinking</span>
-              <select id="thinking-effort" aria-label="Thinking effort" title="Thinking effort">
-                <option value="none" selected>None</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-              </select>
+              <select id="thinking-effort" aria-label="Thinking effort" title="Thinking effort"></select>
             </label>
             <button id="send-message" class="send-button" type="submit"><span>Send</span><span aria-hidden="true">&#8593;</span></button>
           </div>
@@ -160,7 +155,7 @@
   <dialog id="delete-dialog" class="confirm-dialog">
     <div class="eyebrow">CONVERSATION</div>
     <h2 id="delete-title">Delete conversation?</h2>
-    <p id="delete-copy">The chat, saved Strata context, and uploaded source images will be removed. Generated PNG files remain in temp/comfyui.</p>
+    <p id="delete-copy">The conversation, saved context, input images, and session images will be removed. Archived PNG copies in output/ will remain.</p>
     <div class="dialog-actions">
       <button id="cancel-delete" class="quiet-button" type="button">Cancel</button>
       <button id="confirm-delete" class="danger-button" type="button">Delete</button>

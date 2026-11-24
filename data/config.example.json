@@ -1,38 +1,60 @@
 {
-  "schema_version": 3,
+  "schema_version": 6,
   "app": {
     "listen_host": "127.0.0.1",
     "port": 8765,
     "access_token": ""
   },
   "paths": {
-    "strata_runtime_config": "temp/strata/runtime.json",
-    "strata_sessions": "temp/strata",
-    "database": "temp/studio.sqlite3",
-    "temp_root": "temp"
+    "runtime_root": "temp/runtime",
+    "session_root": "temp/session",
+    "output_archive": "output"
   },
-  "strata": {
-    "endpoint": "http://127.0.0.1:8080",
-    "python": "/home/pic1wx/repos/Strata/terminal/.venv/bin/python",
-    "server_script": "/home/pic1wx/repos/Strata/terminal/serve/server.py",
-    "source_config_json": "/home/pic1wx/repos/Strata/terminal/strata-q2_0.json",
-    "api_key": "",
-    "model": "qwen3.8-flash-next-q2_0",
-    "idle_unload_s": 600,
-    "request_timeout_s": 900
+  "chat_backends": {
+    "strata": {
+      "endpoint": "http://127.0.0.1:8080",
+      "python": "~/repos/Strata/terminal/.venv/bin/python",
+      "server_script": "~/repos/Strata/terminal/serve/server.py",
+      "source_config_json": "~/repos/Strata/terminal/strata-q2_0.json",
+      "runtime_config": "temp/runtime/strata_runtime.json",
+      "api_key": "",
+      "model": "qwen3.8-flash-next-q2_0",
+      "idle_unload_s": 600,
+      "request_timeout_s": 900
+    },
+    "bonsai": {
+      "endpoint": "http://127.0.0.1:9931",
+      "server_binary": "~/repos/prism-llama.cpp/build/bin/llama-server",
+      "model_file": "~/models/dealignai__Bonsai-2-27B-1bit-CRACK-GGUF/Bonsai-2-27B-PTQ1_0-CRACK.gguf",
+      "mmproj_file": "~/models/prism-ml__Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-mmproj-BF16.gguf",
+      "model": "local-model",
+      "ctx_size": 65536,
+      "n_gpu_layers": "all",
+      "flash_attn": "on",
+      "parallel": 1,
+      "n_predict": 16384,
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.05,
+      "presence_penalty": 0.0,
+      "repeat_penalty": 1.0,
+      "request_timeout_s": 900,
+      "startup_timeout_s": 900
+    }
   },
   "comfyui": {
     "endpoint": "http://127.0.0.1:8188",
-    "python": "/home/pic1wx/repos/ComfyUI/.venv/bin/python",
-    "main_script": "/home/pic1wx/repos/ComfyUI/main.py",
-    "working_directory": "/home/pic1wx/repos/ComfyUI",
+    "python": "~/repos/ComfyUI/.venv/bin/python",
+    "main_script": "~/repos/ComfyUI/main.py",
+    "working_directory": "~/repos/ComfyUI",
     "model_directories": {
-      "diffusion_models": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/diffusion_models",
-      "text_encoders": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/text_encoders",
-      "vae": "/home/pic1wx/models/Comfy-Org__MiniMax-H3-Image/vae"
+      "diffusion_models": "~/models/Comfy-Org__MiniMax-H3-Image/diffusion_models",
+      "text_encoders": "~/models/Comfy-Org__MiniMax-H3-Image/text_encoders",
+      "vae": "~/models/Comfy-Org__MiniMax-H3-Image/vae"
     },
-    "input_directory": "temp/comfyui/input",
-    "output_directory": "/home/pic1wx/repos/ComfyUI/output",
+    "input_directory": "temp/session",
+    "output_directory": "temp/session",
     "gpu_id": 0,
     "request_timeout_s": 1800,
     "poll_interval_s": 1.0
@@ -40,7 +62,7 @@
   "generation_modes": {
     "text-to-image": {
       "workflow": "data/comfyui/minimax_h3_image_t2i.json",
-      "system_prompt_file": "data/strata/minimax_h3_image_t2i.txt",
+      "system_prompt_file": "data/prompts/minimax_h3_image_t2i.txt",
       "models": {
         "diffusion_model": {
           "directory": "diffusion_models",
@@ -58,7 +80,7 @@
     },
     "edit": {
       "workflow": "data/comfyui/minimax_h3_image_edit.json",
-      "system_prompt_file": "data/strata/minimax_h3_image_edit.txt",
+      "system_prompt_file": "data/prompts/minimax_h3_image_edit.txt",
       "models": {
         "diffusion_model": {
           "directory": "diffusion_models",

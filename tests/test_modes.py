@@ -38,6 +38,8 @@ class ImageModeTests(unittest.TestCase):
         self.assertEqual(edit["source_images"]["max_count"], MAX_SOURCE_IMAGES)
         self.assertEqual(edit["resolution"]["strategy"], "source-image")
         self.assertEqual(edit["ui"]["generate_label"], "Edit image")
+        self.assertNotIn("legacy_local_storage_key", edit)
+        self.assertNotIn("legacy_options_key", edit)
 
     def test_source_image_limits_are_owned_by_the_selected_mode(self) -> None:
         text_to_image = get_mode(DEFAULT_MODE_ID)

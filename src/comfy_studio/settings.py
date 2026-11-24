@@ -8,15 +8,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .chat_backends import CHAT_BACKENDS, get_chat_backend
 from .modes import IMAGE_MODES
 from .resolution import aspect_ratio_map
-
-
-_LEGACY_MODEL_DIRECTORY_IDS = {
-    "diffusion_model": "diffusion_models",
-    "text_encoder": "text_encoders",
-    "vae": "vae",
-}
 
 
 class ConfigError(ValueError):
@@ -27,16 +21,27 @@ class ConfigError(ValueError):
 class Settings:
     root: Path
     data: dict[str, Any]
+    chat_backend: str = "strata"
 
     def section(self, name: str) -> dict[str, Any]:
+        if name in CHAT_BACKENDS:
+            return self.backend_config(name)
         value = self.data[name]
         return value
 
+    def backend_config(self, backend_id: str | None = None) -> dict[str, Any]:
+        selected_id = backend_id or self.chat_backend
+        backends = self.data["chat_backends"]
+        return backends[selected_id]
+
     def path(self, dotted_key: str) -> Path:
         value: Any = self.data
-        for part in dotted_key.split("."):
+        parts = dotted_key.split(".")
+        if parts[0] in CHAT_BACKENDS:
+            parts = ["chat_backends", *parts]
+        for part in parts:
             value = value[part]
-        path = Path(value)
+        path = Path(value).expanduser()
         return path if path.is_absolute() else self.root / path
 
 
@@ -95,72 +100,62 @@ def _endpoint(data: dict[str, Any], prefix: str) -> None:
         raise ConfigError(f"{prefix}.endpoint must be loopback")
 
 
-def _migrate_v1_config(data: dict[str, Any]) -> None:
-    paths = _mapping(data, "paths")
-    generation = _mapping(data, "generation")
-    comfy = _mapping(data, "comfyui")
-    legacy_models = _mapping(comfy, "models")
-
-    model_directories: dict[str, Any] = {}
-    for directory_id in dict.fromkeys(_LEGACY_MODEL_DIRECTORY_IDS.values()):
-        legacy_key = f"{directory_id}_dir"
-        if legacy_key in comfy:
-            model_directories[directory_id] = comfy.pop(legacy_key)
-
-    generation_modes: dict[str, Any] = {}
-    for mode in IMAGE_MODES:
-        mode_models: dict[str, dict[str, Any]] = {}
-        for model_key in mode.required_model_keys:
-            if model_key not in legacy_models:
-                continue
-            directory_id = _LEGACY_MODEL_DIRECTORY_IDS.get(model_key)
-            if directory_id is not None:
-                mode_models[model_key] = {
-                    "directory": directory_id,
-                    "file": legacy_models[model_key],
-                }
-
-        workflow_key = mode.legacy_workflow_path_key
-        prompt_key = mode.legacy_system_prompt_key
-        generation_modes[mode.id] = {
-            "workflow": (
-                paths.pop(workflow_key, mode.default_workflow_path)
-                if workflow_key is not None else mode.default_workflow_path
-            ),
-            "system_prompt_file": (
-                generation.pop(prompt_key, mode.default_system_prompt_file)
-                if prompt_key is not None else mode.default_system_prompt_file
-            ),
-            "models": mode_models,
-        }
-
-    comfy.pop("models", None)
-    comfy["model_directories"] = model_directories
-    data["generation_modes"] = generation_modes
-    data["schema_version"] = 3
+def _validate_strata_config(strata: dict[str, Any]) -> None:
+    _endpoint(strata, "chat_backends.strata")
+    for key_name in ("python", "server_script", "source_config_json", "runtime_config", "model"):
+        _text(strata, key_name, "chat_backends.strata")
+    if strata.get("api_key"):
+        _text(strata, "api_key", "chat_backends.strata")
+    idle_unload = strata.get("idle_unload_s")
+    if isinstance(idle_unload, bool) or not isinstance(idle_unload, (int, float)) or idle_unload < 0:
+        raise ConfigError("chat_backends.strata.idle_unload_s must be a non-negative number")
+    timeout = strata.get("request_timeout_s")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ConfigError("chat_backends.strata.request_timeout_s must be a positive number")
 
 
-def _migrate_v2_config(data: dict[str, Any]) -> None:
-    if "generation_modes" in data:
-        raise ConfigError("schema_version 2 must use image_modes")
-    if "image_modes" not in data:
-        raise ConfigError("schema_version 2 requires image_modes")
-    data["generation_modes"] = data.pop("image_modes")
-    data["schema_version"] = 3
+def _validate_bonsai_config(bonsai: dict[str, Any]) -> None:
+    _endpoint(bonsai, "chat_backends.bonsai")
+    for key_name in ("server_binary", "model_file", "mmproj_file", "model"):
+        _text(bonsai, key_name, "chat_backends.bonsai")
+    for key_name in ("ctx_size", "parallel", "n_predict", "top_k"):
+        value = bonsai.get(key_name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ConfigError(f"chat_backends.bonsai.{key_name} must be a positive integer")
+    gpu_layers = _text(bonsai, "n_gpu_layers", "chat_backends.bonsai")
+    if gpu_layers not in {"all", "auto"} and not gpu_layers.isdecimal():
+        raise ConfigError(
+            "chat_backends.bonsai.n_gpu_layers must be 'all', 'auto', or a non-negative integer"
+        )
+    if _text(bonsai, "flash_attn", "chat_backends.bonsai") not in {"on", "off", "auto"}:
+        raise ConfigError("chat_backends.bonsai.flash_attn must be 'on', 'off', or 'auto'")
+    for key_name in ("temperature", "top_p", "min_p", "presence_penalty", "repeat_penalty",
+                     "request_timeout_s", "startup_timeout_s"):
+        value = bonsai.get(key_name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"chat_backends.bonsai.{key_name} must be a number")
+        if key_name in {"request_timeout_s", "startup_timeout_s"} and value <= 0:
+            raise ConfigError(f"chat_backends.bonsai.{key_name} must be positive")
+        if key_name == "temperature" and value < 0:
+            raise ConfigError("chat_backends.bonsai.temperature must be non-negative")
+        if key_name in {"top_p", "min_p"} and not 0 <= value <= 1:
+            raise ConfigError(f"chat_backends.bonsai.{key_name} must be between 0 and 1")
+        if key_name == "repeat_penalty" and value <= 0:
+            raise ConfigError("chat_backends.bonsai.repeat_penalty must be positive")
 
 
-def validate_config(data: Any) -> dict[str, Any]:
+_BACKEND_CONFIG_VALIDATORS = {
+    "strata": _validate_strata_config,
+    "bonsai": _validate_bonsai_config,
+}
+
+
+def validate_config(data: Any, required_backend: str | None = None) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ConfigError("the root of config.json must be a JSON object")
     version = data.get("schema_version")
-    if isinstance(version, bool):
-        raise ConfigError("schema_version must be 1, 2, or 3")
-    if version == 1:
-        _migrate_v1_config(data)
-    elif version == 2:
-        _migrate_v2_config(data)
-    elif version != 3:
-        raise ConfigError("schema_version must be 1, 2, or 3")
+    if isinstance(version, bool) or version != 6:
+        raise ConfigError("schema_version must be 6")
 
     app = _mapping(data, "app")
     app_host = _text(app, "listen_host", "app")
@@ -176,19 +171,24 @@ def validate_config(data: Any) -> dict[str, Any]:
     if not _is_loopback(app_host) and not allow_insecure_lan_http:
         raise ConfigError("LAN HTTP requires app.allow_insecure_lan_http=true")
 
-    strata = _mapping(data, "strata")
-    _endpoint(strata, "strata")
-    _text(strata, "python", "strata")
-    _text(strata, "server_script", "strata")
-    _text(strata, "source_config_json", "strata")
-    _text(strata, "api_key", "strata") if strata.get("api_key") else None
-    _text(strata, "model", "strata")
-    idle_unload = strata.get("idle_unload_s")
-    if isinstance(idle_unload, bool) or not isinstance(idle_unload, (int, float)) or idle_unload < 0:
-        raise ConfigError("strata.idle_unload_s must be a non-negative number")
-    strata_timeout = strata.get("request_timeout_s")
-    if isinstance(strata_timeout, bool) or not isinstance(strata_timeout, (int, float)) or strata_timeout <= 0:
-        raise ConfigError("strata.request_timeout_s must be a positive number")
+    backend_configs = _mapping(data, "chat_backends")
+    unknown_backends = set(backend_configs) - set(CHAT_BACKENDS)
+    if unknown_backends:
+        unknown = ", ".join(sorted(str(backend_id) for backend_id in unknown_backends))
+        raise ConfigError(f"chat_backends contains unregistered backend(s): {unknown}")
+    for backend_id in backend_configs:
+        backend_config = _mapping(backend_configs, backend_id)
+        backend_definition = get_chat_backend(backend_id)
+        validator = _BACKEND_CONFIG_VALIDATORS.get(backend_definition.config_schema)
+        if validator is None:
+            raise ConfigError(f"no configuration validator is registered for {backend_id}")
+        validator(backend_config)
+    required_backends = CHAT_BACKENDS if required_backend is None else (required_backend,)
+    for backend_id in required_backends:
+        if backend_id not in CHAT_BACKENDS:
+            raise ConfigError(f"chat backend must be one of: {', '.join(CHAT_BACKENDS)}")
+        if backend_id not in backend_configs:
+            raise ConfigError(f"chat_backends.{backend_id} is required")
     comfy = _mapping(data, "comfyui")
     _endpoint(comfy, "comfyui")
     for key_name in ("python", "main_script", "working_directory", "output_directory"):
@@ -199,7 +199,6 @@ def validate_config(data: Any) -> dict[str, Any]:
                 or "." in directory_id):
             raise ConfigError("comfyui.model_directories keys must be non-empty and contain no dots")
         _text(model_directories, directory_id, "comfyui.model_directories")
-    comfy.setdefault("input_directory", "temp/comfyui/input")
     _text(comfy, "input_directory", "comfyui")
     gpu_id = comfy.get("gpu_id")
     if isinstance(gpu_id, bool) or not isinstance(gpu_id, int) or gpu_id < 0:
@@ -210,7 +209,7 @@ def validate_config(data: Any) -> dict[str, Any]:
             raise ConfigError(f"comfyui.{key_name} must be a positive number")
 
     paths = _mapping(data, "paths")
-    for key_name in ("strata_runtime_config", "strata_sessions", "database", "temp_root"):
+    for key_name in ("runtime_root", "session_root", "output_archive"):
         _text(paths, key_name, "paths")
 
     generation_modes = _mapping(data, "generation_modes")
@@ -225,8 +224,6 @@ def validate_config(data: Any) -> dict[str, Any]:
     for mode in IMAGE_MODES:
         mode_prefix = f"generation_modes.{mode.id}"
         mode_config = _mapping(generation_modes, mode.id)
-        mode_config.setdefault("workflow", mode.default_workflow_path)
-        mode_config.setdefault("system_prompt_file", mode.default_system_prompt_file)
         _text(mode_config, "workflow", mode_prefix)
         _text(mode_config, "system_prompt_file", mode_prefix)
 
@@ -302,7 +299,9 @@ def validate_config(data: Any) -> dict[str, Any]:
     return data
 
 
-def load_config(path: Path | None = None) -> Settings:
+def load_config(path: Path | None = None, chat_backend: str = "strata") -> Settings:
+    if chat_backend not in CHAT_BACKENDS:
+        raise ConfigError(f"chat backend must be one of: {', '.join(CHAT_BACKENDS)}")
     config_path = (path or default_config_path()).resolve()
     try:
         with config_path.open("r", encoding="utf-8") as file:
@@ -311,5 +310,5 @@ def load_config(path: Path | None = None) -> Settings:
         raise ConfigError(f"cannot read {config_path}: {error}") from error
     except json.JSONDecodeError as error:
         raise ConfigError(f"invalid JSON in {config_path}: {error}") from error
-    validate_config(data)
-    return Settings(root=config_path.parent, data=data)
+    validate_config(data, required_backend=chat_backend)
+    return Settings(root=config_path.parent, data=data, chat_backend=chat_backend)

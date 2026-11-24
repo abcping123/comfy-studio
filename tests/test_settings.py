@@ -5,8 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from comfy_studio.modes import IMAGE_MODES
-from comfy_studio.settings import ConfigError, load_config, validate_config
+from comfy_studio.settings import ConfigError, Settings, load_config, validate_config
 
 
 def sample_config() -> dict:
@@ -30,27 +29,49 @@ def sample_config() -> dict:
         },
     }
     return {
-        "schema_version": 3,
+        "schema_version": 6,
         "app": {
             "listen_host": "127.0.0.1",
             "port": 8765,
             "access_token": "test-token",
         },
         "paths": {
-            "strata_runtime_config": "temp/strata/runtime.json",
-            "strata_sessions": "temp/strata",
-            "database": "temp/studio.sqlite3",
-            "temp_root": "temp",
+            "runtime_root": "temp/runtime",
+            "session_root": "temp/session",
+            "output_archive": "output",
         },
-        "strata": {
-            "endpoint": "http://127.0.0.1:8080",
-            "python": "/srv/strata/.venv/bin/python",
-            "server_script": "/srv/strata/serve/server.py",
-            "source_config_json": "/srv/strata/config.json",
-            "api_key": "test-api-key",
-            "model": "qwen-q2",
-            "idle_unload_s": 600,
-            "request_timeout_s": 900,
+        "chat_backends": {
+            "strata": {
+                "endpoint": "http://127.0.0.1:8080",
+                "python": "/srv/strata/.venv/bin/python",
+                "server_script": "/srv/strata/serve/server.py",
+                "source_config_json": "/srv/strata/config.json",
+                "runtime_config": "temp/runtime/strata_runtime.json",
+                "api_key": "test-api-key",
+                "model": "qwen-q2",
+                "idle_unload_s": 600,
+                "request_timeout_s": 900,
+            },
+            "bonsai": {
+                "endpoint": "http://127.0.0.1:9931",
+                "server_binary": "/srv/prism-llama.cpp/bin/llama-server",
+                "model_file": "/models/Bonsai-2-27B-PTQ1_0-CRACK.gguf",
+                "mmproj_file": "/models/Ternary-Bonsai-2-27B-mmproj-BF16.gguf",
+                "model": "local-model",
+                "ctx_size": 65536,
+                "n_gpu_layers": "all",
+                "flash_attn": "on",
+                "parallel": 1,
+                "n_predict": 16384,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0.05,
+                "presence_penalty": 0.0,
+                "repeat_penalty": 1.0,
+                "request_timeout_s": 900,
+                "startup_timeout_s": 900,
+            },
         },
         "comfyui": {
             "endpoint": "http://127.0.0.1:8188",
@@ -58,8 +79,8 @@ def sample_config() -> dict:
             "main_script": "/srv/comfy/main.py",
             "working_directory": "/srv/comfy",
             "model_directories": model_directories,
-            "input_directory": "temp/comfyui/input",
-            "output_directory": "temp/comfyui",
+            "input_directory": "temp/session",
+            "output_directory": "temp/session",
             "gpu_id": 0,
             "request_timeout_s": 1800,
             "poll_interval_s": 1.0,
@@ -67,12 +88,12 @@ def sample_config() -> dict:
         "generation_modes": {
             "text-to-image": {
                 "workflow": "data/comfyui/minimax_h3_image_t2i.json",
-                "system_prompt_file": "data/strata/minimax_h3_image_t2i.txt",
+                "system_prompt_file": "data/prompts/minimax_h3_image_t2i.txt",
                 "models": minimax_models,
             },
             "edit": {
                 "workflow": "data/comfyui/minimax_h3_image_edit.json",
-                "system_prompt_file": "data/strata/minimax_h3_image_edit.txt",
+                "system_prompt_file": "data/prompts/minimax_h3_image_edit.txt",
                 "models": {
                     key: dict(value) for key, value in minimax_models.items()
                 },
@@ -102,34 +123,17 @@ def sample_config() -> dict:
     }
 
 
-def legacy_sample_config() -> dict:
-    data = sample_config()
-    generation_modes = data.pop("generation_modes")
-    data["schema_version"] = 1
-    comfy = data["comfyui"]
-    model_directories = comfy.pop("model_directories")
-    comfy.update({
-        "diffusion_models_dir": model_directories["diffusion_models"],
-        "text_encoders_dir": model_directories["text_encoders"],
-        "vae_dir": model_directories["vae"],
-        "models": {
-            key: model["file"]
-            for key, model in generation_modes["text-to-image"]["models"].items()
-        },
-    })
-    for mode in IMAGE_MODES:
-        if mode.legacy_workflow_path_key is not None:
-            data["paths"][mode.legacy_workflow_path_key] = generation_modes[mode.id]["workflow"]
-        if mode.legacy_system_prompt_key is not None:
-            data["generation"][mode.legacy_system_prompt_key] = (
-                generation_modes[mode.id]["system_prompt_file"]
-            )
-    return data
-
-
 class SettingsTests(unittest.TestCase):
     def test_valid_local_config(self) -> None:
-        self.assertEqual(validate_config(sample_config())["schema_version"], 3)
+        self.assertEqual(validate_config(sample_config())["schema_version"], 6)
+
+    def test_only_schema_six_is_supported(self) -> None:
+        for version in range(1, 6):
+            data = sample_config()
+            data["schema_version"] = version
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ConfigError, "schema_version must be 6"):
+                    validate_config(data)
 
     def test_default_megapixels_must_be_between_half_and_twenty(self) -> None:
         data = sample_config()
@@ -150,53 +154,57 @@ class SettingsTests(unittest.TestCase):
             config_path = Path(directory) / "config.json"
             config_path.write_text(json.dumps(sample_config()), encoding="utf-8")
             settings = load_config(config_path)
-            self.assertEqual(settings.path("paths.database"),
-                             Path(directory) / "temp/studio.sqlite3")
+            self.assertEqual(settings.path("paths.session_root"),
+                             Path(directory) / "temp/session")
 
-    def test_version_one_config_migrates_to_per_mode_configuration(self) -> None:
-        data = legacy_sample_config()
-        del data["paths"]["workflow_edit_api"]
-        del data["comfyui"]["input_directory"]
-        del data["generation"]["edit_system_prompt_file"]
-
-        validated = validate_config(data)
-
-        self.assertEqual(validated["schema_version"], 3)
-        self.assertEqual(validated["generation_modes"]["edit"]["workflow"],
-                         "data/comfyui/minimax_h3_image_edit.json")
-        self.assertEqual(validated["comfyui"]["input_directory"], "temp/comfyui/input")
-        self.assertEqual(validated["generation_modes"]["edit"]["system_prompt_file"],
-                         "data/strata/minimax_h3_image_edit.txt")
-        self.assertEqual(
-            validated["generation_modes"]["edit"]["models"]["text_encoder"]["file"],
-            "qwen3vl_minimax.safetensors",
-        )
-
-    def test_version_two_config_migrates_to_generation_modes_name(self) -> None:
+    def test_home_relative_paths_resolve_from_user_home(self) -> None:
         data = sample_config()
-        data["schema_version"] = 2
-        data["image_modes"] = data.pop("generation_modes")
+        data["paths"]["session_root"] = "~/studio-sessions"
+        settings = Settings(Path.cwd(), validate_config(data))
 
-        validated = validate_config(data)
+        self.assertEqual(settings.path("paths.session_root"), Path.home() / "studio-sessions")
 
-        self.assertEqual(validated["schema_version"], 3)
-        self.assertIn("generation_modes", validated)
-        self.assertNotIn("image_modes", validated)
-
-    def test_mode_workflows_and_prompts_default_from_the_registry(self) -> None:
+    def test_unregistered_backend_config_is_rejected(self) -> None:
         data = sample_config()
-        for mode in IMAGE_MODES:
-            data["generation_modes"][mode.id].pop("workflow")
-            data["generation_modes"][mode.id].pop("system_prompt_file")
+        data["chat_backends"]["future-model"] = {}
 
-        validated = validate_config(data)
+        with self.assertRaisesRegex(ConfigError, "unregistered backend"):
+            validate_config(data)
 
-        for mode in IMAGE_MODES:
-            with self.subTest(mode=mode.id):
-                self.assertEqual(validated["generation_modes"][mode.id]["workflow"],
-                                 mode.default_workflow_path)
-                self.assertEqual(validated["generation_modes"][mode.id]["system_prompt_file"],
-                                 mode.default_system_prompt_file)
+    def test_selected_backend_can_load_without_unselected_backend_config(self) -> None:
+        data = sample_config()
+        data["chat_backends"].pop("bonsai")
+
+        self.assertEqual(validate_config(data, required_backend="strata")["schema_version"], 6)
+        with self.assertRaisesRegex(ConfigError, "chat_backends.bonsai is required"):
+            validate_config(data, required_backend="bonsai")
+
+    def test_load_config_records_the_selected_chat_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps(sample_config()), encoding="utf-8")
+
+            settings = load_config(config_path, chat_backend="bonsai")
+
+        self.assertEqual(settings.chat_backend, "bonsai")
+
+    def test_mode_workflow_and_prompt_paths_are_required(self) -> None:
+        for key in ("workflow", "system_prompt_file"):
+            data = sample_config()
+            data["generation_modes"]["text-to-image"].pop(key)
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(
+                    ConfigError,
+                    f"generation_modes.text-to-image.{key} must be a non-empty string",
+                ):
+                    validate_config(data)
+
+    def test_comfy_input_directory_is_required(self) -> None:
+        data = sample_config()
+        data["comfyui"].pop("input_directory")
+
+        with self.assertRaisesRegex(ConfigError, "comfyui.input_directory"):
+            validate_config(data)
 
     def test_each_mode_can_select_its_own_models(self) -> None:
         data = sample_config()
@@ -257,7 +265,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_invalid_url_port_is_rejected(self) -> None:
         data = sample_config()
-        data["strata"]["endpoint"] = "http://127.0.0.1:99999"
+        data["chat_backends"]["strata"]["endpoint"] = "http://127.0.0.1:99999"
         with self.assertRaisesRegex(ConfigError, "invalid"):
             validate_config(data)
 

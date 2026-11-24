@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from comfy_studio.clients import BackendError
 from comfy_studio.orchestrator import CoordinationError, Orchestrator
@@ -40,7 +41,7 @@ class FakeStrata:
         self.calls.append(("save", filename))
         if self.fail_save:
             raise BackendError("Strata", "save failed", status=507)
-        path = self.settings.path("paths.strata_sessions") / filename
+        path = self.settings.path("paths.runtime_root") / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"native-context")
         return {"n_saved": 20, "n_written": 14}
@@ -73,6 +74,12 @@ class FakeStrata:
         yield {"content": "", "reasoning_content": self.reasoning_content[:12]}
         yield {"content": content[:10], "reasoning_content": self.reasoning_content[12:]}
         yield {"content": content[10:], "reasoning_content": ""}
+
+
+class FakeBonsai(FakeStrata):
+    def status(self) -> dict:
+        self.calls.append(("status", None))
+        return {"loaded": True}
 
 
 class FakeProgressSocket:
@@ -156,12 +163,15 @@ class OrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
         data = copy.deepcopy(load_config(project_root() / "data" / "config.example.json").data)
         self.temp = tempfile.TemporaryDirectory()
-        data["paths"]["strata_sessions"] = str(Path(self.temp.name) / "sessions")
-        data["paths"]["temp_root"] = str(Path(self.temp.name) / "temp")
-        data["comfyui"]["output_directory"] = str(Path(self.temp.name) / "ComfyUI" / "output")
-        data["comfyui"]["input_directory"] = str(Path(self.temp.name) / "temp" / "comfyui" / "input")
+        session_root = Path(self.temp.name) / "temp" / "session"
+        runtime_root = Path(self.temp.name) / "temp" / "runtime"
+        data["paths"]["session_root"] = str(session_root)
+        data["paths"]["runtime_root"] = str(runtime_root)
+        data["paths"]["output_archive"] = str(Path(self.temp.name) / "output")
+        data["comfyui"]["output_directory"] = str(session_root)
+        data["comfyui"]["input_directory"] = str(session_root)
         self.settings = Settings(project_root(), data)
-        self.store = ConversationStore(Path(self.temp.name) / "studio.sqlite3")
+        self.store = ConversationStore(session_root, runtime_root)
         self.strata = FakeStrata(self.settings)
         self.comfy = FakeComfy()
         self.comfy.input_directory = self.settings.path("comfyui.input_directory")
@@ -175,6 +185,105 @@ class OrchestratorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def _bonsai_orchestrator(self) -> tuple[Orchestrator, FakeBonsai]:
+        data = copy.deepcopy(self.settings.data)
+        settings = Settings(self.settings.root, data, chat_backend="bonsai")
+        bonsai = FakeBonsai(settings)
+        orchestrator = Orchestrator(
+            settings,
+            self.store,
+            bonsai,
+            self.comfy,
+            clock=lambda: self.fake_time[0],
+            sleeper=lambda seconds: self.fake_time.__setitem__(
+                0, self.fake_time[0] + seconds,
+            ),
+        )
+        return orchestrator, bonsai
+
+    def test_bonsai_chat_restarts_after_generation_and_replays_transcript(self) -> None:
+        orchestrator, bonsai = self._bonsai_orchestrator()
+        conversation_id = self.store.create_conversation()["id"]
+        with (
+            patch(
+                "comfy_studio.orchestrator.service_running",
+                side_effect=[True, True, False, False],
+            ),
+            patch("comfy_studio.orchestrator.stop_service", return_value=True) as stop_service,
+            patch(
+                "comfy_studio.orchestrator.start_service_tracked",
+                return_value=(202, Path("bonsai.log"), True),
+            ) as start_service,
+        ):
+            first = orchestrator.chat(conversation_id, "Design a red teapot")
+            self.assertTrue(first.context_saved)
+            self.assertTrue(self.store.context_is_current(conversation_id, "bonsai"))
+
+            orchestrator.generate(conversation_id, "A red teapot on white", 42)
+            self.assertEqual(self.comfy.calls.count("submit"), 1)
+
+            second = orchestrator.chat(conversation_id, "Make the light warmer")
+
+        self.assertTrue(second.context_saved)
+        stop_service.assert_called_once()
+        start_service.assert_called_once()
+        chat_calls = [messages for name, messages in bonsai.calls if name == "chat"]
+        self.assertEqual(len(chat_calls), 2)
+        self.assertEqual(chat_calls[1][-2]["role"], "assistant")
+        self.assertIn("Design a red teapot", chat_calls[1][-3]["content"])
+        self.assertIn("Make the light warmer", chat_calls[1][-1]["content"])
+        self.assertFalse(any(name in {"save", "restore", "load", "unload"} for name, _ in bonsai.calls))
+
+    def test_bonsai_edit_messages_encode_source_images_as_data_urls(self) -> None:
+        orchestrator, _ = self._bonsai_orchestrator()
+        conversation_id = self.store.create_conversation()["id"]
+        self.store.set_conversation_mode(conversation_id, "edit")
+        source_directory = orchestrator._conversation_input_directory(conversation_id)
+        source_directory.mkdir(parents=True, exist_ok=True)
+        image_bytes = b"small-image-fixture"
+        (source_directory / "source.png").write_bytes(image_bytes)
+        self.store.create_source_image(
+            "a" * 32,
+            conversation_id,
+            "source.png",
+            conversation_id,
+            "image/png",
+            len(image_bytes),
+            1,
+            1,
+        )
+
+        _, _, messages, _ = orchestrator._build_chat_messages(
+            conversation_id,
+            "Keep the composition",
+            None,
+            None,
+        )
+
+        image_part = messages[-1]["content"][1]
+        self.assertEqual(
+            image_part["image_url"]["url"],
+            "data:image/png;base64,c21hbGwtaW1hZ2UtZml4dHVyZQ==",
+        )
+
+    def test_strata_does_not_restore_a_stale_native_session_after_bonsai_chat(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        self.store.append_exchange(conversation_id, "Question", "Answer")
+        self.store.mark_context_saved(
+            conversation_id,
+            None,
+            128,
+            backend="bonsai",
+        )
+        session_path = self.orchestrator._session_path(conversation_id)
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        session_path.write_bytes(b"stale Strata session")
+
+        self.orchestrator._restore_session(conversation_id)
+
+        self.assertNotIn(("restore", self.store.session_filename(conversation_id)), self.strata.calls)
+        self.assertFalse(self.store.context_is_current(conversation_id, "strata"))
+
     def test_chat_generation_and_chat_restore_native_context(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
         first = self.orchestrator.chat(conversation_id, "Design a red teapot")
@@ -182,9 +291,14 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(first.image_prompt, "A red teapot in a soft studio light.")
         self.assertEqual(first.aspect_ratio, "1:1 (Square)")
         self.assertTrue(self.store.context_is_current(conversation_id))
+        self.assertTrue(self.orchestrator._session_path(conversation_id).is_file())
+        staging_path = (
+            self.settings.path("paths.runtime_root") / self.store.session_filename(conversation_id)
+        )
+        self.assertFalse(staging_path.exists())
 
         result = self.orchestrator.generate(conversation_id, "A red teapot on white", 42)
-        self.assertEqual(result.image["filename"], f"{result.generation_id}.png")
+        self.assertEqual(result.image["filename"], f"generation_{result.generation_id}.png")
         self.assertFalse(self.strata.loaded)
 
         second = self.orchestrator.chat(conversation_id, "Make the light warmer")
@@ -194,6 +308,7 @@ class OrchestratorTests(unittest.TestCase):
         final_chat_index = len(calls) - 2
         self.assertLess(restore_index, final_chat_index)
         self.assertEqual(self.strata.calls[restore_index][1], self.store.session_filename(conversation_id))
+        self.assertFalse(staging_path.exists())
         replayed_messages = self.strata.calls[final_chat_index][1]
         self.assertEqual(replayed_messages[0]["role"], "system")
         self.assertEqual(replayed_messages[-1]["role"], "user")
@@ -253,7 +368,7 @@ class OrchestratorTests(unittest.TestCase):
 
         result = self.orchestrator.generate(conversation_id, "A red teapot", 42)
 
-        self.assertEqual(result.image["filename"], f"{result.generation_id}.png")
+        self.assertEqual(result.image["filename"], f"generation_{result.generation_id}.png")
         self.assertEqual(self.comfy.calls.count("free"), 1)
         self.assertIsNone(result.cleanup_warning)
 
@@ -273,7 +388,7 @@ class OrchestratorTests(unittest.TestCase):
         result = self.orchestrator.generate(conversation_id, "A red teapot", 42,
                                             progress_callback=events.append)
 
-        self.assertEqual(result.image["filename"], f"{result.generation_id}.png")
+        self.assertEqual(result.image["filename"], f"generation_{result.generation_id}.png")
         self.assertIn("submit", self.comfy.calls)
         self.assertTrue(any(event.get("message", "").startswith("Live progress unavailable")
                             for event in events))
@@ -289,13 +404,20 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(result.image["subfolder"], conversation_id)
         studio_image = (
-            self.settings.path("paths.temp_root") / "comfyui" / conversation_id
-            / f"{result.generation_id}.png"
+            self.settings.path("paths.session_root") / conversation_id
+            / f"generation_{result.generation_id}.png"
         )
         comfy_image = self.settings.path("comfyui.output_directory") / conversation_id / "generated.png"
         self.assertTrue(studio_image.is_file())
         self.assertEqual(studio_image.read_bytes(), b"generated image")
         self.assertFalse(comfy_image.exists())
+        archives = list(self.settings.path("paths.output_archive").glob("*.png"))
+        self.assertEqual(len(archives), 1)
+        self.assertRegex(
+            archives[0].name,
+            r"^\d{4}-\d{2}-\d{2}_\d{2}h\d{2}_\d{2}\.png$",
+        )
+        self.assertEqual(archives[0].read_bytes(), b"generated image")
 
     def test_edit_generation_uploads_ordered_sources_and_persists_provenance(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
@@ -387,22 +509,24 @@ class OrchestratorTests(unittest.TestCase):
 
         self.assertNotIn("chat", [name for name, _ in self.strata.calls])
 
-    def test_deleting_conversation_removes_sources_but_keeps_generated_output_folder(self) -> None:
+    def test_deleting_conversation_removes_session_but_keeps_output_archive_copy(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
+        result = self.orchestrator.generate(conversation_id, "A red teapot", 42)
         source = self.orchestrator.upload_source_image(
             conversation_id, b"base-image", "image/png", ".png", 100, 100,
         )
         source_path = self.settings.path("comfyui.input_directory") / conversation_id / source["filename"]
-        output_folder = self.settings.path("paths.temp_root") / "comfyui" / conversation_id
-        output_folder.mkdir(parents=True, exist_ok=True)
-        output_image = output_folder / "image_00001_.png"
-        output_image.write_bytes(b"generated")
+        session_directory = self.settings.path("paths.session_root") / conversation_id
+        output_image = session_directory / f"generation_{result.generation_id}.png"
+        archive_image = next(self.settings.path("paths.output_archive").glob("*.png"))
 
         warning = self.orchestrator.delete_conversation(conversation_id)
 
         self.assertIsNone(warning)
         self.assertFalse(source_path.exists())
-        self.assertEqual(output_image.read_bytes(), b"generated")
+        self.assertFalse(session_directory.exists())
+        self.assertFalse(output_image.exists())
+        self.assertEqual(archive_image.read_bytes(), b"generated image")
 
     def test_chat_includes_current_editor_prompt_and_aspect_ratio(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
@@ -518,7 +642,7 @@ class OrchestratorTests(unittest.TestCase):
     def test_deleting_loaded_conversation_unloads_and_removes_native_session(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
         self.orchestrator.chat(conversation_id, "Create a native session")
-        session_path = self.settings.path("paths.strata_sessions") / self.store.session_filename(conversation_id)
+        session_path = self.orchestrator._session_path(conversation_id)
         self.assertTrue(session_path.is_file())
         self.orchestrator.delete_conversation(conversation_id)
         self.assertFalse(self.strata.loaded)
@@ -534,15 +658,6 @@ class OrchestratorTests(unittest.TestCase):
             self.orchestrator.generate(conversation_id, "A red teapot", 1)
         self.assertTrue(self.strata.loaded)
         self.assertNotIn("submit", self.comfy.calls)
-
-    def test_legacy_null_free_vram_threshold_does_not_block_chat(self) -> None:
-        self.settings.data["strata"]["min_free_vram_mib"] = None
-        conversation_id = self.store.create_conversation()["id"]
-        result = self.orchestrator.chat(conversation_id, "Continue without the Studio threshold")
-        self.assertTrue(result.context_saved)
-        self.assertTrue(self.strata.loaded)
-        self.assertIn("free", self.comfy.calls)
-
 
 if __name__ == "__main__":
     unittest.main()

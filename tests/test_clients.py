@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import ProxyHandler
 
-from comfy_studio.clients import BackendError, ComfyUIClient, StrataClient
+from comfy_studio.clients import BackendError, BonsaiClient, ComfyUIClient, StrataClient
 from comfy_studio.settings import load_config, project_root
 from test_settings import sample_config
 
@@ -93,7 +93,7 @@ class ClientTests(unittest.TestCase):
 
     def setUp(self) -> None:
         data = sample_config()
-        data["strata"]["endpoint"] = self.endpoint
+        data["chat_backends"]["strata"]["endpoint"] = self.endpoint
         data["comfyui"]["endpoint"] = self.endpoint
         self.config_path = project_root() / "tests" / "client-test-config.json"
         self.config_path.write_text(json.dumps(data), encoding="utf-8")
@@ -130,6 +130,28 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(headers.get("Accept"), "text/event-stream")
         self.assertTrue(body["stream"])
         self.assertEqual(body["reasoning_effort"], "high")
+
+    def test_bonsai_uses_openai_chat_endpoints_without_authentication(self) -> None:
+        self.settings.data["chat_backends"]["bonsai"]["endpoint"] = self.endpoint
+        client = BonsaiClient(self.settings)
+
+        self.assertTrue(client.status()["loaded"])
+        client.chat([{"role": "user", "content": "Hello"}], max_tokens=64,
+                    reasoning_effort="xhigh")
+        list(client.chat_stream([{"role": "user", "content": "Hello"}], max_tokens=32,
+                                reasoning_effort="medium"))
+
+        methods_and_paths = [(method, path) for method, path, _, _ in FakeHandler.calls]
+        self.assertEqual(methods_and_paths, [
+            ("GET", "/health"),
+            ("POST", "/v1/chat/completions"),
+            ("POST", "/v1/chat/completions"),
+        ])
+        for _, _, headers, _ in FakeHandler.calls:
+            self.assertNotIn("Authorization", headers)
+        self.assertEqual(FakeHandler.calls[1][3]["model"], "local-model")
+        self.assertEqual(FakeHandler.calls[1][3]["reasoning_effort"], "xhigh")
+        self.assertEqual(FakeHandler.calls[2][3]["reasoning_effort"], "medium")
 
     def test_comfy_queue_submit_and_free_contract(self) -> None:
         client = ComfyUIClient(self.settings)

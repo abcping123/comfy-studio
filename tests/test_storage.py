@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 import stat
 import subprocess
 import tempfile
 import unittest
-from contextlib import closing
 from pathlib import Path
 
 from comfy_studio.storage import ConversationStore, StorageError
@@ -30,7 +28,8 @@ def _assert_private_file(test_case: unittest.TestCase, path: Path) -> None:
 class StorageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.store = ConversationStore(Path(self.temp.name) / "temp" / "studio.sqlite3")
+        root = Path(self.temp.name) / "temp"
+        self.store = ConversationStore(root / "session", root / "runtime")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -39,7 +38,9 @@ class StorageTests(unittest.TestCase):
         conversation = self.store.create_conversation()
         conversation_id = conversation["id"]
         self.store.append_exchange(conversation_id, "A red teapot", "I prepared the image prompt.")
-        self.store.mark_context_saved(conversation_id, 128, 4096)
+        self.store.mark_context_saved(
+            conversation_id, 128, 4096, backend="strata",
+        )
         self.store.set_active_conversation_id(conversation_id)
         self.store.set_selected_conversation_id(conversation_id)
         self.assertEqual(self.store.messages(conversation_id), [
@@ -49,19 +50,40 @@ class StorageTests(unittest.TestCase):
         saved = self.store.get_conversation(conversation_id)
         self.assertEqual(saved["context_tokens"], 128)
         self.assertEqual(saved["context_bytes"], 4096)
+        self.assertEqual(saved["context_backend"], "strata")
         self.assertTrue(self.store.context_is_current(conversation_id))
         self.assertEqual(self.store.active_conversation_id(), conversation_id)
         self.assertEqual(self.store.selected_conversation_id(), conversation_id)
-        self.assertEqual(self.store.session_filename(conversation_id), f"{conversation_id}.bin")
-        _assert_private_file(self, self.store.path)
+        self.assertEqual(
+            self.store.session_filename(conversation_id),
+            f"strata_context_{conversation_id}.bin",
+        )
+        _assert_private_file(
+            self, self.store.session_root / conversation_id / "session.sqlite3",
+        )
+        _assert_private_file(self, self.store.runtime_root / "state.json")
 
     def test_context_snapshot_is_stale_after_new_messages(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
         self.store.append_exchange(conversation_id, "First question", "First answer")
-        self.store.mark_context_saved(conversation_id, 12, 256)
+        self.store.mark_context_saved(
+            conversation_id, 12, 256, backend="strata",
+        )
         self.assertTrue(self.store.context_is_current(conversation_id))
         self.store.append_exchange(conversation_id, "Second question", "Second answer")
         self.assertFalse(self.store.context_is_current(conversation_id))
+
+    def test_context_snapshot_is_scoped_to_its_backend(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        self.store.append_exchange(conversation_id, "Question", "Answer")
+        self.store.mark_context_saved(conversation_id, None, 128, backend="bonsai")
+
+        self.assertTrue(self.store.context_is_current(conversation_id, "bonsai"))
+        self.assertFalse(self.store.context_is_current(conversation_id, "strata"))
+        self.assertEqual(
+            self.store.get_conversation(conversation_id)["context_backend"],
+            "bonsai",
+        )
 
     def test_raw_transcript_and_normalized_display_text_are_separate(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
@@ -75,27 +97,16 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.store.display_messages(conversation_id)[-1]["content"], display)
         self.assertEqual(self.store.display_messages(conversation_id)[-1]["reasoning_content"], reasoning)
 
-    def test_existing_database_migrates_reasoning_column(self) -> None:
-        path = Path(self.temp.name) / "legacy.sqlite3"
-        with closing(sqlite3.connect(path)) as connection:
-            connection.executescript("""
-                CREATE TABLE conversations (
-                    id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    context_saved_at TEXT, context_tokens INTEGER, context_bytes INTEGER, context_message_count INTEGER,
-                    image_prompt TEXT NOT NULL DEFAULT '', aspect_ratio TEXT NOT NULL DEFAULT '1:1 (Square)'
-                );
-                CREATE TABLE messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                    role TEXT NOT NULL, content TEXT NOT NULL, display_content TEXT, created_at TEXT NOT NULL
-                );
-            """)
+    def test_each_conversation_has_its_own_database_outside_runtime(self) -> None:
+        first_id = self.store.create_conversation()["id"]
+        second_id = self.store.create_conversation()["id"]
 
-        migrated = ConversationStore(path)
-        with closing(sqlite3.connect(path)) as connection:
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
-        self.assertIn("reasoning_content", columns)
-        _assert_private_file(self, migrated.path)
+        first_database = self.store.session_root / first_id / "session.sqlite3"
+        second_database = self.store.session_root / second_id / "session.sqlite3"
+        self.assertNotEqual(first_database, second_database)
+        self.assertTrue(first_database.is_file())
+        self.assertTrue(second_database.is_file())
+        self.assertEqual(list(self.store.runtime_root.glob("*.sqlite3")), [])
 
     def test_generation_lifecycle_is_persisted(self) -> None:
         conversation_id = self.store.create_conversation()["id"]

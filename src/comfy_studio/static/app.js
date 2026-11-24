@@ -36,9 +36,7 @@
     const modeSettings = saved.mode_settings;
     const modeValue = modeSettings && typeof modeSettings === "object" && !Array.isArray(modeSettings)
       ? modeSettings[mode.id]?.megapixels : undefined;
-    if (modeValue !== undefined) return Number(modeValue);
-    return mode.legacy_local_storage_key
-      ? Number(saved[mode.legacy_local_storage_key]) : Number.NaN;
+    return modeValue === undefined ? Number.NaN : Number(modeValue);
   }
 
   function sourceImageRole(mode, index) {
@@ -95,7 +93,7 @@
       if (!data || data === "[DONE]") return;
       const event = JSON.parse(data);
       if (event.type === "done") outcome = event;
-      else if (event.type === "error") streamError = new Error(event.message || "Strata stream failed.");
+      else if (event.type === "error") streamError = new Error(event.message || "Image assistant stream failed.");
       onEvent(event);
     };
     try {
@@ -118,7 +116,7 @@
       reader.releaseLock();
     }
     if (streamError) throw streamError;
-    if (!outcome) throw new Error("Strata stream ended before the answer was complete.");
+    if (!outcome) throw new Error("Image assistant stream ended before the answer was complete.");
     return outcome;
   }
 
@@ -364,7 +362,7 @@
       details.className = "reasoning-details";
       details.open = streaming;
       summary = document.createElement("summary");
-      summary.textContent = streaming ? "Strata 正在思考…" : "思考过程";
+      summary.textContent = streaming ? "助手正在思考…" : "思考过程";
       reasoning = document.createElement("div");
       reasoning.className = "reasoning-content";
       reasoning.textContent = reasoningContent;
@@ -627,12 +625,18 @@
     select.disabled = false;
   }
 
+  function isSupportedReasoningEffort(value) {
+    return state.options?.reasoning_efforts?.some((item) => item.value === value) ?? false;
+  }
+
   async function loadOptions() {
     const options = await api("/api/options");
     state.options = options;
     renderModeButtons();
     fillSelect(byId("image-aspect-ratio"), options.aspect_ratios,
       (item) => item.label, (item) => item.label, options.default_aspect_ratio);
+    fillSelect(byId("thinking-effort"), options.reasoning_efforts,
+      (item) => item.value, (item) => item.label, options.default_reasoning_effort);
     const megapixels = byId("image-megapixels");
     megapixels.value = Number(getMode(options.default_mode).resolution.megapixels.default).toFixed(2);
     const selectedMode = options.modes.some((mode) => mode.id === state.imageMode)
@@ -678,7 +682,7 @@
         },
       };
     }
-    if (["none", "low", "medium", "high"].includes(thinkingEffort)) {
+    if (isSupportedReasoningEffort(thinkingEffort)) {
       saved.thinking_effort = thinkingEffort;
     }
 
@@ -702,9 +706,8 @@
     byId("image-megapixels").value = Number.isFinite(megapixels) &&
       megapixels >= megapixelOptions.min && megapixels <= megapixelOptions.max
       ? megapixels.toFixed(2) : Number(megapixelOptions.default).toFixed(2);
-    if (["none", "low", "medium", "high"].includes(saved.thinking_effort)) {
-      byId("thinking-effort").value = saved.thinking_effort;
-    }
+    byId("thinking-effort").value = isSupportedReasoningEffort(saved.thinking_effort)
+      ? saved.thinking_effort : state.options.default_reasoning_effort;
   }
 
   function clearConversationSettings(conversationId) {
@@ -726,9 +729,13 @@
 
   async function refreshState() {
     const data = await api("/api/state");
-    const strata = data.services.strata;
+    const backendId = data.chat_backend || "strata";
+    const backendName = data.chat_backend_label || backendId;
+    const backend = data.services[backendId];
     const comfy = data.services.comfyui;
-    setServiceStatus("strata", strata, strata?.available ? (strata.loaded ? "Strata loaded" : "Strata idle") : "Strata offline");
+    setServiceStatus("chat-backend", backend, backend?.available
+      ? (backend.loaded ? `${backendName} loaded` : `${backendName} idle`)
+      : `${backendName} offline`);
     const comfyText = !comfy?.available ? "MiniMax offline" :
       (comfy.queue_running || comfy.queue_pending ? "MiniMax busy" : "MiniMax ready");
     setServiceStatus("comfy", comfy, comfyText);
@@ -878,7 +885,7 @@
         else await createConversation();
       }
       toast(deletion.cleanup_warning ||
-        "Conversation and uploaded source images deleted. Generated PNG files remain in temp/comfyui.");
+        "Conversation session deleted. Archived PNG copies in output/ remain.");
     } catch (error) {
       toast(error.message, true);
     } finally {
@@ -1278,7 +1285,7 @@
       const dot = document.createElement("i");
       const label = document.createElement("span");
       dot.setAttribute("aria-hidden", "true");
-      label.textContent = data.conversation.context_saved_at ? "Native context saved" : "New context";
+      label.textContent = data.conversation.context_saved_at ? "Conversation context saved" : "New context";
       badge.append(dot, label);
       if (data.messages.length) {
         messages.replaceChildren();
@@ -1312,6 +1319,7 @@
         byId("image-megapixels").value = Number(
           getMode(state.options.default_mode).resolution.megapixels.default,
         ).toFixed(2);
+        byId("thinking-effort").value = state.options.default_reasoning_effort;
         saveConversationSettings();
       }
       updatePromptCount();
@@ -1378,7 +1386,7 @@
         assistant.details.remove();
       }
     }
-    const contextLabel = result.context_saved ? "Native context saved" : "Context save needs attention";
+    const contextLabel = result.context_saved ? "Conversation context saved" : "Context save needs attention";
     if (result.warning) toast(result.warning, true);
     if (result.image_prompt) imagePrompt.value = result.image_prompt;
     if (state.options?.aspect_ratios.some((item) => item.label === result.aspect_ratio)) {

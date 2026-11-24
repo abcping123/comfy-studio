@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from comfy_studio.initialize import (
     InitializationError,
@@ -41,14 +42,45 @@ def _assert_private_file(test_case: unittest.TestCase, path: Path) -> None:
 
 
 class InitializeTests(unittest.TestCase):
-    def test_initialization_imports_secret_without_printing_and_sets_private_mode(self) -> None:
+    def test_bonsai_initialization_does_not_require_a_strata_repository_or_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            comfyui_repo = root / "ComfyUI"
+            python = _venv_python(comfyui_repo)
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_text("python", encoding="utf-8")
+            if os.name != "nt":
+                python.chmod(0o755)
+            (comfyui_repo / "main.py").write_text("", encoding="utf-8")
+            template = sample_config()
+            template["chat_backends"]["strata"]["api_key"] = ""
+            template_path = root / "config.example.json"
+            template_path.write_text(json.dumps(template), encoding="utf-8")
+            destination = root / "config.json"
+
+            initialize_config(
+                template_path,
+                destination,
+                comfyui_repo_path=comfyui_repo,
+                chat_backend="bonsai",
+            )
+
+            active = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(active["comfyui"]["python"], str(python.resolve()))
+            self.assertEqual(active["comfyui"]["working_directory"], str(comfyui_repo.resolve()))
+            self.assertEqual(active["chat_backends"]["strata"]["api_key"], "")
+            self.assertTrue(active["app"]["access_token"])
+
+    def test_initialization_imports_secret_without_printing_and_sets_private_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"HOME": directory, "USERPROFILE": directory}
+        ):
             root = Path(directory)
             source_path = root / "strata.json"
             source_path.write_text(json.dumps({"api_key": "private-test-key"}), encoding="utf-8")
             template = sample_config()
-            template["strata"]["source_config_json"] = str(source_path)
-            template["strata"]["api_key"] = ""
+            template["chat_backends"]["strata"]["source_config_json"] = "~/strata.json"
+            template["chat_backends"]["strata"]["api_key"] = ""
             template_path = root / "config.example.json"
             template_path.write_text(json.dumps(template), encoding="utf-8")
             destination = root / "config.json"
@@ -56,7 +88,7 @@ class InitializeTests(unittest.TestCase):
             initialize_config(template_path, destination)
 
             active = json.loads(destination.read_text(encoding="utf-8"))
-            self.assertEqual(active["strata"]["api_key"], "private-test-key")
+            self.assertEqual(active["chat_backends"]["strata"]["api_key"], "private-test-key")
             self.assertTrue(active["app"]["access_token"])
             _assert_private_file(self, destination)
 
@@ -66,8 +98,8 @@ class InitializeTests(unittest.TestCase):
             source_path = root / "strata.json"
             source_path.write_text(json.dumps({"args": []}), encoding="utf-8")
             template = sample_config()
-            template["strata"]["source_config_json"] = str(source_path)
-            template["strata"]["api_key"] = ""
+            template["chat_backends"]["strata"]["source_config_json"] = str(source_path)
+            template["chat_backends"]["strata"]["api_key"] = ""
             template_path = root / "config.example.json"
             template_path.write_text(json.dumps(template), encoding="utf-8")
             destination = root / "config.json"
@@ -75,7 +107,7 @@ class InitializeTests(unittest.TestCase):
             initialize_config(template_path, destination)
 
             active = json.loads(destination.read_text(encoding="utf-8"))
-            self.assertGreaterEqual(len(active["strata"]["api_key"]), 32)
+            self.assertGreaterEqual(len(active["chat_backends"]["strata"]["api_key"]), 32)
             self.assertTrue(active["app"]["access_token"])
             _assert_private_file(self, destination)
 
@@ -85,7 +117,7 @@ class InitializeTests(unittest.TestCase):
             source = root / "strata.json"
             source.write_text(json.dumps({"api_key": "private-test-key"}), encoding="utf-8")
             template = sample_config()
-            template["strata"]["source_config_json"] = str(source)
+            template["chat_backends"]["strata"]["source_config_json"] = str(source)
             template_path = root / "config.example.json"
             template_path.write_text(json.dumps(template), encoding="utf-8")
             destination = root / "config.json"
@@ -113,8 +145,8 @@ class InitializeTests(unittest.TestCase):
             )
 
             template = sample_config()
-            template["strata"]["source_config_json"] = "/old/path/strata-q2_0.json"
-            template["strata"]["api_key"] = ""
+            template["chat_backends"]["strata"]["source_config_json"] = "/old/path/strata-q2_0.json"
+            template["chat_backends"]["strata"]["api_key"] = ""
             template_path = root / "config.example.json"
             template_path.write_text(json.dumps(template), encoding="utf-8")
             destination = root / "config.json"
@@ -122,18 +154,17 @@ class InitializeTests(unittest.TestCase):
             initialize_config(template_path, destination, strata_repo, comfyui_repo)
 
             active = json.loads(destination.read_text(encoding="utf-8"))
-            self.assertEqual(active["strata"]["python"], str(_venv_python(strata_repo)))
-            self.assertEqual(active["strata"]["server_script"], str(strata_server.resolve()))
-            self.assertEqual(active["strata"]["source_config_json"],
+            self.assertEqual(active["chat_backends"]["strata"]["python"], str(_venv_python(strata_repo)))
+            self.assertEqual(active["chat_backends"]["strata"]["server_script"], str(strata_server.resolve()))
+            self.assertEqual(active["chat_backends"]["strata"]["source_config_json"],
                              str((strata_repo / "strata-q2_0.json").resolve()))
-            self.assertEqual(active["strata"]["api_key"], "private-test-key")
+            self.assertEqual(active["chat_backends"]["strata"]["api_key"], "private-test-key")
             self.assertEqual(active["comfyui"]["python"], str(_venv_python(comfyui_repo)))
             self.assertEqual(active["comfyui"]["main_script"],
                              str((comfyui_repo / "main.py").resolve()))
             self.assertEqual(active["comfyui"]["working_directory"], str(comfyui_repo.resolve()))
-            self.assertEqual(active["comfyui"]["output_directory"],
-                             str((comfyui_repo / "output").resolve()))
-            self.assertEqual(active["comfyui"]["input_directory"], "temp/comfyui/input")
+            self.assertEqual(active["comfyui"]["output_directory"], "temp/session")
+            self.assertEqual(active["comfyui"]["input_directory"], "temp/session")
 
     def test_initialization_derives_paths_from_terminal_layout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -155,8 +186,8 @@ class InitializeTests(unittest.TestCase):
             (comfyui_repo / "main.py").write_text("", encoding="utf-8")
 
             template = sample_config()
-            template["strata"]["source_config_json"] = "/old/path/strata-q2_0.json"
-            template["strata"]["api_key"] = ""
+            template["chat_backends"]["strata"]["source_config_json"] = "/old/path/strata-q2_0.json"
+            template["chat_backends"]["strata"]["api_key"] = ""
             template_path = root / "config.example.json"
             template_path.write_text(json.dumps(template), encoding="utf-8")
             destination = root / "config.json"
@@ -164,9 +195,9 @@ class InitializeTests(unittest.TestCase):
             initialize_config(template_path, destination, strata_repo, comfyui_repo)
 
             active = json.loads(destination.read_text(encoding="utf-8"))
-            self.assertEqual(active["strata"]["python"], str(_venv_python(terminal_root)))
-            self.assertEqual(active["strata"]["server_script"], str(strata_server.resolve()))
-            self.assertEqual(active["strata"]["source_config_json"],
+            self.assertEqual(active["chat_backends"]["strata"]["python"], str(_venv_python(terminal_root)))
+            self.assertEqual(active["chat_backends"]["strata"]["server_script"], str(strata_server.resolve()))
+            self.assertEqual(active["chat_backends"]["strata"]["source_config_json"],
                              str((terminal_root / "strata-q2_0.json").resolve()))
 
     def test_initialization_uses_repository_venv_for_terminal_layout(self) -> None:
@@ -188,8 +219,8 @@ class InitializeTests(unittest.TestCase):
             (comfyui_repo / "main.py").write_text("", encoding="utf-8")
 
             template = sample_config()
-            template["strata"]["source_config_json"] = "/old/path/strata-q2_0.json"
-            template["strata"]["api_key"] = ""
+            template["chat_backends"]["strata"]["source_config_json"] = "/old/path/strata-q2_0.json"
+            template["chat_backends"]["strata"]["api_key"] = ""
             template_path = root / "config.example.json"
             template_path.write_text(json.dumps(template), encoding="utf-8")
             destination = root / "config.json"
@@ -197,15 +228,15 @@ class InitializeTests(unittest.TestCase):
             initialize_config(template_path, destination, strata_repo, comfyui_repo)
 
             active = json.loads(destination.read_text(encoding="utf-8"))
-            self.assertEqual(active["strata"]["python"], str(_venv_python(strata_repo)))
-            self.assertEqual(active["strata"]["server_script"], str(strata_server.resolve()))
-            self.assertEqual(active["strata"]["source_config_json"], str(source_path.resolve()))
+            self.assertEqual(active["chat_backends"]["strata"]["python"], str(_venv_python(strata_repo)))
+            self.assertEqual(active["chat_backends"]["strata"]["server_script"], str(strata_server.resolve()))
+            self.assertEqual(active["chat_backends"]["strata"]["source_config_json"], str(source_path.resolve()))
 
     def test_listener_config_keeps_model_backends_private_and_preserves_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
             data = sample_config()
-            data["strata"]["api_key"] = "private-api-key"
+            data["chat_backends"]["strata"]["api_key"] = "private-api-key"
             data["app"]["access_token"] = "private-app-token"
             config_path.write_text(json.dumps(data), encoding="utf-8")
 
@@ -219,17 +250,17 @@ class InitializeTests(unittest.TestCase):
             for key in ("tls_cert_file", "tls_key_file", "http_redirect_host",
                         "http_redirect_port", "public_host"):
                 self.assertNotIn(key, updated["app"])
-            self.assertEqual(updated["strata"]["endpoint"], "http://127.0.0.1:8081")
+            self.assertEqual(updated["chat_backends"]["strata"]["endpoint"], "http://127.0.0.1:8081")
             self.assertEqual(updated["comfyui"]["endpoint"], "http://127.0.0.1:8188")
             self.assertEqual(updated["app"]["access_token"], "private-app-token")
-            self.assertEqual(updated["strata"]["api_key"], "private-api-key")
+            self.assertEqual(updated["chat_backends"]["strata"]["api_key"], "private-api-key")
             _assert_private_file(self, config_path)
 
     def test_listener_config_omits_removed_transport_options(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
             data = sample_config()
-            data["strata"]["api_key"] = "private-api-key"
+            data["chat_backends"]["strata"]["api_key"] = "private-api-key"
             data["app"]["access_token"] = "private-app-token"
             config_path.write_text(json.dumps(data), encoding="utf-8")
 
@@ -241,13 +272,38 @@ class InitializeTests(unittest.TestCase):
             for key in ("tls_cert_file", "tls_key_file", "http_redirect_host",
                         "http_redirect_port", "public_host"):
                 self.assertNotIn(key, updated["app"])
-            self.assertEqual(updated["strata"]["endpoint"], "http://127.0.0.1:8080")
+            self.assertEqual(updated["chat_backends"]["strata"]["endpoint"], "http://127.0.0.1:8080")
             self.assertEqual(updated["comfyui"]["endpoint"], "http://127.0.0.1:8188")
-            self.assertEqual(updated["strata"]["api_key"], "private-api-key")
+            self.assertEqual(updated["chat_backends"]["strata"]["api_key"], "private-api-key")
             self.assertEqual(updated["app"]["access_token"], "private-app-token")
 
-    def test_runtime_files_are_derived_from_json_and_exclude_qwen35(self) -> None:
+    def test_listener_config_can_target_a_registered_backend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps(sample_config()), encoding="utf-8")
+
+            configure_listeners(
+                "127.0.0.1",
+                8765,
+                9940,
+                config_path=config_path,
+                chat_backend="bonsai",
+            )
+
+            updated = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                updated["chat_backends"]["bonsai"]["endpoint"],
+                "http://127.0.0.1:9940",
+            )
+            self.assertEqual(
+                updated["chat_backends"]["strata"]["endpoint"],
+                "http://127.0.0.1:8080",
+            )
+
+    def test_runtime_files_are_derived_from_json_and_exclude_qwen35(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"HOME": directory, "USERPROFILE": directory}
+        ):
             root = Path(directory)
             source_path = root / "strata-source.json"
             source_path.write_text(json.dumps({
@@ -263,22 +319,25 @@ class InitializeTests(unittest.TestCase):
                 "env": {"SHOULD_NOT_COPY": "value"},
             }), encoding="utf-8")
             data = sample_config()
-            data["strata"]["source_config_json"] = str(source_path)
-            data["strata"]["api_key"] = "private-key"
+            data["chat_backends"]["strata"]["source_config_json"] = "~/strata-source.json"
+            data["chat_backends"]["strata"]["api_key"] = "private-key"
             config_path = root / "config.json"
             config_path.write_text(json.dumps(data), encoding="utf-8")
             settings = load_config(config_path)
 
             runtime_path = prepare_runtime_files(settings)
 
-            self.assertEqual(runtime_path, root / "temp" / "strata" / "runtime.json")
-            self.assertTrue((root / "temp" / "comfyui").is_dir())
+            self.assertEqual(runtime_path, root / "temp" / "runtime" / "strata_runtime.json")
+            self.assertTrue((root / "temp" / "runtime").is_dir())
+            self.assertTrue((root / "temp" / "session").is_dir())
+            self.assertTrue((root / "output").is_dir())
             self.assertTrue(settings.path("comfyui.output_directory").is_dir())
             self.assertTrue(settings.path("comfyui.input_directory").is_dir())
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
             self.assertEqual(runtime["api_key"], "private-key")
             self.assertEqual(runtime["host"], "127.0.0.1")
             self.assertEqual(runtime["port"], 8080)
+            self.assertEqual(runtime["slot_save_path"], str(root / "temp" / "runtime"))
             self.assertEqual(runtime["min_free_vram_mib"], 4096)
             self.assertEqual(runtime["vision"], {
                 "exe": "strata-vision",
@@ -300,8 +359,8 @@ class InitializeTests(unittest.TestCase):
             source_path = root / "strata-source.json"
             source_path.write_text(json.dumps({"args": ["--batch", "2"]}), encoding="utf-8")
             data = sample_config()
-            data["strata"]["source_config_json"] = str(source_path)
-            data["strata"]["api_key"] = "private-key"
+            data["chat_backends"]["strata"]["source_config_json"] = str(source_path)
+            data["chat_backends"]["strata"]["api_key"] = "private-key"
             config_path = root / "config.json"
             config_path.write_text(json.dumps(data), encoding="utf-8")
             settings = load_config(config_path)

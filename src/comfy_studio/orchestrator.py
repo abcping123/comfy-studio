@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import threading
 import time
 import json
@@ -9,10 +10,12 @@ import shutil
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from .clients import BackendError, ComfyUIClient, StrataClient
+from .chat_backends import CHAT_BACKENDS, get_chat_backend
+from .clients import BackendError, ChatBackend, ComfyUIClient, NativeSessionBackend
 from .modes import (
     DEFAULT_MODE_ID,
     MAX_SOURCE_IMAGES,
@@ -21,7 +24,9 @@ from .modes import (
     source_image_role,
     validate_source_image_count,
 )
+from .permissions import set_private_permissions
 from .settings import Settings
+from .services import ServiceError, service_running, start_service_tracked, stop_service
 from .resolution import normalize_aspect_ratio
 from .storage import ConversationStore, StorageError
 from .workflow import WorkflowError, build_workflow
@@ -51,12 +56,12 @@ class GenerationOutcome:
 
 class Orchestrator:
     def __init__(self, settings: Settings, store: ConversationStore,
-                 strata: StrataClient, comfy: ComfyUIClient,
+                 chat_backend: ChatBackend, comfy: ComfyUIClient,
                  clock: Callable[[], float] = time.monotonic,
                  sleeper: Callable[[float], None] = time.sleep):
         self.settings = settings
         self.store = store
-        self.strata = strata
+        self.chat_backend = chat_backend
         self.comfy = comfy
         self._clock = clock
         self._sleep = sleeper
@@ -89,44 +94,49 @@ class Orchestrator:
         self.comfy.free_memory()
         self._require_idle_queue()
 
-    def _strata_loaded(self) -> bool:
-        response = self.strata.status()
+    def _chat_backend_loaded(self) -> bool:
+        backend = get_chat_backend(self.settings.chat_backend)
+        if backend.loaded_state == "process":
+            return service_running(self.settings, self.settings.chat_backend)
+        if backend.loaded_state == "stateless":
+            return False
+        response = self.chat_backend.status()
         loaded = response.get("loaded")
         if not isinstance(loaded, bool):
-            raise CoordinationError("Strata load state is unknown; refusing GPU handoff")
+            raise CoordinationError("chat backend load state is unknown; refusing GPU handoff")
         return loaded
 
     def _session_path(self, conversation_id: str) -> Path:
-        filename = self.store.session_filename(conversation_id)
-        directory = self.settings.path("paths.strata_sessions")
-        return directory / filename
+        directory = self.store.session_directory(conversation_id)
+        if directory is None:
+            raise CoordinationError("session directory is missing")
+        return directory / "chat_context.bin"
 
-    def _conversation_input_directory(self, conversation_id: str) -> Path:
-        root = self.settings.path("comfyui.input_directory").resolve()
-        directory = root / self.store.validate_id(conversation_id)
-        if directory.is_symlink() or (directory.exists() and directory.resolve().parent != root):
-            raise CoordinationError("refusing to access a source image directory outside ComfyUI input")
+    def _native_session_backend(self) -> NativeSessionBackend:
+        if not isinstance(self.chat_backend, NativeSessionBackend):
+            raise CoordinationError(
+                f"the selected {get_chat_backend(self.settings.chat_backend).label} client "
+                "does not support native sessions"
+            )
+        return self.chat_backend
+
+    def _session_asset_directory(self, conversation_id: str) -> Path:
+        conversation_id = self.store.validate_id(conversation_id)
+        root = self.settings.path("paths.session_root").resolve(strict=True)
+        input_root = self.settings.path("comfyui.input_directory").resolve(strict=True)
+        output_root = self.settings.path("comfyui.output_directory").resolve(strict=True)
+        if input_root != root or output_root != root:
+            raise CoordinationError("ComfyUI input and output directories must be the session root")
+        directory = self.store.session_directory(conversation_id)
+        if directory is None or directory.parent != root:
+            raise CoordinationError("session directory is missing or outside Studio storage")
         return directory
 
-    def _studio_output_directory(self, conversation_id: str, create: bool = False) -> Path:
-        conversation_id = self.store.validate_id(conversation_id)
-        root = self.settings.path("paths.temp_root") / "comfyui"
-        if root.is_symlink():
-            raise CoordinationError("refusing to access a symbolic-link generated image directory")
-        if create:
-            root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if not root.is_dir():
-            raise CoordinationError("Studio generated image directory does not exist")
-        root = root.resolve(strict=True)
-        directory = root / conversation_id
-        if directory.is_symlink():
-            raise CoordinationError("refusing to access a symbolic-link generated image session")
-        if create:
-            directory.mkdir(mode=0o700, exist_ok=True)
-            os.chmod(directory, 0o700)
-        if not directory.is_dir() or directory.resolve(strict=True).parent != root:
-            raise CoordinationError("refusing to access a generated image directory outside Studio storage")
-        return directory.resolve(strict=True)
+    def _conversation_input_directory(self, conversation_id: str) -> Path:
+        return self._session_asset_directory(conversation_id)
+
+    def _studio_output_directory(self, conversation_id: str) -> Path:
+        return self._session_asset_directory(conversation_id)
 
     def _relocate_generated_image(self, conversation_id: str, generation_id: str,
                                   image: dict[str, str]) -> dict[str, str]:
@@ -138,13 +148,7 @@ class Orchestrator:
                 or Path(filename).suffix.lower() != ".png"):
             raise CoordinationError("ComfyUI returned an unsafe generated image path")
 
-        output_root = self.settings.path("comfyui.output_directory").resolve(strict=True)
-        source_directory = output_root / conversation_id
-        if source_directory.is_symlink() or not source_directory.is_dir():
-            raise CoordinationError("ComfyUI generated image directory is missing or unsafe")
-        source_directory = source_directory.resolve(strict=True)
-        if source_directory.parent != output_root:
-            raise CoordinationError("ComfyUI generated image directory is outside its output directory")
+        source_directory = self._session_asset_directory(conversation_id)
         source_path = source_directory / filename
         if source_path.is_symlink():
             raise CoordinationError("refusing to move a symbolic-link generated image")
@@ -152,17 +156,55 @@ class Orchestrator:
         if source_path.parent != source_directory or not source_path.is_file():
             raise CoordinationError("ComfyUI generated image is missing or unsafe")
 
-        destination_directory = self._studio_output_directory(conversation_id, create=True)
-        if destination_directory == source_directory:
-            raise CoordinationError("ComfyUI and Studio generated image directories must be different")
-        destination_path = destination_directory / f"{generation_id}.png"
+        destination_path = source_directory / f"generation_{generation_id}.png"
         if destination_path.exists() or destination_path.is_symlink():
             raise CoordinationError("generated image destination already exists")
         try:
-            shutil.move(str(source_path), str(destination_path))
+            os.link(source_path, destination_path)
+            source_path.unlink()
         except OSError as error:
-            raise CoordinationError(f"could not move the generated image into Studio storage: {error}") from error
+            raise CoordinationError(f"could not store the generated image in its session: {error}") from error
+        self._archive_generated_image(destination_path)
         return {"filename": destination_path.name, "subfolder": conversation_id, "type": "output"}
+
+    def _archive_generated_image(self, image_path: Path) -> Path:
+        output_root = self.settings.path("paths.output_archive")
+        if output_root.is_symlink():
+            raise CoordinationError("refusing to write to a symbolic-link output archive")
+        try:
+            output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            output_root = output_root.resolve(strict=True)
+            if image_path.is_symlink() or not image_path.is_file():
+                raise CoordinationError("generated image is missing or unsafe")
+            while True:
+                timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%Hh%M_%S")
+                destination = output_root / f"{timestamp}.png"
+                if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+                    raise CoordinationError("output archive target is not a regular file")
+                if destination.exists():
+                    time.sleep(max(0.01, 1.0 - (time.time() % 1.0)))
+                    continue
+                temporary = output_root / f".{destination.name}.{secrets.token_hex(8)}.tmp"
+                try:
+                    with image_path.open("rb") as source, temporary.open("xb") as target:
+                        shutil.copyfileobj(source, target)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    set_private_permissions(temporary)
+                    os.link(temporary, destination)
+                    temporary.unlink()
+                    set_private_permissions(destination)
+                    return destination
+                except FileExistsError:
+                    temporary.unlink(missing_ok=True)
+                    time.sleep(max(0.01, 1.0 - (time.time() % 1.0)))
+                except OSError as error:
+                    temporary.unlink(missing_ok=True)
+                    raise CoordinationError(f"could not archive generated image: {error}") from error
+        except CoordinationError:
+            raise
+        except OSError as error:
+            raise CoordinationError(f"could not archive generated image: {error}") from error
 
     def generated_image_path(self, generation: dict[str, Any]) -> Path:
         conversation_id = self.store.validate_id(generation.get("conversation_id", ""))
@@ -291,77 +333,199 @@ class Orchestrator:
         conversation_id = self.store.validate_id(conversation_id)
         if self.store.get_conversation(conversation_id) is None:
             raise StorageError("conversation does not exist")
-        source_directory = self._conversation_input_directory(conversation_id)
         self._enter()
         try:
             if self.store.active_conversation_id() == conversation_id:
-                if self._strata_loaded():
-                    self.strata.unload(wait_s=300)
-                    if self._strata_loaded():
-                        raise CoordinationError("Strata did not unload; the conversation was not deleted")
+                backend = get_chat_backend(self.settings.chat_backend)
+                if backend.context_strategy == "native-session" and self._chat_backend_loaded():
+                    self._native_session_backend().unload(wait_s=300)
+                    if self._chat_backend_loaded():
+                        raise CoordinationError(
+                            f"{backend.label} did not unload; the conversation was not deleted"
+                        )
                 self.store.set_active_conversation_id(None)
-            session_file = self._session_path(conversation_id)
             try:
-                session_file.unlink(missing_ok=True)
-            except OSError as error:
-                raise CoordinationError(f"could not remove the saved Strata session; conversation kept: {error}") from error
-            if not self.store.delete_conversation(conversation_id):
+                deleted = self.store.delete_conversation(conversation_id)
+            except StorageError as error:
+                raise CoordinationError(
+                    f"could not remove the conversation session: {error}"
+                ) from error
+            if not deleted:
                 raise StorageError("conversation does not exist")
-            if source_directory.exists():
-                try:
-                    shutil.rmtree(source_directory)
-                except OSError as error:
-                    return f"Conversation deleted, but uploaded source images could not be fully removed: {error}"
             return None
         finally:
             self._leave()
 
     def _save_session(self, conversation_id: str) -> None:
-        response = self.strata.save_session(self.store.session_filename(conversation_id))
-        token_count = response.get("n_saved")
-        byte_count = response.get("n_written")
-        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
-               for value in (token_count, byte_count)):
-            raise CoordinationError("Strata did not confirm the session save")
-        self.store.mark_context_saved(conversation_id, token_count, byte_count)
+        backend = get_chat_backend(self.settings.chat_backend)
+        filename = self.store.session_filename(conversation_id)
+        staging_path = self.settings.path("paths.runtime_root") / filename
+        if staging_path.is_symlink() or staging_path.exists():
+            raise CoordinationError("a native session staging file already exists")
+        try:
+            response = self._native_session_backend().save_session(filename)
+            token_count = response.get("n_saved")
+            byte_count = response.get("n_written")
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                   for value in (token_count, byte_count)):
+                raise CoordinationError(f"{backend.label} did not confirm the session save")
+            if staging_path.is_symlink() or not staging_path.is_file():
+                raise CoordinationError(f"{backend.label} did not write the native session file")
+            session_path = self._session_path(conversation_id)
+            if session_path.is_symlink():
+                raise CoordinationError("refusing to replace a symbolic-link native session")
+            try:
+                os.replace(staging_path, session_path)
+            except OSError as error:
+                raise CoordinationError(
+                    f"could not move the native session into its session directory: {error}"
+                ) from error
+            self.store.mark_context_saved(
+                conversation_id, token_count, byte_count, backend=backend.id
+            )
+        finally:
+            try:
+                staging_path.unlink(missing_ok=True)
+            except OSError as error:
+                raise CoordinationError(f"could not clean up native session staging file: {error}") from error
 
     def _restore_session(self, conversation_id: str) -> None:
         conversation = self.store.get_conversation(conversation_id)
         if conversation is None:
             raise CoordinationError("conversation does not exist")
+        if (conversation.get("context_saved_at")
+                and conversation.get("context_backend") != self.settings.chat_backend):
+            return
         if not conversation.get("context_saved_at"):
             if self.store.messages(conversation_id):
-                raise CoordinationError("conversation has messages but no native Strata session file")
+                raise CoordinationError("conversation has messages but no native session file")
             return
-        if not self.store.context_is_current(conversation_id):
-            raise CoordinationError("saved Strata context does not match the latest transcript")
-        if not self._session_path(conversation_id).is_file():
-            raise CoordinationError("saved Strata session file is missing")
-        response = self.strata.restore_session(self.store.session_filename(conversation_id))
-        restored = response.get("n_restored")
-        if isinstance(restored, bool) or not isinstance(restored, int) or restored <= 0:
-            raise CoordinationError("Strata did not confirm the session restore")
+        if not self.store.context_is_current(conversation_id, self.settings.chat_backend):
+            raise CoordinationError("saved native context does not match the latest transcript")
+        session_path = self._session_path(conversation_id)
+        if session_path.is_symlink() or not session_path.is_file():
+            raise CoordinationError("saved native session file is missing")
+        backend = get_chat_backend(self.settings.chat_backend)
+        filename = self.store.session_filename(conversation_id)
+        staging_path = self.settings.path("paths.runtime_root") / filename
+        if staging_path.is_symlink() or staging_path.exists():
+            raise CoordinationError("a native session staging file already exists")
+        try:
+            with session_path.open("rb") as source, staging_path.open("xb") as target:
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fsync(target.fileno())
+            set_private_permissions(staging_path)
+            response = self._native_session_backend().restore_session(filename)
+            restored = response.get("n_restored")
+            if isinstance(restored, bool) or not isinstance(restored, int) or restored <= 0:
+                raise CoordinationError(f"{backend.label} did not confirm the session restore")
+        except OSError as error:
+            raise CoordinationError(f"could not stage the native session for restore: {error}") from error
+        finally:
+            try:
+                staging_path.unlink(missing_ok=True)
+            except OSError as error:
+                raise CoordinationError(f"could not clean up native session staging file: {error}") from error
 
-    def _prepare_strata(self, conversation_id: str) -> None:
+    def _save_context(self, conversation_id: str) -> None:
+        backend = get_chat_backend(self.settings.chat_backend)
+        if backend.context_strategy == "native-session":
+            self._save_session(conversation_id)
+            return
+        transcript = json.dumps(
+            self.store.messages(conversation_id),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.store.mark_context_saved(
+            conversation_id,
+            None,
+            len(transcript),
+            backend=backend.id,
+        )
+
+    def _wait_for_managed_backend(self, log_path: Path) -> None:
+        backend = get_chat_backend(self.settings.chat_backend)
+        if backend.startup_timeout_key is None:
+            raise CoordinationError(f"{backend.label} has no configured service startup timeout")
+        timeout = self.settings.backend_config()[backend.startup_timeout_key]
+        deadline = self._clock() + timeout
+        while True:
+            try:
+                status = self.chat_backend.status()
+                if status.get("loaded") is True:
+                    return
+                last_error = "health endpoint did not report a ready model"
+            except BackendError as error:
+                last_error = str(error)
+            if not service_running(self.settings, backend.id):
+                raise CoordinationError(
+                    f"{backend.label} exited before becoming ready ({last_error}); inspect {log_path}"
+                )
+            if self._clock() >= deadline:
+                raise CoordinationError(
+                    f"{backend.label} did not become ready within {timeout:g} seconds "
+                    f"({last_error}); inspect {log_path}"
+                )
+            self._sleep(min(0.5, max(0.0, deadline - self._clock())))
+
+    def _prepare_on_demand_backend(self) -> None:
+        backend = get_chat_backend(self.settings.chat_backend)
+        if not service_running(self.settings, backend.id):
+            self._release_comfy()
+            try:
+                pid, log_path, _ = start_service_tracked(self.settings, backend.id)
+            except (ServiceError, OSError) as error:
+                raise CoordinationError(f"could not start {backend.label}: {error}") from error
+            if pid is None:
+                raise CoordinationError(f"{backend.label} has no identifiable process to supervise")
+        else:
+            log_path = self.settings.path("paths.runtime_root") / f"service_{backend.id}.log"
+        self._wait_for_managed_backend(log_path)
+
+    def _stop_backend_service(self) -> None:
+        backend = get_chat_backend(self.settings.chat_backend)
+        try:
+            stopped = stop_service(self.settings, backend.id, wait_s=30.0)
+        except (ServiceError, OSError) as error:
+            raise CoordinationError(
+                f"could not stop {backend.label} before ComfyUI generation: {error}"
+            ) from error
+        if stopped is None or service_running(self.settings, backend.id):
+            raise CoordinationError(
+                f"{backend.label} is still running; image generation was not started"
+            )
+
+    def _prepare_chat_backend(self, conversation_id: str) -> None:
         self._require_idle_queue()
-        loaded = self._strata_loaded()
+        backend = get_chat_backend(self.settings.chat_backend)
+        if backend.chat_preparation == "on-demand-service":
+            self._prepare_on_demand_backend()
+            self.store.set_active_conversation_id(conversation_id)
+            return
+        if backend.chat_preparation == "stateless":
+            self.store.set_active_conversation_id(conversation_id)
+            return
+
+        loaded = self._chat_backend_loaded()
         active_id = self.store.active_conversation_id()
         if loaded and active_id is None:
-            raise CoordinationError("Strata is loaded but its active conversation is unknown")
+            raise CoordinationError(f"{backend.label} is loaded but its active conversation is unknown")
         if loaded and active_id == conversation_id:
             return
         if loaded and active_id != conversation_id:
             if active_id is not None:
                 self._save_session(active_id)
-            self.strata.unload(wait_s=300)
-            if self._strata_loaded():
-                raise CoordinationError("Strata did not unload; refusing to replace its context")
+            self._native_session_backend().unload(wait_s=300)
+            if self._chat_backend_loaded():
+                raise CoordinationError(f"{backend.label} did not unload; refusing to replace its context")
             loaded = False
         if not loaded:
             self._release_comfy()
-            self.strata.load()
-            if not self._strata_loaded():
-                raise CoordinationError("Strata load did not complete")
+            self._native_session_backend().load()
+            if not self._chat_backend_loaded():
+                raise CoordinationError(f"{backend.label} load did not complete")
             self._restore_session(conversation_id)
             self.store.set_active_conversation_id(conversation_id)
 
@@ -371,18 +535,18 @@ class Orchestrator:
             message = response["choices"][0]["message"]
             content = message["content"]
         except (KeyError, IndexError, TypeError) as error:
-            raise CoordinationError("Strata returned no assistant message") from error
+            raise CoordinationError("chat backend returned no assistant message") from error
         if isinstance(content, str):
             answer = content
         elif isinstance(content, list):
             answer = "".join(part.get("text", "") for part in content if isinstance(part, dict))
         else:
-            raise CoordinationError("Strata returned an unsupported message content type")
+            raise CoordinationError("chat backend returned an unsupported message content type")
         if not answer.strip():
-            raise CoordinationError("Strata returned an empty assistant message")
+            raise CoordinationError("chat backend returned an empty assistant message")
         reasoning = message.get("reasoning_content") or ""
         if not isinstance(reasoning, str):
-            raise CoordinationError("Strata returned unsupported reasoning content")
+            raise CoordinationError("chat backend returned unsupported reasoning content")
         return answer, reasoning
 
     @classmethod
@@ -391,13 +555,13 @@ class Orchestrator:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as error:
-            raise CoordinationError("Strata response was not the configured JSON object") from error
+            raise CoordinationError("chat backend response was not the configured JSON object") from error
         if not isinstance(parsed, dict) or set(parsed) != {"reply", "image_prompt", "aspect_ratio"}:
-            raise CoordinationError("Strata response must contain only reply, image_prompt, and aspect_ratio")
+            raise CoordinationError("chat backend response must contain only reply, image_prompt, and aspect_ratio")
         reply, image_prompt, aspect_ratio = parsed["reply"], parsed["image_prompt"], parsed["aspect_ratio"]
         if (not isinstance(reply, str) or not reply.strip() or not isinstance(image_prompt, str)
                 or not isinstance(aspect_ratio, str)):
-            raise CoordinationError("Strata reply, image_prompt, and aspect_ratio must be strings")
+            raise CoordinationError("chat backend reply, image_prompt, and aspect_ratio must be strings")
         return reply.strip(), image_prompt.strip(), aspect_ratio.strip(), raw, reasoning
 
     def _build_chat_messages(self, conversation_id: str, user_text: str,
@@ -460,6 +624,11 @@ class Orchestrator:
         )
         message_content: str | list[dict[str, Any]] = current_user_message
         if mode.send_source_images_to_chat and source_images:
+            backend = get_chat_backend(self.settings.chat_backend)
+            if backend.image_transport == "none":
+                raise CoordinationError(
+                    f"{backend.label} does not accept source images for chat"
+                )
             image_labels = [
                 f"<Picture {index + 1}> ({source_image_role(mode, index)})"
                 for index in range(source_image_count)
@@ -476,9 +645,30 @@ class Orchestrator:
                     raise CoordinationError(
                         f"source image file could not be resolved: {image['filename']}"
                     ) from error
+                image_url = str(resolved_image_path)
+                if backend.image_transport == "data-url":
+                    image_types = {
+                        ".png": "image/png",
+                        ".jpg": "image/jpeg",
+                        ".jpeg": "image/jpeg",
+                        ".webp": "image/webp",
+                    }
+                    image_type = image_types.get(resolved_image_path.suffix.lower())
+                    if image_type is None:
+                        raise CoordinationError(
+                            f"source image format is unsupported by {backend.label}: "
+                            f"{image['filename']}"
+                        )
+                    try:
+                        encoded_image = base64.b64encode(resolved_image_path.read_bytes()).decode("ascii")
+                    except OSError as error:
+                        raise CoordinationError(
+                            f"source image file could not be read: {image['filename']}"
+                        ) from error
+                    image_url = f"data:{image_type};base64,{encoded_image}"
                 content_parts.append({
                     "type": "image_url",
-                    "image_url": {"url": str(resolved_image_path)},
+                    "image_url": {"url": image_url},
                 })
             message_content = content_parts
         messages = [{"role": "system", "content": system_prompt}]
@@ -506,13 +696,13 @@ class Orchestrator:
         self.store.append_exchange(conversation_id, user_text, raw_answer, image_prompt,
                                    aspect_ratio, display_answer, reasoning_content)
         try:
-            self._save_session(conversation_id)
+            self._save_context(conversation_id)
             return ChatOutcome(answer=display_answer, image_prompt=image_prompt, aspect_ratio=aspect_ratio,
                                context_saved=True, reasoning_content=reasoning_content)
         except (BackendError, StorageError, CoordinationError) as error:
             return ChatOutcome(answer=display_answer, image_prompt=image_prompt, aspect_ratio=aspect_ratio,
                                context_saved=False,
-                               warning=f"Reply received, but native context was not saved: {error}",
+                               warning=f"Reply received, but the conversation context was not saved: {error}",
                                reasoning_content=reasoning_content)
 
     def chat(self, conversation_id: str, user_text: str, max_tokens: int = 2048, *,
@@ -524,9 +714,9 @@ class Orchestrator:
         )
         self._enter()
         try:
-            self._prepare_strata(conversation_id)
-            response = self.strata.chat(messages, max_tokens=max_tokens,
-                                        reasoning_effort=reasoning_effort)
+            self._prepare_chat_backend(conversation_id)
+            response = self.chat_backend.chat(messages, max_tokens=max_tokens,
+                                              reasoning_effort=reasoning_effort)
             return self._finish_chat(conversation_id, user_text, response, preserve_aspect_ratio)
         finally:
             self._leave()
@@ -541,17 +731,17 @@ class Orchestrator:
         self._enter()
         stream = None
         try:
-            self._prepare_strata(conversation_id)
+            self._prepare_chat_backend(conversation_id)
             content_parts: list[str] = []
             reasoning_parts: list[str] = []
-            stream = self.strata.chat_stream(messages, max_tokens=max_tokens,
-                                             reasoning_effort=reasoning_effort)
+            stream = self.chat_backend.chat_stream(messages, max_tokens=max_tokens,
+                                                   reasoning_effort=reasoning_effort)
             try:
                 for delta in stream:
                     content = delta.get("content", "")
                     reasoning = delta.get("reasoning_content", "")
                     if not isinstance(content, str) or not isinstance(reasoning, str):
-                        raise CoordinationError("Strata returned non-text streaming content")
+                        raise CoordinationError("chat backend returned non-text streaming content")
                     if content:
                         content_parts.append(content)
                     if reasoning:
@@ -786,18 +976,32 @@ class Orchestrator:
                 "type": "phase", "message": "Preparing GPU resources for ComfyUI",
             })
             self._require_idle_queue()
-            strata_was_loaded = self._strata_loaded()
-            if strata_was_loaded:
+            backend = get_chat_backend(self.settings.chat_backend)
+            backend_was_loaded = self._chat_backend_loaded()
+            if backend.generation_handoff == "native-session" and backend_was_loaded:
                 active_id = self.store.active_conversation_id()
                 if active_id is None:
-                    raise CoordinationError("Strata is loaded but its active conversation is unknown")
+                    raise CoordinationError(
+                        f"{backend.label} is loaded but its active conversation is unknown"
+                    )
                 self._save_session(active_id)
-                self.strata.unload(wait_s=300)
-                if self._strata_loaded():
-                    raise CoordinationError("Strata did not unload; image generation was not started")
-            if self.store.messages(conversation_id) and not self.store.context_is_current(conversation_id):
-                raise CoordinationError("this conversation has no current native Strata session")
-            if strata_was_loaded or not self._comfy_models_retained:
+                self._native_session_backend().unload(wait_s=300)
+                if self._chat_backend_loaded():
+                    raise CoordinationError(
+                        f"{backend.label} did not unload; image generation was not started"
+                    )
+            elif backend.generation_handoff == "stop-service" and backend_was_loaded:
+                self._stop_backend_service()
+            if (
+                backend.context_strategy == "native-session"
+                and self.store.messages(conversation_id)
+                and not any(
+                    self.store.context_is_current(conversation_id, backend_id)
+                    for backend_id in CHAT_BACKENDS
+                )
+            ):
+                raise CoordinationError("this conversation has no current saved chat context")
+            if backend_was_loaded or not self._comfy_models_retained:
                 self._release_comfy()
             generation = self.settings.section("generation")
             selected_megapixels = (
@@ -836,7 +1040,7 @@ class Orchestrator:
             comfy_image = self._wait_for_generation(prompt_id, workflow, progress_socket,
                                                     progress_callback)
             self._report_generation_event(progress_callback, {
-                "type": "phase", "message": "Moving generated image into Studio storage",
+                "type": "phase", "message": "Saving generated image to the session and output archive",
             })
             completed_image = self._relocate_generated_image(
                 conversation_id, generation_id, comfy_image,

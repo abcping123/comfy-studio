@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 from pathlib import PurePosixPath
-from typing import Any, Iterator
+from typing import Any, Iterator, Protocol, runtime_checkable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener
@@ -23,6 +23,27 @@ class BackendError(RuntimeError):
         self.retry_after = retry_after
 
 
+class ChatBackend(Protocol):
+    def status(self) -> dict[str, Any]: ...
+
+    def chat(self, messages: list[dict[str, Any]], max_tokens: int = 2048,
+             reasoning_effort: str | None = None) -> dict[str, Any]: ...
+
+    def chat_stream(self, messages: list[dict[str, Any]], max_tokens: int = 2048,
+                    reasoning_effort: str | None = None) -> Iterator[dict[str, str]]: ...
+
+
+@runtime_checkable
+class NativeSessionBackend(ChatBackend, Protocol):
+    def load(self) -> dict[str, Any]: ...
+
+    def unload(self, wait_s: int = 300) -> dict[str, Any]: ...
+
+    def save_session(self, filename: str) -> dict[str, Any]: ...
+
+    def restore_session(self, filename: str) -> dict[str, Any]: ...
+
+
 class JsonHttpClient:
     def __init__(self, service: str, endpoint: str, timeout_s: float):
         self.service = service
@@ -31,7 +52,8 @@ class JsonHttpClient:
         self._opener = build_opener(ProxyHandler({}))
 
     def request_json(self, method: str, path: str, body: dict[str, Any] | None = None,
-                     headers: dict[str, str] | None = None) -> dict[str, Any]:
+                     headers: dict[str, str] | None = None,
+                     timeout_s: float | None = None) -> dict[str, Any]:
         request_headers = {"Accept": "application/json", **(headers or {})}
         payload = None
         if body is not None:
@@ -39,7 +61,10 @@ class JsonHttpClient:
             payload = json.dumps(body).encode("utf-8")
         request = Request(f"{self.endpoint}{path}", data=payload, headers=request_headers, method=method)
         try:
-            with self._opener.open(request, timeout=self.timeout_s) as response:
+            with self._opener.open(
+                request,
+                timeout=self.timeout_s if timeout_s is None else timeout_s,
+            ) as response:
                 raw = response.read()
                 status = response.status
                 retry_after = response.headers.get("Retry-After")
@@ -64,33 +89,13 @@ class JsonHttpClient:
         return parsed
 
 
-class StrataClient(JsonHttpClient):
-    def __init__(self, settings: Settings):
-        config = settings.section("strata")
-        api_key = config["api_key"]
-        if not isinstance(api_key, str) or not api_key.strip():
-            raise BackendError("Strata", "strata.api_key is empty in config.json")
-        self.api_key = api_key
-        self.model = config["model"]
-        super().__init__("Strata", config["endpoint"], config["request_timeout_s"])
+class OpenAIChatClient(JsonHttpClient):
+    def __init__(self, service: str, endpoint: str, timeout_s: float, model: str):
+        self.model = model
+        super().__init__(service, endpoint, timeout_s)
 
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.api_key}"}
-
-    def status(self) -> dict[str, Any]:
-        return self.request_json("GET", "/v1/status", headers=self._headers())
-
-    def load(self) -> dict[str, Any]:
-        return self.request_json("POST", "/v1/load", {}, self._headers())
-
-    def unload(self, wait_s: int = 300) -> dict[str, Any]:
-        return self.request_json("POST", f"/v1/unload?wait={wait_s}", {}, self._headers())
-
-    def save_session(self, filename: str) -> dict[str, Any]:
-        return self.request_json("POST", "/slots/0?action=save", {"filename": filename}, self._headers())
-
-    def restore_session(self, filename: str) -> dict[str, Any]:
-        return self.request_json("POST", "/slots/0?action=restore", {"filename": filename}, self._headers())
+        return {}
 
     def chat(self, messages: list[dict[str, Any]], max_tokens: int = 2048,
              reasoning_effort: str | None = None) -> dict[str, Any]:
@@ -164,6 +169,54 @@ class StrataClient(JsonHttpClient):
                         yield {"content": content, "reasoning_content": reasoning}
         except (URLError, TimeoutError, OSError) as error:
             raise BackendError(self.service, f"stream response failed: {error}") from error
+
+
+class StrataClient(OpenAIChatClient):
+    def __init__(self, settings: Settings):
+        config = settings.backend_config("strata")
+        api_key = config["api_key"]
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise BackendError("Strata", "strata.api_key is empty in config.json")
+        self.api_key = api_key
+        super().__init__(
+            "Strata",
+            config["endpoint"],
+            config["request_timeout_s"],
+            config["model"],
+        )
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def status(self) -> dict[str, Any]:
+        return self.request_json("GET", "/v1/status", headers=self._headers())
+
+    def load(self) -> dict[str, Any]:
+        return self.request_json("POST", "/v1/load", {}, self._headers())
+
+    def unload(self, wait_s: int = 300) -> dict[str, Any]:
+        return self.request_json("POST", f"/v1/unload?wait={wait_s}", {}, self._headers())
+
+    def save_session(self, filename: str) -> dict[str, Any]:
+        return self.request_json("POST", "/slots/0?action=save", {"filename": filename}, self._headers())
+
+    def restore_session(self, filename: str) -> dict[str, Any]:
+        return self.request_json("POST", "/slots/0?action=restore", {"filename": filename}, self._headers())
+
+
+class BonsaiClient(OpenAIChatClient):
+    def __init__(self, settings: Settings):
+        config = settings.backend_config("bonsai")
+        super().__init__(
+            "Bonsai",
+            config["endpoint"],
+            config["request_timeout_s"],
+            config["model"],
+        )
+
+    def status(self) -> dict[str, Any]:
+        self.request_json("GET", "/health", timeout_s=min(self.timeout_s, 2.0))
+        return {"loaded": True}
 
 
 class ComfyUIClient(JsonHttpClient):

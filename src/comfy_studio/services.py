@@ -5,7 +5,6 @@ import os
 import signal
 import socket
 import subprocess
-import sys
 import time
 from collections.abc import Iterable
 from http.client import HTTPException
@@ -14,8 +13,9 @@ from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
+from .chat_backends import CHAT_BACKENDS, get_chat_backend
 from .permissions import set_private_permissions
-from .settings import Settings, project_root
+from .settings import Settings
 
 
 class ServiceError(RuntimeError):
@@ -23,39 +23,66 @@ class ServiceError(RuntimeError):
 
 
 def service_command(settings: Settings, service: str) -> tuple[list[str], Path, str, int]:
-    if service == "studio":
-        config = settings.section("app")
-        return ([sys.executable, "-m", "comfy_studio.app"], project_root(),
-                config["listen_host"], config["port"])
-    if service == "strata":
-        config = settings.section("strata")
-        endpoint = urlsplit(config["endpoint"])
-        command = [
-            config["python"], config["server_script"], "--engine", "strata",
-            "--config", str(settings.path("paths.strata_runtime_config")),
-            "--host", endpoint.hostname or "127.0.0.1", "--port", str(endpoint.port),
-        ]
-        cwd = Path(config["server_script"]).resolve().parent.parent
-    elif service == "comfyui":
+    if service == "comfyui":
         config = settings.section("comfyui")
         endpoint = urlsplit(config["endpoint"])
         command = [
-            config["python"], config["main_script"],
+            str(settings.path("comfyui.python")),
+            str(settings.path("comfyui.main_script").resolve()),
             "--listen", endpoint.hostname or "127.0.0.1", "--port", str(endpoint.port),
             "--output-directory", str(settings.path("comfyui.output_directory").resolve()),
             "--input-directory", str(settings.path("comfyui.input_directory").resolve()),
         ]
-        cwd = Path(config["working_directory"]).resolve()
+        cwd = settings.path("comfyui.working_directory").resolve()
     else:
-        raise ServiceError(f"unknown managed service: {service}")
-    endpoint = urlsplit(settings.section(service)["endpoint"])
+        try:
+            backend = get_chat_backend(service)
+        except ValueError as error:
+            raise ServiceError(f"unknown managed service: {service}") from error
+        if not backend.managed_service:
+            raise ServiceError(f"chat backend {service} does not manage a local service")
+        config = settings.backend_config(service)
+        endpoint = urlsplit(config["endpoint"])
+        if backend.service_adapter == "strata":
+            script = settings.path(f"{service}.server_script").resolve()
+            command = [
+                str(settings.path(f"{service}.python")),
+                str(script), "--engine", "strata",
+                "--config", str(settings.path(f"{service}.runtime_config")),
+                "--host", endpoint.hostname or "127.0.0.1", "--port", str(endpoint.port),
+            ]
+            cwd = script.parent.parent
+        elif backend.service_adapter == "llama-server":
+            binary = settings.path(f"{service}.server_binary").resolve()
+            command = [
+                str(binary),
+                "--model", str(settings.path(f"{service}.model_file").resolve()),
+                "--mmproj", str(settings.path(f"{service}.mmproj_file").resolve()),
+                "--ctx-size", str(config["ctx_size"]),
+                "--n-gpu-layers", str(config["n_gpu_layers"]),
+                "--flash-attn", config["flash_attn"],
+                "--parallel", str(config["parallel"]),
+                "--n-predict", str(config["n_predict"]),
+                "--temp", str(config["temperature"]),
+                "--top-p", str(config["top_p"]),
+                "--top-k", str(config["top_k"]),
+                "--min-p", str(config["min_p"]),
+                "--presence-penalty", str(config["presence_penalty"]),
+                "--repeat-penalty", str(config["repeat_penalty"]),
+                "--host", endpoint.hostname or "127.0.0.1",
+                "--port", str(endpoint.port),
+            ]
+            cwd = binary.parent
+        else:
+            raise ServiceError(
+                f"no service command adapter is registered for chat backend {service}"
+            )
     return command, cwd, endpoint.hostname or "127.0.0.1", endpoint.port or 0
 
 
 def _pid_path(settings: Settings, service: str) -> Path:
-    temp_root = settings.path("paths.temp_root")
-    service_dir = temp_root if service == "studio" else temp_root / service
-    return service_dir / "service.pid"
+    runtime_root = settings.path("paths.runtime_root")
+    return runtime_root / f"service_{service}.pid"
 
 
 def _process_identity(pid: int) -> tuple[list[str], Path] | None:
@@ -77,6 +104,15 @@ def _process_identity(pid: int) -> tuple[list[str], Path] | None:
     except OSError:
         return None
     return args, process_cwd
+
+
+def _process_isolated_from_studio(pid: int) -> bool:
+    if os.name == "nt":
+        return False
+    try:
+        return os.getpgid(pid) != os.getpgrp()
+    except ProcessLookupError:
+        return False
 
 
 def _iter_process_identities() -> Iterable[tuple[int, list[str], Path]]:
@@ -110,27 +146,51 @@ def _option_value(args: list[str], option: str) -> str | None:
     return None
 
 
+def _argument_path_matches(value: str | None, expected: Path, process_cwd: Path) -> bool:
+    if value is None:
+        return False
+    actual = Path(value)
+    if not actual.is_absolute():
+        actual = process_cwd / actual
+    try:
+        return actual.resolve() == expected.resolve()
+    except (OSError, ValueError):
+        return False
+
+
 def _service_command_matches(
     settings: Settings,
     service: str,
     args: list[str],
     process_cwd: Path,
 ) -> bool:
-    if service not in ("studio", "strata", "comfyui"):
+    if service != "comfyui" and service not in CHAT_BACKENDS:
         return False
-    command, service_cwd, _, port = service_command(settings, service)
-    if service == "studio":
-        return len(args) == len(command) and args[1:] == command[1:] and process_cwd == service_cwd
+    backend = get_chat_backend(service) if service != "comfyui" else None
+    if backend is not None and not backend.managed_service:
+        return False
+    service_adapter = backend.service_adapter if backend is not None else "comfyui"
+    command, _, _, port = service_command(settings, service)
+    if service_adapter == "llama-server":
+        if (not args
+                or not _argument_path_matches(args[0], Path(command[0]), process_cwd)
+                or _option_value(args, "--port") != str(port)):
+            return False
+        for option in ("--model", "--mmproj"):
+            expected = _option_value(command, option)
+            if expected is None or not _argument_path_matches(
+                _option_value(args, option),
+                Path(expected),
+                process_cwd,
+            ):
+                return False
+        return True
 
-    config = settings.section(service)
-    script_key = "server_script" if service == "strata" else "main_script"
-    script_path = Path(config[script_key])
-    if not script_path.is_absolute():
-        script_path = service_cwd / script_path
-    script_path = script_path.resolve()
+    script_key = "main_script" if service == "comfyui" else "server_script"
+    script_path = settings.path(f"{service}.{script_key}").resolve()
     if _option_value(args, "--port") != str(port):
         return False
-    if service == "strata" and _option_value(args, "--engine") != "strata":
+    if service_adapter == "strata" and _option_value(args, "--engine") != "strata":
         return False
 
     for argument in args[1:]:
@@ -151,7 +211,9 @@ def _service_process_matches(settings: Settings, service: str, pid: int) -> bool
 
 
 def _find_service_processes(settings: Settings, service: str) -> list[int]:
-    if service not in ("studio", "strata", "comfyui"):
+    if service != "comfyui" and service not in CHAT_BACKENDS:
+        return []
+    if service != "comfyui" and not get_chat_backend(service).managed_service:
         return []
     return [
         pid
@@ -210,8 +272,27 @@ def _pid_exists(pid: int) -> bool:
     if os.name == "nt":
         import psutil
 
-        return psutil.pid_exists(pid)
-    return (Path("/proc") / str(pid)).exists()
+        try:
+            return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.Error:
+            return True
+
+    proc = Path("/proc") / str(pid)
+    try:
+        stat = (proc / "stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return proc.exists()
+    _, separator, details = stat.rpartition(")")
+    if not separator:
+        return proc.exists()
+    fields = details.split()
+    if not fields:
+        return proc.exists()
+    return fields[0] not in {"Z", "X"}
 
 
 def _terminate_process(pid: int) -> None:
@@ -225,11 +306,19 @@ def _terminate_process(pid: int) -> None:
         except psutil.Error as error:
             raise ServiceError(f"could not terminate process {pid}: {error}") from error
         return
-    os.kill(pid, signal.SIGTERM)
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError as error:
+        raise ServiceError(f"could not terminate process {pid}: {error}") from error
 
 
-def _strata_endpoint_matches(settings: Settings) -> bool:
-    config = settings.section("strata")
+def _strata_endpoint_matches(settings: Settings, service: str = "strata") -> bool:
+    config = settings.backend_config(service)
     api_key = config.get("api_key")
     if not isinstance(api_key, str) or not api_key.strip():
         return False
@@ -251,56 +340,47 @@ def _strata_endpoint_matches(settings: Settings) -> bool:
     )
 
 
-def _reject_unmanageable_strata(settings: Settings, service: str) -> None:
-    if service == "strata" and _strata_endpoint_matches(settings):
+def _reject_unmanageable_endpoint_backend(settings: Settings, service: str) -> None:
+    if service not in CHAT_BACKENDS:
+        return
+    backend = get_chat_backend(service)
+    if backend.endpoint_probe == "strata-model" and _strata_endpoint_matches(settings, service):
         raise ServiceError(
-            "Strata is responding with the configured model, but no matching local process "
-            "was found; it cannot be taken over safely or stopped on Ctrl+C"
+            f"{backend.label} is responding with the configured model, but no "
+            "matching local process was found; it cannot be taken over safely or stopped on Ctrl+C"
         )
 
 
 def _check_service_start(
     settings: Settings,
     service: str,
-) -> tuple[int | None, bool, int | None]:
-    command, cwd, host, port = service_command(settings, service)
+) -> tuple[int | None, list[int]]:
+    _, _, host, port = service_command(settings, service)
     pid_file = _pid_path(settings, service)
-    stale_pid_file = False
     old_pid: int | None = None
-    invalid_pid_file = False
 
     if pid_file.exists():
         try:
             old_pid = int(pid_file.read_text(encoding="ascii").strip())
-        except ValueError:
-            invalid_pid_file = True
-        else:
-            if _service_process_matches(settings, service, old_pid):
-                return old_pid, False, None
-            stale_pid_file = not _pid_exists(old_pid)
+        except (OSError, ValueError):
+            pass
 
     matching_pids = _find_service_processes(settings, service)
     if matching_pids:
-        if len(matching_pids) != 1:
-            raise ServiceError(
-                f"multiple {service} processes match the configured server script and port; "
-                "refusing to take over any of them"
-            )
-        return None, stale_pid_file, matching_pids[0]
-
-    if invalid_pid_file:
-        _reject_unmanageable_strata(settings, service)
-        raise ServiceError(f"invalid pid file; inspect before removing it: {pid_file}")
-
-    if old_pid is not None and not stale_pid_file:
-        _reject_unmanageable_strata(settings, service)
-        raise _pid_mismatch_error(pid_file, old_pid, service, command, cwd)
+        if (len(matching_pids) == 1
+                and matching_pids[0] == old_pid
+                and _process_isolated_from_studio(old_pid)):
+            return old_pid, []
+        return None, matching_pids
 
     if _port_open(host, port):
-        _reject_unmanageable_strata(settings, service)
+        _reject_unmanageable_endpoint_backend(settings, service)
+        command, cwd, _, _ = service_command(settings, service)
+        if old_pid is not None and _pid_exists(old_pid):
+            raise _pid_mismatch_error(pid_file, old_pid, service, command, cwd)
         raise ServiceError(f"refusing to start {service}: {host}:{port} is already in use")
 
-    return None, stale_pid_file, None
+    return None, []
 
 
 def preflight_service_start(settings: Settings, services: Iterable[str]) -> None:
@@ -315,7 +395,18 @@ def preflight_service_start(settings: Settings, services: Iterable[str]) -> None
         raise ServiceError(f"startup preflight failed; no services were started:\n - {details}")
 
 
+def preflight_studio_start(settings: Settings) -> None:
+    config = settings.section("app")
+    host = config["listen_host"]
+    port = config["port"]
+    if _port_open(host, port):
+        raise ServiceError(f"refusing to start studio: {host}:{port} is already in use")
+
+
 def service_running(settings: Settings, service: str) -> bool:
+    if service != "comfyui":
+        if service not in CHAT_BACKENDS or not get_chat_backend(service).managed_service:
+            return False
     pid_file = _pid_path(settings, service)
     try:
         pid = int(pid_file.read_text(encoding="ascii").strip())
@@ -323,7 +414,13 @@ def service_running(settings: Settings, service: str) -> bool:
         pid = None
     if pid is not None and _service_process_matches(settings, service, pid):
         return True
-    return service == "strata" and _strata_endpoint_matches(settings)
+    if _find_service_processes(settings, service):
+        return True
+    return (
+        service in CHAT_BACKENDS
+        and get_chat_backend(service).endpoint_probe == "strata-model"
+        and _strata_endpoint_matches(settings, service)
+    )
 
 
 def start_service(settings: Settings, service: str) -> tuple[int | None, Path]:
@@ -331,38 +428,83 @@ def start_service(settings: Settings, service: str) -> tuple[int | None, Path]:
     return pid, log_path
 
 
-def start_service_tracked(settings: Settings, service: str) -> tuple[int | None, Path, bool]:
+def _stop_service_processes(
+    settings: Settings,
+    service: str,
+    pids: Iterable[int],
+    wait_s: float,
+    wait_for_port: bool = False,
+) -> None:
+    _, _, host, port = service_command(settings, service)
+    process_ids = list(dict.fromkeys(pids))
+    for pid in process_ids:
+        if _service_process_matches(settings, service, pid):
+            _terminate_process(pid)
+
+    deadline = time.monotonic() + wait_s
+    while True:
+        active_pids = [
+            pid for pid in process_ids
+            if _service_process_matches(settings, service, pid)
+        ]
+        port_open = wait_for_port and _port_open(host, port)
+        if not active_pids and not port_open:
+            return
+        if time.monotonic() >= deadline:
+            if active_pids:
+                raise ServiceError(
+                    f"{service} is still running after SIGTERM; no force kill was sent"
+                )
+            raise ServiceError(
+                f"{service} endpoint {host}:{port} is still in use after SIGTERM"
+            )
+        time.sleep(0.1)
+
+
+def start_service_tracked(
+    settings: Settings,
+    service: str,
+) -> tuple[int | None, Path, bool]:
     command, cwd, _, _ = service_command(settings, service)
     pid_file = _pid_path(settings, service)
-    log_path = pid_file.parent / "service.log"
+    log_path = pid_file.with_suffix(".log")
     pid_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     set_private_permissions(pid_file.parent, directory=True)
-    existing_pid, stale_pid_file, takeover_pid = _check_service_start(settings, service)
-    if stale_pid_file:
-        pid_file.unlink(missing_ok=True)
+    existing_pid, restart_pids = _check_service_start(settings, service)
     if existing_pid is not None:
         return existing_pid, log_path, False
-    if takeover_pid is not None:
-        if not _service_process_matches(settings, service, takeover_pid):
-            raise ServiceError(
-                f"{service} process PID {takeover_pid} changed before it could be taken over"
-            )
-        pid_file.write_text(f"{takeover_pid}\n", encoding="ascii")
-        set_private_permissions(pid_file)
-        return takeover_pid, log_path, False
+    if restart_pids:
+        _stop_service_processes(
+            settings,
+            service,
+            restart_pids,
+            wait_s=10.0,
+            wait_for_port=True,
+        )
 
     with log_path.open("ab") as log:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
+        if os.name == "nt":
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
     if process.poll() is not None:
         raise ServiceError(f"{service} exited during startup; inspect {log_path}")
     try:
-        with pid_file.open("x", encoding="ascii") as file:
+        with pid_file.open("w", encoding="ascii") as file:
             file.write(f"{process.pid}\n")
         set_private_permissions(pid_file)
     except OSError as error:
@@ -375,23 +517,37 @@ def start_service_tracked(settings: Settings, service: str) -> tuple[int | None,
 def stop_service(settings: Settings, service: str, wait_s: float = 10.0) -> bool | None:
     command, cwd, _, _ = service_command(settings, service)
     pid_file = _pid_path(settings, service)
+    matching_pids = _find_service_processes(settings, service)
+    if matching_pids:
+        _stop_service_processes(settings, service, matching_pids, wait_s)
+        pid_file.unlink(missing_ok=True)
+        return True
+
     if not pid_file.exists():
-        if service == "strata" and _strata_endpoint_matches(settings):
+        if (service in CHAT_BACKENDS
+                and get_chat_backend(service).endpoint_probe == "strata-model"
+                and _strata_endpoint_matches(settings, service)):
             return None
         return False
     try:
         pid = int(pid_file.read_text(encoding="ascii").strip())
     except ValueError as error:
-        if service == "strata" and _strata_endpoint_matches(settings):
+        if (service in CHAT_BACKENDS
+                and get_chat_backend(service).endpoint_probe == "strata-model"
+                and _strata_endpoint_matches(settings, service)):
             return None
         raise ServiceError(f"invalid pid file; leaving it untouched: {pid_file}") from error
     if not _service_process_matches(settings, service, pid):
         if not _pid_exists(pid):
             pid_file.unlink(missing_ok=True)
-            if service == "strata" and _strata_endpoint_matches(settings):
+            if (service in CHAT_BACKENDS
+                    and get_chat_backend(service).endpoint_probe == "strata-model"
+                    and _strata_endpoint_matches(settings, service)):
                 return None
             return False
-        if service == "strata" and _strata_endpoint_matches(settings):
+        if (service in CHAT_BACKENDS
+                and get_chat_backend(service).endpoint_probe == "strata-model"
+                and _strata_endpoint_matches(settings, service)):
             return None
         raise _pid_mismatch_error(pid_file, pid, service, command, cwd)
 
