@@ -23,6 +23,7 @@ from .modes import (
     MAX_SOURCE_IMAGES,
     calculate_mode_dimensions,
     get_mode,
+    mode_default_megapixels,
     source_image_role,
     validate_source_image_count,
 )
@@ -1075,7 +1076,7 @@ class Orchestrator:
                 self._release_comfy()
             generation = self.settings.section("generation")
             selected_megapixels = (
-                min(generation["default_megapixels"], mode.max_megapixels)
+                mode_default_megapixels(mode, generation)
                 if megapixels is None else megapixels
             )
             selected_sampler = sampler_name or generation["default_sampler"]

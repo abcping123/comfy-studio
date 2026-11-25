@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +15,7 @@ def sample_config() -> dict:
         "diffusion_models": "/models/diffusion_models",
         "text_encoders": "/models/text_encoders",
         "vae": "/models/vae",
+        "loras": "/srv/comfy/models/loras",
     }
     minimax_models = {
         "diffusion_model": {
@@ -29,7 +32,7 @@ def sample_config() -> dict:
         },
     }
     return {
-        "schema_version": 8,
+        "schema_version": 9,
         "app": {
             "listen_host": "127.0.0.1",
             "port": 8765,
@@ -101,6 +104,18 @@ def sample_config() -> dict:
                     key: dict(value) for key, value in minimax_models.items()
                 },
             },
+            "character-swap": {
+                "workflow": "data/comfyui/minimax_h3_image_character_swap.json",
+                "system_prompt_file": "data/prompts/minimax_h3_image_character_swap.txt",
+                "models": {
+                    key: dict(value) for key, value in minimax_models.items()
+                } | {
+                    "character_swap_lora": {
+                        "directory": "loras",
+                        "file": "h3_image_character_swap_v1.safetensors",
+                    },
+                },
+            },
         },
         "generation": {
             "prompt_enhancement": False,
@@ -128,7 +143,7 @@ def sample_config() -> dict:
 
 class SettingsTests(unittest.TestCase):
     def test_valid_local_config(self) -> None:
-        self.assertEqual(validate_config(sample_config())["schema_version"], 8)
+        self.assertEqual(validate_config(sample_config())["schema_version"], 9)
 
     def test_chat_max_tokens_must_be_a_positive_integer_for_each_backend(self) -> None:
         for backend_id in ("strata", "bonsai"):
@@ -157,7 +172,7 @@ class SettingsTests(unittest.TestCase):
         data = sample_config()
         data["chat_backends"]["strata"].pop("source_config_json")
 
-        self.assertEqual(validate_config(data)["schema_version"], 8)
+        self.assertEqual(validate_config(data)["schema_version"], 9)
 
     def test_bonsai_mmproj_gpu_offload_must_be_boolean(self) -> None:
         data = sample_config()
@@ -176,12 +191,12 @@ class SettingsTests(unittest.TestCase):
         data["chat_backends"]["bonsai"]["mmproj_gpu_offload"] = False
         self.assertFalse(validate_config(data)["chat_backends"]["bonsai"]["mmproj_gpu_offload"])
 
-    def test_only_schema_eight_is_supported(self) -> None:
-        for version in range(1, 8):
+    def test_only_schema_nine_is_supported(self) -> None:
+        for version in range(1, 9):
             data = sample_config()
             data["schema_version"] = version
             with self.subTest(version=version):
-                with self.assertRaisesRegex(ConfigError, "schema_version must be 8"):
+                with self.assertRaisesRegex(ConfigError, "schema_version must be 9"):
                     validate_config(data)
 
     def test_default_megapixels_must_be_between_half_and_twenty(self) -> None:
@@ -206,6 +221,14 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(settings.path("paths.session_root"),
                              Path(directory) / "temp/session")
 
+    def test_load_config_rejects_a_non_object_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text("[]", encoding="utf-8")
+
+            with self.assertRaisesRegex(ConfigError, "root of config.json must be a JSON object"):
+                load_config(config_path)
+
     def test_home_relative_paths_resolve_from_user_home(self) -> None:
         data = sample_config()
         data["paths"]["session_root"] = "~/studio-sessions"
@@ -224,7 +247,7 @@ class SettingsTests(unittest.TestCase):
         data = sample_config()
         data["chat_backends"].pop("bonsai")
 
-        self.assertEqual(validate_config(data, required_backend="strata")["schema_version"], 8)
+        self.assertEqual(validate_config(data, required_backend="strata")["schema_version"], 9)
         with self.assertRaisesRegex(ConfigError, "chat_backends.bonsai is required"):
             validate_config(data, required_backend="bonsai")
 
@@ -236,6 +259,36 @@ class SettingsTests(unittest.TestCase):
             settings = load_config(config_path, chat_backend="bonsai")
 
         self.assertEqual(settings.chat_backend, "bonsai")
+
+    def test_load_config_migrates_schema_eight_without_losing_private_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            legacy = sample_config()
+            legacy["schema_version"] = 8
+            legacy["generation_modes"].pop("character-swap")
+            legacy["comfyui"]["model_directories"].pop("loras")
+            legacy["chat_backends"]["strata"]["api_key"] = "preserved-api-key"
+            config_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            settings = load_config(config_path)
+            persisted = json.loads(config_path.read_text(encoding="utf-8"))
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+
+        self.assertEqual(settings.data["schema_version"], 9)
+        self.assertEqual(settings.data["chat_backends"]["strata"]["api_key"], "preserved-api-key")
+        self.assertEqual(
+            settings.path("comfyui.model_directories.loras"),
+            Path("/srv/comfy/models/loras"),
+        )
+        self.assertEqual(
+            settings.data["generation_modes"]["character-swap"]["models"]["diffusion_model"],
+            legacy["generation_modes"]["edit"]["models"]["diffusion_model"],
+        )
+        self.assertEqual(
+            persisted["generation_modes"]["character-swap"]["models"]["character_swap_lora"]["file"],
+            "h3_image_character_swap_v1.safetensors",
+        )
 
     def test_mode_workflow_and_prompt_paths_are_required(self) -> None:
         for key in ("workflow", "system_prompt_file"):

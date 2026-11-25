@@ -123,6 +123,13 @@ class AppTests(unittest.TestCase):
         self.assertEqual(edit_mode["resolution"]["megapixels"]["max"], 16.0)
         self.assertEqual(edit_mode["source_images"]["min_count"], 1)
         self.assertEqual(edit_mode["source_images"]["max_count"], 5)
+        character_swap_mode = next(
+            mode for mode in options["modes"] if mode["id"] == "character-swap"
+        )
+        self.assertEqual(character_swap_mode["resolution"]["megapixels"]["default"], 1.0)
+        self.assertEqual(character_swap_mode["source_images"]["min_count"], 2)
+        self.assertEqual(character_swap_mode["source_images"]["max_count"], 5)
+        self.assertEqual(character_swap_mode["ui"]["generate_label"], "Swap character")
         self.assertEqual(options["default_aspect_ratio"], "1:1 (Square)")
         self.assertEqual(text_to_image_mode["resolution"]["megapixels"], {
             "min": 0.5,

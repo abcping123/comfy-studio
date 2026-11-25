@@ -97,6 +97,66 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(graph["4"]["inputs"]["width"], ["12", 0])
         self.assertEqual(graph["4"]["inputs"]["height"], ["12", 1])
 
+    def test_character_swap_workflow_applies_lora_and_maps_scene_and_references(self) -> None:
+        source_images = [
+            {"filename": "scene.png", "subfolder": "a" * 32, "width": 1920, "height": 1080},
+            {"filename": "character.jpg", "subfolder": "a" * 32, "width": 800, "height": 1200},
+            {"filename": "detail.webp", "subfolder": "a" * 32, "width": 640, "height": 480},
+        ]
+        graph = build_workflow(
+            self.settings,
+            "Replace the person in <Picture 1> with the character in <Picture 2>.",
+            7,
+            image_mode="character-swap",
+            source_images=source_images,
+        )
+
+        self.assertEqual(graph["9"]["inputs"]["image"], f"{'a' * 32}/scene.png")
+        self.assertEqual(graph["10"]["inputs"]["resize_type.megapixels"], 1.0)
+        self.assertEqual(graph["11"]["inputs"]["resize_type.multiple"], 32)
+        self.assertEqual(graph["4"]["inputs"]["images.image_0"], ["11", 0])
+        self.assertEqual(graph["4"]["inputs"]["images.image_1"], ["13", 0])
+        self.assertEqual(graph["13"]["inputs"]["image"], f"{'a' * 32}/character.jpg")
+        self.assertEqual(graph["4"]["inputs"]["images.image_2"], ["14", 0])
+        self.assertEqual(graph["14"]["inputs"]["image"], f"{'a' * 32}/detail.webp")
+        self.assertNotIn("15", graph)
+        self.assertNotIn("16", graph)
+        self.assertEqual(graph["17"]["class_type"], "LoadLoraModel")
+        self.assertEqual(
+            graph["17"]["inputs"]["loras.0.lora_name"],
+            self.settings.data["generation_modes"]["character-swap"]["models"]
+            ["character_swap_lora"]["file"],
+        )
+        self.assertEqual(graph["17"]["inputs"]["loras.0.strength"], 1.0)
+        self.assertTrue(graph["17"]["inputs"]["loras.0.enabled"])
+        self.assertEqual(graph["6"]["inputs"]["model"], ["17", 0])
+
+    def test_character_swap_requires_scene_and_reference_and_rejects_unsafe_paths(self) -> None:
+        with self.assertRaisesRegex(WorkflowError, "at least one character reference"):
+            build_workflow(
+                self.settings,
+                "Replace the person.",
+                7,
+                image_mode="character-swap",
+                source_images=[{
+                    "filename": "scene.png",
+                    "subfolder": "a" * 32,
+                    "width": 1024,
+                    "height": 1024,
+                }],
+            )
+        with self.assertRaisesRegex(WorkflowError, "unsafe"):
+            build_workflow(
+                self.settings,
+                "Replace the person.",
+                7,
+                image_mode="character-swap",
+                source_images=[
+                    {"filename": "scene.png", "subfolder": "a" * 32, "width": 1024, "height": 1024},
+                    {"filename": "../character.png", "subfolder": "a" * 32, "width": 1024, "height": 1024},
+                ],
+            )
+
     def test_edit_workflow_requires_base_image_and_obeys_resize_limit(self) -> None:
         with self.assertRaisesRegex(WorkflowError, "requires one base image"):
             build_workflow(self.settings, "Edit", 7, image_mode="edit", source_images=[])

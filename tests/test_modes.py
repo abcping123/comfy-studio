@@ -40,6 +40,12 @@ class ImageModeTests(unittest.TestCase):
         self.assertEqual(edit["ui"]["generate_label"], "Edit image")
         self.assertNotIn("legacy_local_storage_key", edit)
         self.assertNotIn("legacy_options_key", edit)
+        character_swap = next(item for item in options if item["id"] == "character-swap")
+        self.assertEqual(character_swap["source_images"]["min_count"], 2)
+        self.assertEqual(character_swap["source_images"]["max_count"], MAX_SOURCE_IMAGES)
+        self.assertEqual(character_swap["resolution"]["strategy"], "source-image")
+        self.assertEqual(character_swap["resolution"]["megapixels"]["default"], 1.0)
+        self.assertEqual(character_swap["ui"]["generate_label"], "Swap character")
 
     def test_source_image_limits_are_owned_by_the_selected_mode(self) -> None:
         text_to_image = get_mode(DEFAULT_MODE_ID)
@@ -51,6 +57,10 @@ class ImageModeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires one base image"):
             validate_source_image_count(edit, 0)
         validate_source_image_count(edit, MAX_SOURCE_IMAGES)
+        character_swap = get_mode("character-swap")
+        with self.assertRaisesRegex(ValueError, "at least one character reference"):
+            validate_source_image_count(character_swap, 1)
+        validate_source_image_count(character_swap, MAX_SOURCE_IMAGES)
 
     def test_unknown_mode_is_not_silently_mapped_to_the_default(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported image mode"):

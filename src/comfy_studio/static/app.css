@@ -119,8 +119,8 @@ h2 { font-size: 20px; }
 .prompt-column { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--line); }
 .prompt-editor-wrap { padding: 12px 18px 10px; }
 .prompt-input-wrap { position: relative; margin-top: 7px; }
-.image-mode-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: #f5f7f3; }
-.mode-button { min-width: 0; height: 29px; padding: 0 8px; border: 0; border-radius: 5px; color: #78827c; background: transparent; font-size: 10px; font-weight: 700; }
+.image-mode-switch { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: #f5f7f3; }
+.mode-button { min-width: 0; height: 29px; padding: 0 8px; border: 0; border-radius: 5px; color: #78827c; background: transparent; font-size: 10px; font-weight: 700; white-space: nowrap; }
 .mode-button.is-active { color: var(--teal-dark); background: white; box-shadow: 0 1px 3px rgba(29, 41, 39, .1); }
 .mode-button:disabled { cursor: not-allowed; }
 .source-image-panel { max-height: 190px; margin-top: 9px; padding: 6px; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: #fbfcfa; }
@@ -306,6 +306,7 @@ h2 { font-size: 20px; }
   .composer-actions { margin-left: auto; }
   .prompt-column { order: 3; border-top: 1px solid var(--line); }
   .prompt-editor-wrap, .settings-block, .result-section { padding-right: 15px; padding-left: 15px; }
+  .mode-button { padding-right: 3px; padding-left: 3px; font-size: 9px; }
   .prompt-editor { height: 110px; }
   .image-lightbox { padding: 12px; }
   .lightbox-figure img { max-width: calc(100vw - 24px); max-height: calc(100dvh - 48px); }

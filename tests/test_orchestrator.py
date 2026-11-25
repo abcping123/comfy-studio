@@ -463,6 +463,39 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(self.store.generation(result.generation_id)["source_image_ids"],
                          [base["id"], reference["id"]])
 
+    def test_character_swap_generation_uses_lora_order_and_recommended_resolution(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        self.store.set_conversation_mode(conversation_id, "character-swap")
+        scene = self.orchestrator.upload_source_image(
+            conversation_id, b"scene-image", "image/png", ".png", 1920, 1080,
+        )
+        character = self.orchestrator.upload_source_image(
+            conversation_id, b"character-image", "image/jpeg", ".jpg", 800, 1200,
+        )
+
+        result = self.orchestrator.generate(
+            conversation_id,
+            "Replace the person in <Picture 1> with the character in <Picture 2>.",
+            42,
+            image_mode="character-swap",
+            source_image_ids=[scene["id"], character["id"]],
+        )
+
+        workflow = self.comfy.submitted
+        self.assertEqual(workflow["9"]["inputs"]["image"], f"{conversation_id}/{scene['filename']}")
+        self.assertEqual(workflow["4"]["inputs"]["images.image_0"], ["11", 0])
+        self.assertEqual(workflow["13"]["inputs"]["image"],
+                         f"{conversation_id}/{character['filename']}")
+        self.assertEqual(workflow["4"]["inputs"]["images.image_1"], ["13", 0])
+        self.assertEqual(
+            workflow["17"]["inputs"]["loras.0.lora_name"],
+            "h3_image_character_swap_v1.safetensors",
+        )
+        generation = self.store.generation(result.generation_id)
+        self.assertEqual(generation["image_mode"], "character-swap")
+        self.assertEqual(generation["megapixels"], 1.0)
+        self.assertEqual(generation["source_image_ids"], [scene["id"], character["id"]])
+
     def test_reuploading_removed_source_restores_same_record_and_file(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
         source = self.orchestrator.upload_source_image(
@@ -533,6 +566,32 @@ class OrchestratorTests(unittest.TestCase):
             "data:image/jpeg;base64," + base64.b64encode(b"reference-image").decode("ascii"),
         ])
         self.assertNotIn("不会收到上传图片的像素内容", messages[0]["content"])
+
+    def test_character_swap_chat_uses_mode_prompt_and_image_roles(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        self.store.set_conversation_mode(conversation_id, "character-swap")
+        self.orchestrator.upload_source_image(
+            conversation_id, b"scene-image", "image/png", ".png", 1920, 1080,
+        )
+        self.orchestrator.upload_source_image(
+            conversation_id, b"character-image", "image/jpeg", ".jpg", 800, 1200,
+        )
+
+        self.orchestrator.chat(
+            conversation_id,
+            "Replace the person in the scene with this character.",
+            current_aspect_ratio="16:9 (Widescreen)",
+        )
+
+        messages = next(messages for name, messages in self.strata.calls if name == "chat")
+        message_content = messages[-1]["content"]
+        self.assertIn("MiniMax H3 Character Swap Prompt Assistant", messages[0]["content"])
+        self.assertIn("<Picture 1> (scene image)", message_content[0]["text"])
+        self.assertIn("<Picture 2> (character reference)", message_content[0]["text"])
+        self.assertEqual(
+            [part["type"] for part in message_content],
+            ["text", "image_url", "image_url"],
+        )
 
     def test_edit_chat_fails_when_an_uploaded_image_file_is_missing(self) -> None:
         conversation_id = self.store.create_conversation()["id"]

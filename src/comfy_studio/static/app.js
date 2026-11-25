@@ -592,12 +592,10 @@
     applyImageMode(imageMode);
     const megapixelOptions = mode.resolution.megapixels;
     const savedMegapixels = getSavedMegapixels(saved, mode);
-    const previousValue = Number(previousMegapixels);
     const selectedMegapixels = Number.isFinite(savedMegapixels) &&
       savedMegapixels >= megapixelOptions.min && savedMegapixels <= megapixelOptions.max
       ? savedMegapixels
-      : Number.isFinite(previousValue) && previousValue >= megapixelOptions.min &&
-        previousValue <= megapixelOptions.max ? previousValue : megapixelOptions.default;
+      : megapixelOptions.default;
     byId("image-megapixels").value = selectedMegapixels.toFixed(2);
     updateResolutionPreview();
     try {

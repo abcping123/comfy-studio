@@ -1,5 +1,5 @@
 {
-  "schema_version": 8,
+  "schema_version": 9,
   "app": {
     "listen_host": "127.0.0.1",
     "port": 8765,
@@ -54,7 +54,8 @@
     "model_directories": {
       "diffusion_models": "~/models/Comfy-Org__MiniMax-H3-Image/diffusion_models",
       "text_encoders": "~/models/Comfy-Org__MiniMax-H3-Image/text_encoders",
-      "vae": "~/models/Comfy-Org__MiniMax-H3-Image/vae"
+      "vae": "~/models/Comfy-Org__MiniMax-H3-Image/vae",
+      "loras": "~/repos/ComfyUI/models/loras"
     },
     "input_directory": "temp/session",
     "output_directory": "temp/session",
@@ -96,6 +97,28 @@
         "vae": {
           "directory": "vae",
           "file": "minimax_h3_image_vae_fp16.safetensors"
+        }
+      }
+    },
+    "character-swap": {
+      "workflow": "data/comfyui/minimax_h3_image_character_swap.json",
+      "system_prompt_file": "data/prompts/minimax_h3_image_character_swap.txt",
+      "models": {
+        "diffusion_model": {
+          "directory": "diffusion_models",
+          "file": "minimax_h3_image_pruned_int8_convrot.safetensors"
+        },
+        "text_encoder": {
+          "directory": "text_encoders",
+          "file": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+        },
+        "vae": {
+          "directory": "vae",
+          "file": "minimax_h3_image_vae_fp16.safetensors"
+        },
+        "character_swap_lora": {
+          "directory": "loras",
+          "file": "h3_image_character_swap_v1.safetensors"
         }
       }
     }

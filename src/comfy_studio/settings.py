@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
 import ipaddress
 import json
+import os
+import secrets
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -9,8 +12,17 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .chat_backends import CHAT_BACKENDS, get_chat_backend
-from .modes import IMAGE_MODES
+from .modes import (
+    CHARACTER_SWAP_LORA_FILENAME,
+    CHARACTER_SWAP_LORA_MODEL_KEY,
+    IMAGE_MODES,
+    get_mode,
+)
+from .permissions import set_private_permissions
 from .resolution import aspect_ratio_map
+
+
+CONFIG_SCHEMA_VERSION = 9
 
 
 class ConfigError(ValueError):
@@ -167,8 +179,8 @@ def validate_config(data: Any, required_backend: str | None = None) -> dict[str,
     if not isinstance(data, dict):
         raise ConfigError("the root of config.json must be a JSON object")
     version = data.get("schema_version")
-    if isinstance(version, bool) or version != 8:
-        raise ConfigError("schema_version must be 8")
+    if isinstance(version, bool) or version != CONFIG_SCHEMA_VERSION:
+        raise ConfigError(f"schema_version must be {CONFIG_SCHEMA_VERSION}")
 
     app = _mapping(data, "app")
     app_host = _text(app, "listen_host", "app")
@@ -323,5 +335,80 @@ def load_config(path: Path | None = None, chat_backend: str = "strata") -> Setti
         raise ConfigError(f"cannot read {config_path}: {error}") from error
     except json.JSONDecodeError as error:
         raise ConfigError(f"invalid JSON in {config_path}: {error}") from error
+    migrated = _migrate_schema_8_config(data, config_path)
     validate_config(data, required_backend=chat_backend)
+    if migrated:
+        _persist_migrated_config(config_path, data)
     return Settings(root=config_path.parent, data=data, chat_backend=chat_backend)
+
+
+def _merge_missing(target: dict[str, Any], defaults: dict[str, Any]) -> None:
+    for key, default in defaults.items():
+        if key not in target:
+            target[key] = copy.deepcopy(default)
+        elif isinstance(target[key], dict) and isinstance(default, dict):
+            _merge_missing(target[key], default)
+
+
+def _migrate_schema_8_config(data: Any, config_path: Path) -> bool:
+    if not isinstance(data, dict) or data.get("schema_version") != 8:
+        return False
+
+    comfy = _mapping(data, "comfyui")
+    model_directories = _mapping(comfy, "model_directories")
+    if "loras" not in model_directories:
+        working_directory = _text(comfy, "working_directory", "comfyui")
+        comfy_root = Path(working_directory).expanduser()
+        if not comfy_root.is_absolute():
+            comfy_root = config_path.parent / comfy_root
+        model_directories["loras"] = str(comfy_root / "models" / "loras")
+
+    generation_modes = _mapping(data, "generation_modes")
+    edit_mode = _mapping(generation_modes, "edit")
+    edit_models = _mapping(edit_mode, "models")
+    base_model_keys = ("diffusion_model", "text_encoder", "vae")
+    missing_base_models = [key for key in base_model_keys if key not in edit_models]
+    if missing_base_models:
+        missing = ", ".join(missing_base_models)
+        raise ConfigError(f"cannot migrate schema 8 config; edit mode is missing model(s): {missing}")
+
+    character_swap = get_mode("character-swap")
+    default_mode = {
+        "workflow": character_swap.default_workflow_path,
+        "system_prompt_file": character_swap.default_system_prompt_file,
+        "models": {
+            key: copy.deepcopy(edit_models[key])
+            for key in base_model_keys
+        } | {
+            CHARACTER_SWAP_LORA_MODEL_KEY: {
+                "directory": "loras",
+                "file": CHARACTER_SWAP_LORA_FILENAME,
+            },
+        },
+    }
+    existing_mode = generation_modes.get(character_swap.id)
+    if existing_mode is None:
+        existing_mode = {}
+        generation_modes[character_swap.id] = existing_mode
+    if not isinstance(existing_mode, dict):
+        raise ConfigError(f"generation_modes.{character_swap.id} must be a JSON object")
+    _merge_missing(existing_mode, default_mode)
+    data["schema_version"] = CONFIG_SCHEMA_VERSION
+    return True
+
+
+def _persist_migrated_config(config_path: Path, data: dict[str, Any]) -> None:
+    temporary = config_path.with_name(f".{config_path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        set_private_permissions(temporary)
+        os.replace(temporary, config_path)
+    except OSError as error:
+        raise ConfigError(f"cannot persist config migration to {config_path}: {error}") from error
+    finally:
+        temporary.unlink(missing_ok=True)

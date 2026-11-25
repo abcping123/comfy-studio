@@ -7,10 +7,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .modes import (
+    CHARACTER_SWAP_LORA_MODEL_KEY,
     DEFAULT_MODE_ID,
     ModeDefinition,
     calculate_mode_dimensions,
     get_mode,
+    mode_default_megapixels,
     validate_source_image_count,
 )
 from .settings import ConfigError, Settings
@@ -80,9 +82,39 @@ def _configure_minimax_h3_edit(graph: dict[str, Any], context: WorkflowContext) 
         graph.pop(str(11 + image_number), None)
 
 
+def _configure_minimax_h3_character_swap(
+    graph: dict[str, Any], context: WorkflowContext,
+) -> None:
+    _configure_minimax_h3_common(graph, context)
+    conditioning_inputs = graph["4"]["inputs"]
+    conditioning_inputs.update({
+        "width": ["12", 0],
+        "height": ["12", 1],
+        "images.image_0": ["11", 0],
+    })
+    graph["10"]["inputs"].update({
+        "resize_type": "scale total pixels",
+        "resize_type.megapixels": context.generation["selected_megapixels"],
+    })
+    graph["11"]["inputs"].update({
+        "resize_type": "scale to multiple",
+        "resize_type.multiple": context.generation["resolution_multiple"],
+    })
+    graph["9"]["inputs"]["image"] = _source_image_path(context.source_images[0])
+    graph["17"]["inputs"]["loras.0.lora_name"] = context.models[CHARACTER_SWAP_LORA_MODEL_KEY]
+    for image_slot, image in enumerate(context.source_images[1:], start=1):
+        node_id = str(12 + image_slot)
+        graph[node_id]["inputs"]["image"] = _source_image_path(image)
+        conditioning_inputs[f"images.image_{image_slot}"] = [node_id, 0]
+    for image_slot in range(len(context.source_images), 5):
+        conditioning_inputs.pop(f"images.image_{image_slot}", None)
+        graph.pop(str(12 + image_slot), None)
+
+
 _WORKFLOW_STRATEGIES: dict[str, Callable[[dict[str, Any], WorkflowContext], None]] = {
     "minimax-h3-text-to-image": _configure_minimax_h3_t2i,
     "minimax-h3-image-edit": _configure_minimax_h3_edit,
+    "minimax-h3-character-swap": _configure_minimax_h3_character_swap,
 }
 
 
@@ -155,8 +187,7 @@ def build_workflow(settings: Settings, prompt: str, seed: int,
         raise WorkflowError(f"no workflow strategy is registered for image mode {mode.id}")
     try:
         selected_megapixels = (
-            min(generation["default_megapixels"], mode.max_megapixels)
-            if megapixels is None else megapixels
+            mode_default_megapixels(mode, generation) if megapixels is None else megapixels
         )
         models = {
             model_key: model_config["file"]
