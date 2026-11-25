@@ -465,7 +465,10 @@ class ExternalStrataTests(unittest.TestCase):
     def test_status_and_stop_report_but_do_not_manage_external_strata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = self._settings(Path(directory))
-            with patch("comfy_studio.services._strata_endpoint_matches", return_value=True):
+            with (
+                patch("comfy_studio.services._find_service_processes", return_value=[]),
+                patch("comfy_studio.services._strata_endpoint_matches", return_value=True),
+            ):
                 self.assertTrue(service_running(settings, "strata"))
                 self.assertIsNone(stop_service(settings, "strata"))
 
