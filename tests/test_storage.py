@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
@@ -135,13 +136,15 @@ class StorageTests(unittest.TestCase):
         self.store.set_conversation_mode(conversation_id, "edit")
         base_id = "1" * 32
         reference_id = "2" * 32
+        base_hash = hashlib.sha256(b"base").hexdigest()
+        reference_hash = hashlib.sha256(b"reference").hexdigest()
         self.store.create_source_image(
-            base_id, conversation_id, f"{base_id}.png", conversation_id,
-            "image/png", 100, 1920, 1080,
+            base_id, conversation_id, f"{base_hash}.png", conversation_id,
+            "image/png", base_hash, 100, 1920, 1080,
         )
         self.store.create_source_image(
-            reference_id, conversation_id, f"{reference_id}.jpg", conversation_id,
-            "image/jpeg", 200, 800, 1200,
+            reference_id, conversation_id, f"{reference_hash}.jpg", conversation_id,
+            "image/jpeg", reference_hash, 200, 800, 1200,
         )
 
         generation_id = self.store.create_generation(
@@ -152,14 +155,36 @@ class StorageTests(unittest.TestCase):
         generation = self.store.generation(generation_id)
         self.assertEqual(generation["image_mode"], "edit")
         self.assertEqual(generation["source_image_ids"], [base_id, reference_id])
-        self.assertTrue(self.store.source_images(conversation_id)[0]["in_use"])
+        self.assertEqual(
+            [image["id"] for image in self.store.source_images(conversation_id)],
+            [base_id, reference_id],
+        )
         with self.assertRaisesRegex(StorageError, "does not belong"):
             self.store.source_images_by_ids(other_conversation_id, [base_id])
-        with self.assertRaisesRegex(StorageError, "used by"):
-            self.store.delete_source_image(conversation_id, base_id)
 
-        reordered = self.store.reorder_source_images(conversation_id, [reference_id, base_id])
-        self.assertEqual([image["id"] for image in reordered], [reference_id, base_id])
+        removed = self.store.soft_delete_source_image(conversation_id, base_id)
+        self.assertIsNotNone(removed)
+        self.assertIsNone(self.store.source_image(conversation_id, base_id))
+        self.assertEqual(
+            [image["id"] for image in self.store.source_images(conversation_id)],
+            [reference_id],
+        )
+        self.assertEqual(self.store.generation(generation_id)["source_image_ids"],
+                         [base_id, reference_id])
+        with self.assertRaisesRegex(StorageError, "does not belong"):
+            self.store.source_images_by_ids(conversation_id, [base_id])
+
+        with self.assertRaisesRegex(StorageError, "must include every image"):
+            self.store.reorder_source_images(conversation_id, [reference_id, base_id])
+        restored = self.store.restore_source_image(conversation_id, base_id)
+        self.assertEqual(restored["id"], base_id)
+        self.assertEqual(restored["content_hash"], base_hash)
+        self.assertEqual(
+            [image["id"] for image in self.store.source_images(conversation_id)],
+            [reference_id, base_id],
+        )
+        reordered = self.store.reorder_source_images(conversation_id, [base_id, reference_id])
+        self.assertEqual([image["id"] for image in reordered], [base_id, reference_id])
         self.assertTrue(self.store.delete_conversation(conversation_id))
         self.assertEqual(self.store.source_images(conversation_id), [])
         self.assertIsNone(self.store.get_conversation(conversation_id))
@@ -169,6 +194,23 @@ class StorageTests(unittest.TestCase):
             self.store.messages("../outside")
         with self.assertRaisesRegex(StorageError, "does not exist"):
             self.store.append_exchange("0" * 32, "A prompt", "An answer")
+
+    def test_list_conversations_ignores_non_session_subdirectories(self) -> None:
+        conversation = self.store.create_conversation()
+        (self.store.session_root / "3d").mkdir()
+
+        with self.assertNoLogs("comfy_studio.storage", level="WARNING"):
+            conversations = self.store.list_conversations()
+
+        self.assertEqual([item["id"] for item in conversations], [conversation["id"]])
+
+    def test_list_conversations_rejects_invalid_directory_with_session_database(self) -> None:
+        invalid_session = self.store.session_root / "3d"
+        invalid_session.mkdir()
+        (invalid_session / "session.sqlite3").touch()
+
+        with self.assertRaisesRegex(StorageError, "invalid conversation id: 3d"):
+            self.store.list_conversations()
 
     def test_delete_cascades_records_and_clears_conversation_state(self) -> None:
         conversation_id = self.store.create_conversation()["id"]

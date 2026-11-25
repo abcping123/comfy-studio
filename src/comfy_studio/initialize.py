@@ -24,14 +24,19 @@ class InitializationError(RuntimeError):
 
 
 def _read_json(path: Path) -> dict[str, Any]:
+    data, _ = _read_json_contents(path)
+    return data
+
+
+def _read_json_contents(path: Path) -> tuple[dict[str, Any], bytes]:
     try:
-        with path.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-    except (OSError, json.JSONDecodeError) as error:
+        contents = path.read_bytes()
+        data = json.loads(contents.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InitializationError(f"cannot read JSON config {path}: {error}") from error
     if not isinstance(data, dict):
         raise InitializationError(f"JSON config root must be an object: {path}")
-    return data
+    return data, contents
 
 
 def _write_private_json(path: Path, data: dict[str, Any]) -> None:
@@ -60,6 +65,28 @@ def _replace_private_json(path: Path, data: dict[str, Any]) -> None:
     set_private_permissions(path)
 
 
+def _copy_private_file_if_missing(contents: bytes, path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(contents)
+            file.flush()
+            os.fsync(file.fileno())
+        set_private_permissions(temporary)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return
+        set_private_permissions(path)
+    except OSError as error:
+        raise InitializationError(
+            f"could not initialize Strata runtime config {path}: {error}"
+        ) from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _python_executable(root: Path) -> Path:
     if os.name == "nt":
         return root / ".venv" / "Scripts" / "python.exe"
@@ -81,10 +108,22 @@ def initialize_config(template_path: Path | None = None, output_path: Path | Non
     backend_definition = get_chat_backend(chat_backend)
     backend_config = data["chat_backends"][chat_backend]
     source_value = backend_config.get("source_config_json")
-    if backend_definition.setup_adapter == "strata" and (
+    runtime_path: Path | None = None
+    if backend_definition.setup_adapter == "strata":
+        runtime_path = Settings(destination.parent, data, chat_backend).path(
+            f"{chat_backend}.runtime_config"
+        )
+    if runtime_path is not None and runtime_path.is_symlink():
+        raise InitializationError(f"refusing to use a symbolic-link runtime config: {runtime_path}")
+    runtime_exists = runtime_path is not None and runtime_path.is_file()
+    if runtime_path is not None and runtime_path.exists() and not runtime_exists:
+        raise InitializationError(f"Strata runtime config is not a file: {runtime_path}")
+    if backend_definition.setup_adapter == "strata" and not runtime_exists and (
         not isinstance(source_value, str) or not source_value.strip()
     ):
-        raise InitializationError("strata.source_config_json must point to the existing Strata JSON config")
+        raise InitializationError(
+            "strata.source_config_json must be configured to initialize the Strata runtime config"
+        )
     if backend_definition.setup_adapter == "strata" and (strata_repo_path is None) != (comfyui_repo_path is None):
         raise InitializationError("both Strata and ComfyUI repository paths are required")
     if backend_definition.setup_adapter == "strata" and strata_repo_path is not None and comfyui_repo_path is not None:
@@ -106,16 +145,23 @@ def initialize_config(template_path: Path | None = None, output_path: Path | Non
                 checked = ", ".join(str(path) for path in strata_python_candidates)
                 raise InitializationError(f"Strata Python does not exist; checked: {checked}")
             strata_server = strata_root / "serve/server.py"
-            source_path = strata_root / Path(source_value).name
+            source_path = (
+                strata_root / Path(source_value).name
+                if not runtime_exists and isinstance(source_value, str)
+                else None
+            )
         comfy_python = _python_executable(comfyui_repo)
         comfy_main = comfyui_repo / "main.py"
-        required_files = (
+        required_files = [
             (strata_python, "Strata Python"),
             (strata_server, "Strata server script"),
-            (source_path, "Strata source config"),
+        ]
+        if source_path is not None:
+            required_files.append((source_path, "Strata source config"))
+        required_files.extend((
             (comfy_python, "ComfyUI Python"),
             (comfy_main, "ComfyUI main script"),
-        )
+        ))
         for path, label in required_files:
             if not path.is_file():
                 raise InitializationError(f"{label} does not exist: {path}")
@@ -127,8 +173,9 @@ def initialize_config(template_path: Path | None = None, output_path: Path | Non
         backend_config.update({
             "python": str(strata_python),
             "server_script": str(strata_server),
-            "source_config_json": str(source_path),
         })
+        if source_path is not None:
+            backend_config["source_config_json"] = str(source_path)
         data["comfyui"].update({
             "python": str(comfy_python),
             "main_script": str(comfy_main),
@@ -156,16 +203,27 @@ def initialize_config(template_path: Path | None = None, output_path: Path | Non
     data["comfyui"]["output_directory"] = session_root
 
     if backend_definition.setup_adapter == "strata":
-        configured_source = backend_config["source_config_json"]
-        source_path = Path(configured_source).expanduser()
-        if not source_path.is_absolute():
-            source_path = template.parent / source_path
-        source = _read_json(source_path)
+        source_description = runtime_path
+        if runtime_exists and runtime_path is not None:
+            source = _read_json(runtime_path)
+        else:
+            configured_source = backend_config.get("source_config_json")
+            if not isinstance(configured_source, str) or not configured_source.strip():
+                raise InitializationError(
+                    "strata.source_config_json must be configured to initialize the Strata runtime config"
+                )
+            source_path = Path(configured_source).expanduser()
+            if not source_path.is_absolute():
+                source_path = destination.parent / source_path
+            source_description = source_path
+            source = _read_json(source_path)
         api_key = source.get("api_key")
         if api_key is None or (isinstance(api_key, str) and not api_key.strip()):
             api_key = secrets.token_urlsafe(32)
         elif not isinstance(api_key, str):
-            raise InitializationError(f"the Strata JSON config has an invalid API key: {source_path}")
+            raise InitializationError(
+                f"the Strata JSON config has an invalid API key: {source_description}"
+            )
         backend_config["api_key"] = api_key
     if not data["app"].get("access_token"):
         data["app"]["access_token"] = secrets.token_urlsafe(32)
@@ -222,23 +280,8 @@ def _validate_single_slot_source(source: dict[str, Any], source_path: Path) -> N
 
 
 def prepare_runtime_files(settings: Settings) -> Path:
-    """Create the private Strata runtime JSON from config.json."""
+    """Seed the private Strata runtime JSON once, then preserve it as the source config."""
     strata = settings.backend_config("strata")
-    endpoint = urlsplit(strata["endpoint"])
-    source_path = settings.path("strata.source_config_json").resolve()
-    source = _read_json(source_path)
-    _validate_single_slot_source(source, source_path)
-
-    runtime = dict(source)
-    runtime.pop("env", None)
-    runtime.update({
-        "api_key": strata["api_key"],
-        "host": endpoint.hostname,
-        "port": endpoint.port,
-        "slot_save_path": str(settings.path("paths.runtime_root").resolve()),
-        "idle_unload_s": strata["idle_unload_s"],
-        "lazy_load": True,
-    })
     runtime_path = settings.path("strata.runtime_config")
     prepare_runtime_directories(settings)
     runtime_root = settings.path("paths.runtime_root")
@@ -248,10 +291,32 @@ def prepare_runtime_files(settings: Settings) -> Path:
         (runtime_root, runtime_path.parent, output_directory, input_directory),
     )
     for directory in directories:
+        if directory.is_symlink():
+            raise InitializationError(f"refusing to use a symbolic-link runtime directory: {directory}")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         set_private_permissions(directory, directory=True)
 
-    _replace_private_json(runtime_path, runtime)
+    if runtime_path.is_symlink():
+        raise InitializationError(f"refusing to use a symbolic-link runtime config: {runtime_path}")
+    if runtime_path.exists() and not runtime_path.is_file():
+        raise InitializationError(f"Strata runtime config is not a file: {runtime_path}")
+
+    if runtime_path.is_file():
+        runtime = _read_json(runtime_path)
+    else:
+        source_value = strata.get("source_config_json")
+        if not isinstance(source_value, str) or not source_value.strip():
+            raise InitializationError(
+                "strata.source_config_json must be configured to initialize the Strata runtime config"
+            )
+        source_path = settings.path("strata.source_config_json")
+        source, contents = _read_json_contents(source_path)
+        _validate_single_slot_source(source, source_path)
+        _copy_private_file_if_missing(contents, runtime_path)
+        runtime = _read_json(runtime_path)
+
+    _validate_single_slot_source(runtime, runtime_path)
+    set_private_permissions(runtime_path)
     return runtime_path
 
 

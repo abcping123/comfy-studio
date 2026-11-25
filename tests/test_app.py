@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import json
+import hashlib
 import io
+import json
+import shutil
 import tempfile
 import threading
 import unittest
@@ -13,6 +15,7 @@ from PIL import Image
 
 from comfy_studio.chat_backends import CHAT_BACKEND_REGISTRY, ChatBackendDefinition
 from comfy_studio.app import ChatRunManager, GenerationRunManager, create_app
+from comfy_studio.clients import BackendError
 from comfy_studio.modes import DEFAULT_MODE_ID, IMAGE_MODES
 from comfy_studio.orchestrator import ChatOutcome, GenerationOutcome
 from comfy_studio.settings import Settings
@@ -201,6 +204,7 @@ class AppTests(unittest.TestCase):
             generation_handoff="none",
         )
         settings = Settings(self.root, self.data, chat_backend=definition.id)
+        settings.data["chat_backends"][definition.id] = dict(settings.data["chat_backends"]["strata"])
         app = create_app(settings, self.store, AppStrata(), AppComfy(settings))
         headers = {"Authorization": f"Bearer {self.data['app']['access_token']}"}
 
@@ -227,6 +231,7 @@ class AppTests(unittest.TestCase):
                 })
             self.assertEqual(response.status_code, 200)
             self.assertEqual(chat.call_args.kwargs["reasoning_effort"], "ultra_low")
+            self.assertEqual(chat.call_args.kwargs["max_tokens"], 8192)
 
     def test_generate_stream_rejects_megapixels_outside_half_to_twenty(self) -> None:
         headers = {"Authorization": "Bearer test-access-token"}
@@ -243,6 +248,7 @@ class AppTests(unittest.TestCase):
     def test_chat_forwards_current_editor_state(self) -> None:
         headers = {"Authorization": "Bearer test-access-token"}
         conversation = self.client.post("/api/conversations", headers=headers).json()
+        self.settings.data["chat_backends"]["strata"]["max_tokens"] = 4096
         editor_state = {
             "current_image_prompt": "A red teapot on a dark green table.",
             "current_aspect_ratio": "16:9 (Widescreen)",
@@ -258,10 +264,13 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(chat.call_args.args[1:3], (conversation["id"], "Make the lighting warmer"))
-        self.assertEqual(chat.call_args.kwargs, {**editor_state, "reasoning_effort": "none"})
+        self.assertEqual(chat.call_args.kwargs, {
+            **editor_state, "max_tokens": 4096, "reasoning_effort": "none",
+        })
         self.assertEqual(response.json()["reasoning_content"], "Consider a wide composition.")
 
     def test_chat_stream_emits_server_sent_events(self) -> None:
+        self.settings.data["chat_backends"]["strata"]["max_tokens"] = 6144
         headers = {"Authorization": "Bearer test-access-token"}
         conversation = self.client.post("/api/conversations", headers=headers).json()
         editor_state = {
@@ -295,7 +304,7 @@ class AppTests(unittest.TestCase):
                            if line.startswith("data: ")]
         self.assertEqual(replayed_events, stream_events)
         self.assertEqual(chat.call_args.args[1:3], (conversation["id"], "Make the frame wider"))
-        self.assertEqual(chat.call_args.kwargs, editor_state)
+        self.assertEqual(chat.call_args.kwargs, {**editor_state, "max_tokens": 6144})
 
     def test_chat_run_can_be_replayed_after_a_subscriber_disconnects(self) -> None:
         manager = ChatRunManager()
@@ -348,6 +357,33 @@ class AppTests(unittest.TestCase):
         finally:
             release.set()
         self.assertEqual(len(list(run.stream())), 2)
+
+    def test_state_clears_selection_when_session_storage_is_missing(self) -> None:
+        headers = {"Authorization": f"Bearer {self.data['app']['access_token']}"}
+        missing = self.client.post("/api/conversations", headers=headers).json()
+        surviving = self.client.post("/api/conversations", headers=headers).json()
+        missing_id = missing["id"]
+        surviving_id = surviving["id"]
+        self.store.set_selected_conversation_id(missing_id)
+        self.store.set_active_conversation_id(surviving_id)
+        shutil.rmtree(self.settings.path("paths.session_root") / missing_id)
+
+        response = self.client.get("/api/state", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["active_conversation_id"])
+        self.assertEqual(
+            [conversation["id"] for conversation in response.json()["conversations"]],
+            [surviving_id],
+        )
+        self.assertEqual(
+            json.loads(
+                (self.settings.path("paths.runtime_root") / "state.json").read_text()
+            ),
+            {"active_conversation_id": surviving_id},
+        )
+        self.assertIsNone(self.store.selected_conversation_id())
+        self.assertEqual(self.store.active_conversation_id(), surviving_id)
 
     def test_state_exposes_active_generation_for_page_recovery(self) -> None:
         headers = {"Authorization": "Bearer test-access-token"}
@@ -427,7 +463,8 @@ class AppTests(unittest.TestCase):
             conversation["id"], "A red teapot", 42, "1:1 (Square)", 1.0,
             1024, 1024, "euler", "simple",
         )
-        filename = f"generation_{generation_id}.png"
+        image_bytes = b"generated PNG"
+        filename = f"{hashlib.sha256(image_bytes).hexdigest()}.png"
         self.store.update_generation(generation_id, "complete", image={
             "filename": filename, "subfolder": conversation["id"], "type": "output",
         })
@@ -435,7 +472,7 @@ class AppTests(unittest.TestCase):
             self.settings.path("paths.session_root") / conversation["id"] / filename
         )
         image_path.parent.mkdir(parents=True, exist_ok=True)
-        image_path.write_bytes(b"generated PNG")
+        image_path.write_bytes(image_bytes)
 
         response = self.client.get(f"/api/generations/{generation_id}/image", headers=headers)
 
@@ -464,16 +501,58 @@ class AppTests(unittest.TestCase):
         source_image = uploaded.json()
         self.assertEqual((source_image["width"], source_image["height"]), (4, 3))
         self.assertNotIn("filename", source_image)
-        self.assertEqual(source_image["in_use"], 0)
+        self.assertEqual(source_image["content_hash"], hashlib.sha256(image_bytes).hexdigest())
+        self.assertNotIn("in_use", source_image)
         stored = self.client.get(
             f"/api/conversations/{conversation_id}", headers=headers,
         ).json()
         self.assertEqual([item["id"] for item in stored["source_images"]], [source_image["id"]])
-        image_response = self.client.get(
-            f"{path}/{source_image['id']}", headers=headers,
-        )
+        with patch.object(
+            AppComfy,
+            "image",
+            side_effect=BackendError("ComfyUI", "image request failed"),
+        ) as comfy_image:
+            image_response = self.client.get(f"{path}/{source_image['id']}", headers=headers)
         self.assertEqual(image_response.status_code, 200)
         self.assertEqual(image_response.content, image_bytes)
+        missing_path = (
+            self.settings.path("paths.session_root") / conversation_id
+            / f"{source_image['content_hash']}.png"
+        )
+        missing_path.unlink()
+        missing_image = self.client.get(f"{path}/{source_image['id']}", headers=headers)
+        self.assertEqual(missing_image.status_code, 404)
+        comfy_image.assert_not_called()
+
+        duplicate = self.client.post(
+            path, content=image_bytes, headers={**headers, "Content-Type": "image/png"},
+        )
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(duplicate.json()["id"], source_image["id"])
+        self.assertEqual(len(self.store.source_images(conversation_id)), 1)
+
+        removed = self.client.delete(f"{path}/{source_image['id']}", headers=headers)
+        self.assertEqual(removed.status_code, 200)
+        self.assertTrue(
+            (self.settings.path("comfyui.input_directory") / conversation_id
+             / f"{source_image['content_hash']}.png").is_file()
+        )
+        self.assertEqual(
+            self.client.get(f"/api/conversations/{conversation_id}", headers=headers)
+            .json()["source_images"],
+            [],
+        )
+        self.assertEqual(
+            self.client.get(f"{path}/{source_image['id']}", headers=headers).status_code,
+            404,
+        )
+
+        restored = self.client.post(
+            path, content=image_bytes, headers={**headers, "Content-Type": "image/png"},
+        )
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(restored.json()["id"], source_image["id"])
+        self.assertEqual(len(self.store.source_images(conversation_id)), 1)
 
         other_response = self.client.post("/api/conversations", headers=headers)
         self.assertEqual(other_response.status_code, 200, other_response.text)

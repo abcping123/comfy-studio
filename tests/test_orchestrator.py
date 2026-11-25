@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -12,6 +14,9 @@ from comfy_studio.clients import BackendError
 from comfy_studio.orchestrator import CoordinationError, Orchestrator
 from comfy_studio.settings import Settings, load_config, project_root
 from comfy_studio.storage import ConversationStore, StorageError
+
+
+GENERATED_IMAGE_HASH = hashlib.sha256(b"generated image").hexdigest()
 
 
 class FakeStrata:
@@ -50,7 +55,7 @@ class FakeStrata:
         self.calls.append(("restore", filename))
         return {"n_restored": 20, "n_read": 14}
 
-    def chat(self, messages: list[dict], max_tokens: int = 2048,
+    def chat(self, messages: list[dict], max_tokens: int = 8192,
              reasoning_effort: str | None = None) -> dict:
         self.calls.append(("chat", messages))
         return {"choices": [{"message": {
@@ -62,7 +67,7 @@ class FakeStrata:
             "reasoning_content": self.reasoning_content,
         }}]}
 
-    def chat_stream(self, messages: list[dict], max_tokens: int = 2048,
+    def chat_stream(self, messages: list[dict], max_tokens: int = 8192,
                     reasoning_effort: str | None = None):
         self.reasoning_effort = reasoning_effort
         self.calls.append(("chat_stream", messages))
@@ -241,13 +246,16 @@ class OrchestratorTests(unittest.TestCase):
         source_directory = orchestrator._conversation_input_directory(conversation_id)
         source_directory.mkdir(parents=True, exist_ok=True)
         image_bytes = b"small-image-fixture"
-        (source_directory / "source.png").write_bytes(image_bytes)
+        content_hash = hashlib.sha256(image_bytes).hexdigest()
+        filename = f"{content_hash}.png"
+        (source_directory / filename).write_bytes(image_bytes)
         self.store.create_source_image(
             "a" * 32,
             conversation_id,
-            "source.png",
+            filename,
             conversation_id,
             "image/png",
+            content_hash,
             len(image_bytes),
             1,
             1,
@@ -298,7 +306,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(staging_path.exists())
 
         result = self.orchestrator.generate(conversation_id, "A red teapot on white", 42)
-        self.assertEqual(result.image["filename"], f"generation_{result.generation_id}.png")
+        self.assertEqual(result.image["filename"], f"{GENERATED_IMAGE_HASH}.png")
         self.assertFalse(self.strata.loaded)
 
         second = self.orchestrator.chat(conversation_id, "Make the light warmer")
@@ -368,7 +376,7 @@ class OrchestratorTests(unittest.TestCase):
 
         result = self.orchestrator.generate(conversation_id, "A red teapot", 42)
 
-        self.assertEqual(result.image["filename"], f"generation_{result.generation_id}.png")
+        self.assertEqual(result.image["filename"], f"{GENERATED_IMAGE_HASH}.png")
         self.assertEqual(self.comfy.calls.count("free"), 1)
         self.assertIsNone(result.cleanup_warning)
 
@@ -388,7 +396,7 @@ class OrchestratorTests(unittest.TestCase):
         result = self.orchestrator.generate(conversation_id, "A red teapot", 42,
                                             progress_callback=events.append)
 
-        self.assertEqual(result.image["filename"], f"generation_{result.generation_id}.png")
+        self.assertEqual(result.image["filename"], f"{GENERATED_IMAGE_HASH}.png")
         self.assertIn("submit", self.comfy.calls)
         self.assertTrue(any(event.get("message", "").startswith("Live progress unavailable")
                             for event in events))
@@ -405,7 +413,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(result.image["subfolder"], conversation_id)
         studio_image = (
             self.settings.path("paths.session_root") / conversation_id
-            / f"generation_{result.generation_id}.png"
+            / f"{GENERATED_IMAGE_HASH}.png"
         )
         comfy_image = self.settings.path("comfyui.output_directory") / conversation_id / "generated.png"
         self.assertTrue(studio_image.is_file())
@@ -428,6 +436,9 @@ class OrchestratorTests(unittest.TestCase):
         reference = self.orchestrator.upload_source_image(
             conversation_id, b"reference-image", "image/jpeg", ".jpg", 800, 1200,
         )
+        self.assertEqual(base["filename"], f"{hashlib.sha256(b'base-image').hexdigest()}.png")
+        self.assertEqual(reference["filename"],
+                         f"{hashlib.sha256(b'reference-image').hexdigest()}.jpg")
 
         result = self.orchestrator.generate(
             conversation_id, "Edit <Picture 1> using <Picture 2>.", 42,
@@ -444,23 +455,52 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(generation["image_mode"], "edit")
         self.assertEqual(generation["source_image_ids"], [base["id"], reference["id"]])
         self.assertEqual([name for name in self.comfy.calls if name == "upload"], ["upload", "upload"])
-        with self.assertRaisesRegex(StorageError, "used by a generation"):
-            self.orchestrator.delete_source_image(conversation_id, base["id"])
+        self.orchestrator.delete_source_image(conversation_id, base["id"])
         self.assertTrue(
             (self.settings.path("comfyui.input_directory") / conversation_id / base["filename"]).is_file()
         )
+        self.assertIsNone(self.store.source_image(conversation_id, base["id"]))
+        self.assertEqual(self.store.generation(result.generation_id)["source_image_ids"],
+                         [base["id"], reference["id"]])
 
-    def test_removing_unused_source_image_deletes_its_uploaded_file(self) -> None:
+    def test_reuploading_removed_source_restores_same_record_and_file(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
         source = self.orchestrator.upload_source_image(
             conversation_id, b"base-image", "image/png", ".png", 100, 100,
         )
         image_path = self.settings.path("comfyui.input_directory") / conversation_id / source["filename"]
 
+        duplicate = self.orchestrator.upload_source_image(
+            conversation_id, b"base-image", "image/png", ".png", 100, 100,
+        )
+        self.assertEqual(duplicate["id"], source["id"])
+        self.assertEqual(self.comfy.calls.count("upload"), 1)
+
         self.orchestrator.delete_source_image(conversation_id, source["id"])
 
-        self.assertFalse(image_path.exists())
+        self.assertTrue(image_path.is_file())
         self.assertIsNone(self.store.source_image(conversation_id, source["id"]))
+        self.assertEqual(self.store.source_image_by_hash(conversation_id, source["content_hash"])["id"],
+                         source["id"])
+
+        restored = self.orchestrator.upload_source_image(
+            conversation_id, b"base-image", "image/png", ".png", 100, 100,
+        )
+        self.assertEqual(restored["id"], source["id"])
+        self.assertEqual([image["id"] for image in self.store.source_images(conversation_id)],
+                         [source["id"]])
+        self.assertEqual(self.comfy.calls.count("upload"), 1)
+
+    def test_generations_with_identical_output_share_hash_named_session_file(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+
+        first = self.orchestrator.generate(conversation_id, "A red teapot", 42)
+        second = self.orchestrator.generate(conversation_id, "A red teapot", 42)
+
+        self.assertEqual(first.image["filename"], f"{GENERATED_IMAGE_HASH}.png")
+        self.assertEqual(second.image["filename"], first.image["filename"])
+        session_directory = self.settings.path("paths.session_root") / conversation_id
+        self.assertEqual(len(list(session_directory.glob("*.png"))), 1)
 
     def test_edit_chat_forwards_ordered_images_and_keeps_source_ratio(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
@@ -488,10 +528,9 @@ class OrchestratorTests(unittest.TestCase):
         image_urls = [
             part["image_url"]["url"] for part in message_content if part["type"] == "image_url"
         ]
-        input_directory = self.settings.path("comfyui.input_directory")
         self.assertEqual(image_urls, [
-            str((input_directory / conversation_id / base["filename"]).resolve()),
-            str((input_directory / conversation_id / reference["filename"]).resolve()),
+            "data:image/png;base64," + base64.b64encode(b"base-image").decode("ascii"),
+            "data:image/jpeg;base64," + base64.b64encode(b"reference-image").decode("ascii"),
         ])
         self.assertNotIn("不会收到上传图片的像素内容", messages[0]["content"])
 
@@ -517,7 +556,7 @@ class OrchestratorTests(unittest.TestCase):
         )
         source_path = self.settings.path("comfyui.input_directory") / conversation_id / source["filename"]
         session_directory = self.settings.path("paths.session_root") / conversation_id
-        output_image = session_directory / f"generation_{result.generation_id}.png"
+        output_image = session_directory / f"{GENERATED_IMAGE_HASH}.png"
         archive_image = next(self.settings.path("paths.output_archive").glob("*.png"))
 
         warning = self.orchestrator.delete_conversation(conversation_id)

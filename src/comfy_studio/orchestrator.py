@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import re
 import threading
 import time
 import json
@@ -138,10 +140,9 @@ class Orchestrator:
     def _studio_output_directory(self, conversation_id: str) -> Path:
         return self._session_asset_directory(conversation_id)
 
-    def _relocate_generated_image(self, conversation_id: str, generation_id: str,
+    def _relocate_generated_image(self, conversation_id: str,
                                   image: dict[str, str]) -> dict[str, str]:
         conversation_id = self.store.validate_id(conversation_id)
-        generation_id = self.store.validate_id(generation_id)
         filename = image.get("filename", "")
         if (image.get("subfolder") != conversation_id or image.get("type") != "output"
                 or not filename or Path(filename).name != filename or "\\" in filename
@@ -156,14 +157,38 @@ class Orchestrator:
         if source_path.parent != source_directory or not source_path.is_file():
             raise CoordinationError("ComfyUI generated image is missing or unsafe")
 
-        destination_path = source_directory / f"generation_{generation_id}.png"
-        if destination_path.exists() or destination_path.is_symlink():
-            raise CoordinationError("generated image destination already exists")
-        try:
-            os.link(source_path, destination_path)
-            source_path.unlink()
-        except OSError as error:
-            raise CoordinationError(f"could not store the generated image in its session: {error}") from error
+        content_hash = self._sha256_file(source_path)
+        destination_path = source_directory / f"{content_hash}.png"
+        if destination_path.is_symlink():
+            raise CoordinationError("refusing to overwrite a symbolic-link generated image")
+        if destination_path.exists():
+            if (not destination_path.is_file()
+                    or self._sha256_file(destination_path) != content_hash):
+                raise CoordinationError("generated image hash path contains different content")
+            try:
+                source_path.unlink()
+            except OSError as error:
+                raise CoordinationError(
+                    f"could not remove the duplicate generated image: {error}"
+                ) from error
+        else:
+            try:
+                os.link(source_path, destination_path)
+                source_path.unlink()
+            except FileExistsError:
+                if (destination_path.is_symlink() or not destination_path.is_file()
+                        or self._sha256_file(destination_path) != content_hash):
+                    raise CoordinationError("generated image hash path contains different content")
+                try:
+                    source_path.unlink()
+                except OSError as error:
+                    raise CoordinationError(
+                        f"could not remove the duplicate generated image: {error}"
+                    ) from error
+            except OSError as error:
+                raise CoordinationError(
+                    f"could not store the generated image in its session: {error}"
+                ) from error
         self._archive_generated_image(destination_path)
         return {"filename": destination_path.name, "subfolder": conversation_id, "type": "output"}
 
@@ -211,7 +236,7 @@ class Orchestrator:
         filename = generation.get("filename")
         if (generation.get("subfolder") != conversation_id or generation.get("image_type") != "output"
                 or not isinstance(filename, str) or not filename or Path(filename).name != filename
-                or "\\" in filename or Path(filename).suffix.lower() != ".png"):
+                or "\\" in filename or re.fullmatch(r"[0-9a-f]{64}\.png", filename) is None):
             raise CoordinationError("generated image metadata has an invalid path")
         directory = self._studio_output_directory(conversation_id)
         image_path = directory / filename
@@ -225,6 +250,39 @@ class Orchestrator:
             raise CoordinationError("generated image file is missing or unsafe")
         return image_path
 
+    def source_image_path(self, conversation_id: str,
+                          source_image: dict[str, Any]) -> Path:
+        conversation_id = self.store.validate_id(conversation_id)
+        content_type = source_image.get("content_type")
+        extension = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/webp": ".webp",
+        }.get(content_type) if isinstance(content_type, str) else None
+        content_hash = source_image.get("content_hash")
+        filename = source_image.get("filename")
+        if (extension is None or not isinstance(content_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", content_hash) is None
+                or filename != f"{content_hash}{extension}"
+                or source_image.get("subfolder") != conversation_id):
+            raise CoordinationError("source image metadata has an invalid path")
+
+        try:
+            directory = self._conversation_input_directory(conversation_id)
+            if directory.is_symlink():
+                raise CoordinationError("refusing to access a symbolic-link source image directory")
+            image_path = self._source_image_file(conversation_id, filename)
+            session_root = self.settings.path("paths.session_root").resolve(strict=True)
+            resolved_directory = directory.resolve(strict=True)
+            resolved_image_path = image_path.resolve(strict=True)
+        except OSError as error:
+            raise CoordinationError("source image file is missing") from error
+        if (resolved_directory.parent != session_root
+                or resolved_image_path.parent != resolved_directory
+                or not resolved_image_path.is_file()):
+            raise CoordinationError("source image file is missing or unsafe")
+        return resolved_image_path
+
     def _source_image_file(self, conversation_id: str, filename: str) -> Path:
         directory = self._conversation_input_directory(conversation_id)
         if filename in {"", ".", ".."} or Path(filename).name != filename or "\\" in filename:
@@ -234,6 +292,39 @@ class Orchestrator:
             raise CoordinationError("refusing to access a symbolic-link source image")
         return path
 
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as image_file:
+                for chunk in iter(lambda: image_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as error:
+            raise CoordinationError(f"could not read image for hashing: {error}") from error
+        return digest.hexdigest()
+
+    def _ensure_source_image_file(self, conversation_id: str, content: bytes,
+                                  content_type: str, extension: str,
+                                  content_hash: str) -> tuple[Path, bool]:
+        filename = f"{content_hash}{extension}"
+        image_path = self._source_image_file(conversation_id, filename)
+        if image_path.exists():
+            if not image_path.is_file() or self._sha256_file(image_path) != content_hash:
+                raise CoordinationError("source image hash path contains different content")
+            return image_path, False
+
+        response = self.comfy.upload_image(filename, content, content_type, conversation_id)
+        uploaded_name = response.get("name")
+        uploaded_subfolder = response.get("subfolder")
+        uploaded_type = response.get("type")
+        if (uploaded_name != filename or uploaded_subfolder != conversation_id
+                or uploaded_type != "input"):
+            raise CoordinationError("ComfyUI returned an invalid source image path")
+        image_path = self._source_image_file(conversation_id, filename)
+        if not image_path.is_file() or self._sha256_file(image_path) != content_hash:
+            raise CoordinationError("ComfyUI did not store the source image at its hash path")
+        return image_path, True
+
     def upload_source_image(self, conversation_id: str, content: bytes, content_type: str,
                             extension: str, width: int, height: int) -> dict[str, Any]:
         conversation_id = self.store.validate_id(conversation_id)
@@ -241,35 +332,47 @@ class Orchestrator:
             raise StorageError("conversation does not exist")
         if extension not in {".png", ".jpg", ".webp"}:
             raise CoordinationError("unsupported source image extension")
+        content_hash = hashlib.sha256(content).hexdigest()
         self._enter()
         try:
+            existing = self.store.source_image_by_hash(conversation_id, content_hash)
+            if existing is not None:
+                if (existing["removed_at"] is not None
+                        and len(self.store.source_images(conversation_id)) >= MAX_SOURCE_IMAGES):
+                    raise CoordinationError(
+                        f"a conversation can have at most {MAX_SOURCE_IMAGES} source images"
+                    )
+                self._ensure_source_image_file(
+                    conversation_id, content, content_type, extension, content_hash,
+                )
+                if existing["removed_at"] is None:
+                    return existing
+                restored = self.store.restore_source_image(conversation_id, existing["id"])
+                if restored is None:
+                    raise StorageError("source image could not be restored")
+                return restored
+
             if len(self.store.source_images(conversation_id)) >= MAX_SOURCE_IMAGES:
                 raise CoordinationError(
                     f"a conversation can have at most {MAX_SOURCE_IMAGES} source images"
                 )
             source_image_id = secrets.token_hex(16)
-            response = self.comfy.upload_image(
-                f"{source_image_id}{extension}", content, content_type, conversation_id,
+            image_path, uploaded = self._ensure_source_image_file(
+                conversation_id, content, content_type, extension, content_hash,
             )
-            filename = response.get("name")
-            subfolder = response.get("subfolder")
-            image_type = response.get("type")
-            if (not isinstance(filename, str) or not filename or Path(filename).name != filename
-                    or "\\" in filename or subfolder != conversation_id or image_type != "input"):
-                raise CoordinationError("ComfyUI returned an invalid source image path")
-            file_path = self._source_image_file(conversation_id, filename)
             try:
                 return self.store.create_source_image(
-                    source_image_id, conversation_id, filename, subfolder,
-                    content_type, len(content), width, height,
+                    source_image_id, conversation_id, image_path.name, conversation_id,
+                    content_type, content_hash, len(content), width, height,
                 )
             except (StorageError, sqlite3.Error) as error:
-                try:
-                    file_path.unlink(missing_ok=True)
-                except OSError as cleanup_error:
-                    raise CoordinationError(
-                        f"source image could not be recorded or removed: {cleanup_error}"
-                    ) from cleanup_error
+                if uploaded:
+                    try:
+                        image_path.unlink(missing_ok=True)
+                    except OSError as cleanup_error:
+                        raise CoordinationError(
+                            f"source image could not be recorded or removed: {cleanup_error}"
+                        ) from cleanup_error
                 raise
         finally:
             self._leave()
@@ -291,41 +394,10 @@ class Orchestrator:
 
     def delete_source_image(self, conversation_id: str, source_image_id: str) -> None:
         conversation_id = self.store.validate_id(conversation_id)
-        source_image = self.store.source_image(conversation_id, source_image_id)
-        if source_image is None:
-            raise StorageError("source image does not exist in this conversation")
         self._enter()
-        staged_path: Path | None = None
         try:
-            image_path = self._source_image_file(conversation_id, source_image["filename"])
-            if image_path.exists():
-                staged_path = image_path.with_name(f".{image_path.name}.{source_image_id}.deleting")
-                if staged_path.exists():
-                    raise CoordinationError("a source image cleanup is already in progress")
-                try:
-                    os.replace(image_path, staged_path)
-                except OSError as error:
-                    raise CoordinationError(f"could not stage source image for removal: {error}") from error
-            try:
-                deleted = self.store.delete_source_image(conversation_id, source_image_id)
-            except (StorageError, sqlite3.Error) as error:
-                if staged_path is not None and staged_path.exists():
-                    try:
-                        os.replace(staged_path, image_path)
-                    except OSError as rollback_error:
-                        raise CoordinationError(
-                            f"source image record was not removed and its file could not be restored: {rollback_error}"
-                        ) from rollback_error
-                raise error
-            if deleted is None:
+            if self.store.soft_delete_source_image(conversation_id, source_image_id) is None:
                 raise StorageError("source image does not exist in this conversation")
-            if staged_path is not None:
-                try:
-                    staged_path.unlink(missing_ok=True)
-                except OSError as error:
-                    raise CoordinationError(
-                        f"source image was removed from Studio, but its file could not be erased: {error}"
-                    ) from error
         finally:
             self._leave()
 
@@ -645,27 +717,25 @@ class Orchestrator:
                     raise CoordinationError(
                         f"source image file could not be resolved: {image['filename']}"
                     ) from error
-                image_url = str(resolved_image_path)
-                if backend.image_transport == "data-url":
-                    image_types = {
-                        ".png": "image/png",
-                        ".jpg": "image/jpeg",
-                        ".jpeg": "image/jpeg",
-                        ".webp": "image/webp",
-                    }
-                    image_type = image_types.get(resolved_image_path.suffix.lower())
-                    if image_type is None:
-                        raise CoordinationError(
-                            f"source image format is unsupported by {backend.label}: "
-                            f"{image['filename']}"
-                        )
-                    try:
-                        encoded_image = base64.b64encode(resolved_image_path.read_bytes()).decode("ascii")
-                    except OSError as error:
-                        raise CoordinationError(
-                            f"source image file could not be read: {image['filename']}"
-                        ) from error
-                    image_url = f"data:{image_type};base64,{encoded_image}"
+                image_types = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                }
+                image_type = image_types.get(resolved_image_path.suffix.lower())
+                if image_type is None:
+                    raise CoordinationError(
+                        f"source image format is unsupported by {backend.label}: "
+                        f"{image['filename']}"
+                    )
+                try:
+                    encoded_image = base64.b64encode(resolved_image_path.read_bytes()).decode("ascii")
+                except OSError as error:
+                    raise CoordinationError(
+                        f"source image file could not be read: {image['filename']}"
+                    ) from error
+                image_url = f"data:{image_type};base64,{encoded_image}"
                 content_parts.append({
                     "type": "image_url",
                     "image_url": {"url": image_url},
@@ -705,7 +775,7 @@ class Orchestrator:
                                warning=f"Reply received, but the conversation context was not saved: {error}",
                                reasoning_content=reasoning_content)
 
-    def chat(self, conversation_id: str, user_text: str, max_tokens: int = 2048, *,
+    def chat(self, conversation_id: str, user_text: str, max_tokens: int = 8192, *,
              current_image_prompt: str | None = None,
              current_aspect_ratio: str | None = None,
              reasoning_effort: str | None = None) -> ChatOutcome:
@@ -721,7 +791,7 @@ class Orchestrator:
         finally:
             self._leave()
 
-    def chat_stream(self, conversation_id: str, user_text: str, max_tokens: int = 2048, *,
+    def chat_stream(self, conversation_id: str, user_text: str, max_tokens: int = 8192, *,
                     current_image_prompt: str | None = None,
                     current_aspect_ratio: str | None = None,
                     reasoning_effort: str | None = None) -> Iterator[dict[str, Any]]:
@@ -1043,7 +1113,7 @@ class Orchestrator:
                 "type": "phase", "message": "Saving generated image to the session and output archive",
             })
             completed_image = self._relocate_generated_image(
-                conversation_id, generation_id, comfy_image,
+                conversation_id, comfy_image,
             )
             self.store.update_generation(generation_id, "complete", image=completed_image)
         except Exception as error:

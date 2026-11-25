@@ -20,14 +20,11 @@ from .permissions import set_private_permissions
 
 _CONVERSATION_ID = re.compile(r"^[0-9a-f]{32}$")
 _SOURCE_IMAGE_ID = re.compile(r"^[0-9a-f]{32}$")
+_CONTENT_HASH = re.compile(r"^[0-9a-f]{64}$")
 
 
 class StorageError(RuntimeError):
     """Persistent app state is missing or invalid."""
-
-
-class StorageConflictError(StorageError):
-    """A persistent operation conflicts with an existing relationship."""
 
 
 def _now() -> str:
@@ -170,11 +167,13 @@ class ConversationStore:
                     filename TEXT NOT NULL,
                     subfolder TEXT NOT NULL,
                     content_type TEXT NOT NULL,
+                    content_hash TEXT NOT NULL UNIQUE,
                     size_bytes INTEGER NOT NULL,
                     width INTEGER NOT NULL,
                     height INTEGER NOT NULL,
                     position INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    removed_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS source_images_conversation_id_position
                     ON source_images(conversation_id, position);
@@ -265,9 +264,15 @@ class ConversationStore:
             if entry.is_symlink() or not entry.is_dir():
                 raise StorageError(f"unexpected file in session root: {entry.name}")
             try:
-                ids.append(self.validate_id(entry.name))
+                conversation_id = self.validate_id(entry.name)
             except StorageError as error:
-                raise StorageError(f"unexpected directory in session root: {entry.name}") from error
+                database_path = entry / "session.sqlite3"
+                if database_path.exists() or database_path.is_symlink():
+                    raise StorageError(
+                        f"session directory has an invalid conversation id: {entry.name}"
+                    ) from error
+                continue
+            ids.append(conversation_id)
         return ids
 
     def messages(self, conversation_id: str) -> list[dict[str, str]]:
@@ -402,13 +407,16 @@ class ConversationStore:
 
     def _state_value(self, key: str) -> str | None:
         with self._lock:
-            value = self._read_state().get(key)
-            if value is None:
-                return None
-            conversation_id = self.validate_id(value)
-            if self.database_path(conversation_id) is None:
-                raise StorageError(f"runtime state references a missing session: {conversation_id}")
-            return conversation_id
+            state = self._read_state()
+            changed = False
+            for state_key in ("active_conversation_id", "selected_conversation_id"):
+                conversation_id = state.get(state_key)
+                if conversation_id is not None and self.database_path(conversation_id) is None:
+                    state.pop(state_key)
+                    changed = True
+            if changed:
+                self._write_state(state)
+            return state.get(key)
 
     def _set_state_value(self, key: str, conversation_id: str | None) -> None:
         if conversation_id is not None:
@@ -456,18 +464,21 @@ class ConversationStore:
         return source_image_id
 
     def create_source_image(self, source_image_id: str, conversation_id: str, filename: str,
-                            subfolder: str, content_type: str, size_bytes: int,
-                            width: int, height: int) -> dict[str, Any]:
+                            subfolder: str, content_type: str, content_hash: str,
+                            size_bytes: int, width: int, height: int) -> dict[str, Any]:
         source_image_id = self.validate_source_image_id(source_image_id)
         conversation_id = self.validate_id(conversation_id)
-        if (not isinstance(filename, str) or filename in {"", ".", ".."} or Path(filename).name != filename
-                or "\\" in filename or subfolder != conversation_id):
-            raise StorageError("invalid ComfyUI source image path")
+        if not isinstance(content_hash, str) or not _CONTENT_HASH.fullmatch(content_hash):
+            raise StorageError("invalid source image content hash")
         if (not isinstance(content_type, str) or not content_type.startswith("image/")
                 or isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes <= 0
                 or isinstance(width, bool) or not isinstance(width, int) or width <= 0
                 or isinstance(height, bool) or not isinstance(height, int) or height <= 0):
             raise StorageError("invalid source image metadata")
+        extension = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(content_type)
+        if (extension is None or filename != f"{content_hash}{extension}"
+                or subfolder != conversation_id):
+            raise StorageError("invalid ComfyUI source image path")
         with self._lock, self._connect(conversation_id) as connection:
             conversation = connection.execute(
                 "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,),
@@ -475,14 +486,16 @@ class ConversationStore:
             if conversation is None:
                 raise StorageError("conversation does not exist")
             position = connection.execute(
-                "SELECT coalesce(max(position), -1) + 1 FROM source_images WHERE conversation_id = ?",
+                "SELECT coalesce(max(position), -1) + 1 FROM source_images "
+                "WHERE conversation_id = ? AND removed_at IS NULL",
                 (conversation_id,),
             ).fetchone()[0]
             connection.execute(
                 "INSERT INTO source_images "
-                "(id, conversation_id, filename, subfolder, content_type, size_bytes, width, height, position, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (source_image_id, conversation_id, filename, subfolder, content_type,
+                "(id, conversation_id, filename, subfolder, content_type, content_hash, size_bytes, "
+                "width, height, position, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (source_image_id, conversation_id, filename, subfolder, content_type, content_hash,
                  size_bytes, width, height, position, _now()),
             )
         return self.source_image(conversation_id, source_image_id) or {}
@@ -493,9 +506,8 @@ class ConversationStore:
             return []
         with self._lock, self._connect(conversation_id) as connection:
             rows = connection.execute(
-                "SELECT s.*, EXISTS (SELECT 1 FROM generation_sources g "
-                "WHERE g.source_image_id = s.id) AS in_use FROM source_images s "
-                "WHERE s.conversation_id = ? ORDER BY s.position, s.created_at",
+                "SELECT * FROM source_images "
+                "WHERE conversation_id = ? AND removed_at IS NULL ORDER BY position, created_at",
                 (conversation_id,),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -507,12 +519,49 @@ class ConversationStore:
             return None
         with self._lock, self._connect(conversation_id) as connection:
             row = connection.execute(
-                "SELECT s.*, EXISTS (SELECT 1 FROM generation_sources g "
-                "WHERE g.source_image_id = s.id) AS in_use FROM source_images s "
-                "WHERE s.id = ? AND s.conversation_id = ?",
+                "SELECT * FROM source_images "
+                "WHERE id = ? AND conversation_id = ? AND removed_at IS NULL",
                 (source_image_id, conversation_id),
             ).fetchone()
         return dict(row) if row else None
+
+    def source_image_by_hash(self, conversation_id: str, content_hash: str) -> dict[str, Any] | None:
+        conversation_id = self.validate_id(conversation_id)
+        if not isinstance(content_hash, str) or not _CONTENT_HASH.fullmatch(content_hash):
+            raise StorageError("invalid source image content hash")
+        if self.database_path(conversation_id) is None:
+            return None
+        with self._lock, self._connect(conversation_id) as connection:
+            row = connection.execute(
+                "SELECT * FROM source_images WHERE conversation_id = ? AND content_hash = ?",
+                (conversation_id, content_hash),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def restore_source_image(self, conversation_id: str, source_image_id: str) -> dict[str, Any] | None:
+        conversation_id = self.validate_id(conversation_id)
+        source_image_id = self.validate_source_image_id(source_image_id)
+        if self.database_path(conversation_id) is None:
+            return None
+        with self._lock, self._connect(conversation_id) as connection:
+            row = connection.execute(
+                "SELECT id, removed_at FROM source_images WHERE id = ? AND conversation_id = ?",
+                (source_image_id, conversation_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["removed_at"] is not None:
+                position = connection.execute(
+                    "SELECT coalesce(max(position), -1) + 1 FROM source_images "
+                    "WHERE conversation_id = ? AND removed_at IS NULL",
+                    (conversation_id,),
+                ).fetchone()[0]
+                connection.execute(
+                    "UPDATE source_images SET removed_at = NULL, position = ? "
+                    "WHERE id = ? AND conversation_id = ?",
+                    (position, source_image_id, conversation_id),
+                )
+        return self.source_image(conversation_id, source_image_id)
 
     def source_images_by_ids(self, conversation_id: str,
                              source_image_ids: list[str]) -> list[dict[str, Any]]:
@@ -529,7 +578,8 @@ class ConversationStore:
         placeholders = ",".join("?" for _ in ids)
         with self._lock, self._connect(conversation_id) as connection:
             rows = connection.execute(
-                f"SELECT * FROM source_images WHERE conversation_id = ? AND id IN ({placeholders})",
+                f"SELECT * FROM source_images WHERE conversation_id = ? "
+                f"AND removed_at IS NULL AND id IN ({placeholders})",
                 (conversation_id, *ids),
             ).fetchall()
         records = {row["id"]: dict(row) for row in rows}
@@ -551,7 +601,8 @@ class ConversationStore:
             if conversation is None:
                 raise StorageError("conversation does not exist")
             rows = connection.execute(
-                "SELECT id FROM source_images WHERE conversation_id = ? ORDER BY position, created_at",
+                "SELECT id FROM source_images WHERE conversation_id = ? AND removed_at IS NULL "
+                "ORDER BY position, created_at",
                 (conversation_id,),
             ).fetchall()
             current_ids = [row["id"] for row in rows]
@@ -563,27 +614,26 @@ class ConversationStore:
             )
         return self.source_images(conversation_id)
 
-    def delete_source_image(self, conversation_id: str, source_image_id: str) -> dict[str, Any] | None:
+    def soft_delete_source_image(self, conversation_id: str,
+                                 source_image_id: str) -> dict[str, Any] | None:
         conversation_id = self.validate_id(conversation_id)
         source_image_id = self.validate_source_image_id(source_image_id)
         if self.database_path(conversation_id) is None:
             return None
-        try:
-            with self._lock, self._connect(conversation_id) as connection:
-                row = connection.execute(
-                    "SELECT * FROM source_images WHERE id = ? AND conversation_id = ?",
-                    (source_image_id, conversation_id),
-                ).fetchone()
-                if row is None:
-                    return None
-                record = dict(row)
-                connection.execute(
-                    "DELETE FROM source_images WHERE id = ? AND conversation_id = ?",
-                    (source_image_id, conversation_id),
-                )
-        except sqlite3.IntegrityError as error:
-            raise StorageConflictError("source image is used by a generation") from error
-        return record
+        removed_at = _now()
+        with self._lock, self._connect(conversation_id) as connection:
+            cursor = connection.execute(
+                "UPDATE source_images SET removed_at = ? "
+                "WHERE id = ? AND conversation_id = ? AND removed_at IS NULL",
+                (removed_at, source_image_id, conversation_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM source_images WHERE id = ? AND conversation_id = ?",
+                (source_image_id, conversation_id),
+            ).fetchone()
+        return dict(row) if row else None
 
     def delete_conversation(self, conversation_id: str) -> bool:
         conversation_id = self.validate_id(conversation_id)

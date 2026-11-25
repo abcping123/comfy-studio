@@ -300,13 +300,13 @@ class InitializeTests(unittest.TestCase):
                 "http://127.0.0.1:8080",
             )
 
-    def test_runtime_files_are_derived_from_json_and_exclude_qwen35(self) -> None:
+    def test_runtime_config_is_copied_exactly_once_and_kept_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"HOME": directory, "USERPROFILE": directory}
         ):
             root = Path(directory)
             source_path = root / "strata-source.json"
-            source_path.write_text(json.dumps({
+            source_contents = json.dumps({
                 "api_key": "source-key",
                 "min_free_vram_mib": 4096,
                 "args": ["--max-context", "32768"],
@@ -317,7 +317,8 @@ class InitializeTests(unittest.TestCase):
                     "gpu": True,
                 },
                 "env": {"SHOULD_NOT_COPY": "value"},
-            }), encoding="utf-8")
+            }, indent=2).encode("utf-8")
+            source_path.write_bytes(source_contents)
             data = sample_config()
             data["chat_backends"]["strata"]["source_config_json"] = "~/strata-source.json"
             data["chat_backends"]["strata"]["api_key"] = "private-key"
@@ -333,11 +334,9 @@ class InitializeTests(unittest.TestCase):
             self.assertTrue((root / "output").is_dir())
             self.assertTrue(settings.path("comfyui.output_directory").is_dir())
             self.assertTrue(settings.path("comfyui.input_directory").is_dir())
+            self.assertEqual(runtime_path.read_bytes(), source_contents)
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-            self.assertEqual(runtime["api_key"], "private-key")
-            self.assertEqual(runtime["host"], "127.0.0.1")
-            self.assertEqual(runtime["port"], 8080)
-            self.assertEqual(runtime["slot_save_path"], str(root / "temp" / "runtime"))
+            self.assertEqual(runtime["api_key"], "source-key")
             self.assertEqual(runtime["min_free_vram_mib"], 4096)
             self.assertEqual(runtime["vision"], {
                 "exe": "strata-vision",
@@ -345,13 +344,93 @@ class InitializeTests(unittest.TestCase):
                 "model": "model.gguf",
                 "gpu": True,
             })
-            self.assertNotIn("env", runtime)
+            self.assertEqual(runtime["env"], {"SHOULD_NOT_COPY": "value"})
+            self.assertNotIn("host", runtime)
+            self.assertNotIn("slot_save_path", runtime)
             _assert_private_file(self, runtime_path)
             self.assertFalse((root / "config" / "model_paths.yaml").exists())
             self.assertTrue(
                 data["generation_modes"]["text-to-image"]["models"]["text_encoder"]["file"]
                 .startswith("qwen3vl_")
             )
+
+            source_path.unlink()
+            prepare_runtime_files(settings)
+            self.assertEqual(runtime_path.read_bytes(), source_contents)
+
+    def test_existing_runtime_config_does_not_depend_on_or_overwrite_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime_path = root / "temp" / "runtime" / "strata_runtime.json"
+            runtime_path.parent.mkdir(parents=True)
+            runtime_contents = b'{\n  "args": [],\n  "api_key": "runtime-key"\n}\n'
+            runtime_path.write_bytes(runtime_contents)
+
+            data = sample_config()
+            data["chat_backends"]["strata"].pop("source_config_json")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(data), encoding="utf-8")
+            settings = load_config(config_path)
+
+            self.assertEqual(prepare_runtime_files(settings), runtime_path)
+            self.assertEqual(runtime_path.read_bytes(), runtime_contents)
+
+    def test_invalid_existing_runtime_config_is_not_reseeded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "strata-source.json"
+            source_path.write_text(json.dumps({"args": []}), encoding="utf-8")
+            runtime_path = root / "temp" / "runtime" / "strata_runtime.json"
+            runtime_path.parent.mkdir(parents=True)
+            runtime_contents = b"{invalid json"
+            runtime_path.write_bytes(runtime_contents)
+
+            data = sample_config()
+            data["chat_backends"]["strata"]["source_config_json"] = str(source_path)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(data), encoding="utf-8")
+            settings = load_config(config_path)
+
+            with self.assertRaisesRegex(InitializationError, "cannot read JSON config"):
+                prepare_runtime_files(settings)
+            self.assertEqual(runtime_path.read_bytes(), runtime_contents)
+
+    def test_initialization_uses_existing_runtime_without_source_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            strata_repo = root / "Strata"
+            comfyui_repo = root / "ComfyUI"
+            for path in (_venv_python(strata_repo), _venv_python(comfyui_repo)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("python", encoding="utf-8")
+                if os.name != "nt":
+                    path.chmod(0o755)
+            strata_server = strata_repo / "serve/server.py"
+            strata_server.parent.mkdir(parents=True)
+            strata_server.write_text("", encoding="utf-8")
+            (comfyui_repo / "main.py").write_text("", encoding="utf-8")
+
+            runtime_path = root / "temp" / "runtime" / "strata_runtime.json"
+            runtime_path.parent.mkdir(parents=True)
+            runtime_path.write_text(
+                json.dumps({"api_key": "runtime-key", "args": []}),
+                encoding="utf-8",
+            )
+            template = sample_config()
+            template["chat_backends"]["strata"].pop("source_config_json")
+            template_path = root / "config.example.json"
+            template_path.write_text(json.dumps(template), encoding="utf-8")
+
+            destination = initialize_config(
+                template_path,
+                root / "config.json",
+                strata_repo_path=strata_repo,
+                comfyui_repo_path=comfyui_repo,
+            )
+
+            active = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(active["chat_backends"]["strata"]["api_key"], "runtime-key")
+            self.assertNotIn("source_config_json", active["chat_backends"]["strata"])
 
     def test_runtime_rejects_strata_batch_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

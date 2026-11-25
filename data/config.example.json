@@ -1,5 +1,5 @@
 {
-  "schema_version": 6,
+  "schema_version": 8,
   "app": {
     "listen_host": "127.0.0.1",
     "port": 8765,
@@ -20,6 +20,7 @@
       "api_key": "",
       "model": "qwen3.8-flash-next-q2_0",
       "idle_unload_s": 600,
+      "max_tokens": 8192,
       "request_timeout_s": 900
     },
     "bonsai": {
@@ -27,8 +28,9 @@
       "server_binary": "~/repos/prism-llama.cpp/build/bin/llama-server",
       "model_file": "~/models/dealignai__Bonsai-2-27B-1bit-CRACK-GGUF/Bonsai-2-27B-PTQ1_0-CRACK.gguf",
       "mmproj_file": "~/models/prism-ml__Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-mmproj-BF16.gguf",
+      "mmproj_gpu_offload": false,
       "model": "local-model",
-      "ctx_size": 65536,
+      "ctx_size": 32768,
       "n_gpu_layers": "all",
       "flash_attn": "on",
       "parallel": 1,
@@ -39,6 +41,7 @@
       "min_p": 0.05,
       "presence_penalty": 0.0,
       "repeat_penalty": 1.0,
+      "max_tokens": 8192,
       "request_timeout_s": 900,
       "startup_timeout_s": 900
     }

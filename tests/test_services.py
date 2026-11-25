@@ -39,6 +39,12 @@ class ServiceCommandTests(unittest.TestCase):
         self.assertEqual(command[0], str(self.settings.path("strata.python")))
         self.assertEqual(command[1], str(self.settings.path("strata.server_script").resolve()))
         self.assertIn(str(self.settings.path("strata.runtime_config")), " ".join(command))
+        self.assertIn("--lazy", command)
+        self.assertEqual(command[command.index("--idle-unload") + 1], "600")
+        self.assertEqual(
+            command[command.index("--slot-save-path") + 1],
+            str(self.settings.path("paths.runtime_root").resolve()),
+        )
         self.assertNotIn(self.settings.section("strata")["api_key"], command)
         self.assertEqual(
             cwd,
@@ -53,7 +59,8 @@ class ServiceCommandTests(unittest.TestCase):
             str(self.settings.path("bonsai.server_binary").resolve()),
             "--model", str(self.settings.path("bonsai.model_file").resolve()),
             "--mmproj", str(self.settings.path("bonsai.mmproj_file").resolve()),
-            "--ctx-size", "65536",
+            "--no-mmproj-offload",
+            "--ctx-size", "32768",
             "--n-gpu-layers", "all",
             "--flash-attn", "on",
             "--parallel", "1",
@@ -68,6 +75,24 @@ class ServiceCommandTests(unittest.TestCase):
             "--port", "9931",
         ])
         self.assertEqual(cwd, Path(command[0]).resolve().parent)
+
+    def test_bonsai_mmproj_gpu_offload_can_be_enabled(self) -> None:
+        data = {
+            **self.settings.data,
+            "chat_backends": {
+                **self.settings.data["chat_backends"],
+                "bonsai": {
+                    **self.settings.section("bonsai"),
+                    "mmproj_gpu_offload": True,
+                },
+            },
+        }
+        settings = Settings(self.settings.root, data)
+
+        command, _, _, _ = service_command(settings, "bonsai")
+
+        self.assertIn("--mmproj-offload", command)
+        self.assertNotIn("--no-mmproj-offload", command)
 
     def test_comfy_command_uses_default_model_paths(self) -> None:
         command, cwd, host, port = service_command(self.settings, "comfyui")
@@ -165,6 +190,26 @@ class ExternalStrataTests(unittest.TestCase):
 
             self.assertFalse(_pid_path(settings, "strata").exists())
             popen.assert_not_called()
+
+    def test_start_passes_strata_api_key_only_in_the_child_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self._settings(Path(directory))
+            process = MagicMock()
+            process.poll.return_value = None
+            process.pid = 808
+
+            with (
+                patch("comfy_studio.services._port_open", return_value=False),
+                patch("comfy_studio.services._find_service_processes", return_value=[]),
+                patch("comfy_studio.services.set_private_permissions"),
+                patch("comfy_studio.services.subprocess.Popen", return_value=process) as popen,
+            ):
+                start_service_tracked(settings, "strata")
+
+            command = popen.call_args.args[0]
+            environment = popen.call_args.kwargs["env"]
+            self.assertEqual(environment["STRATA_API_KEY"], "test-api-key")
+            self.assertNotIn("test-api-key", command)
 
     def test_service_process_matching_uses_script_and_port(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

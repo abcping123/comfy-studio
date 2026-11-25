@@ -24,7 +24,7 @@ class ChatBackendDefinition:
     endpoint_probe: Literal["strata-model"] | None
     chat_preparation: Literal["native-session", "on-demand-service", "stateless"]
     context_strategy: Literal["native-session", "transcript"]
-    image_transport: Literal["local-path", "data-url", "none"]
+    image_transport: Literal["data-url", "none"]
     generation_handoff: Literal["native-session", "stop-service", "none"]
     required_files: tuple[tuple[str, str], ...] = ()
     executable_files: tuple[str, ...] = ()
@@ -82,12 +82,12 @@ CHAT_BACKEND_DEFINITIONS = (
         endpoint_probe="strata-model",
         chat_preparation="native-session",
         context_strategy="native-session",
-        image_transport="local-path",
+        image_transport="data-url",
         generation_handoff="native-session",
         required_files=(
             ("python", "Strata Python"),
             ("server_script", "Strata server script"),
-            ("source_config_json", "Strata source config"),
+            ("runtime_config", "Strata runtime config"),
         ),
         executable_files=("python",),
         requires_api_key=True,

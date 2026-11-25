@@ -29,7 +29,7 @@ from .permissions import set_private_permissions
 from .security import require_access
 from .settings import CHAT_BACKENDS, ConfigError, Settings, default_config_path, load_config
 from .services import ServiceError, service_running
-from .storage import ConversationStore, StorageConflictError, StorageError
+from .storage import ConversationStore, StorageError
 from .system_metrics import SystemMetrics
 
 
@@ -83,7 +83,9 @@ class SourceImageOrderRequest(BaseModel):
 def _public_source_image(source_image: dict[str, Any]) -> dict[str, Any]:
     return {
         key: source_image[key]
-        for key in ("id", "content_type", "size_bytes", "width", "height", "position", "created_at", "in_use")
+        for key in (
+            "id", "content_type", "content_hash", "size_bytes", "width", "height", "position", "created_at",
+        )
     }
 
 
@@ -542,8 +544,6 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
     async def delete_source_image(conversation_id: str, source_image_id: str) -> dict[str, bool]:
         try:
             orchestrator.delete_source_image(conversation_id, source_image_id)
-        except StorageConflictError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
         except StorageError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except CoordinationError as error:
@@ -560,13 +560,14 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         if image_record is None:
             raise HTTPException(status_code=404, detail="Source image not found.")
         try:
-            content, media_type = comfy.image(
-                image_record["filename"], image_record["subfolder"], "input",
-            )
-        except BackendError as error:
-            raise HTTPException(status_code=502, detail="ComfyUI source image retrieval failed.") from error
-        return Response(content, media_type=media_type,
-                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+            image_path = orchestrator.source_image_path(conversation_id, image_record)
+        except CoordinationError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return FileResponse(
+            image_path,
+            media_type=image_record["content_type"],
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
 
     @app.delete("/api/conversations/{conversation_id}", dependencies=[Depends(authenticated)])
     async def delete_conversation(conversation_id: str) -> dict[str, Any]:
@@ -585,6 +586,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
             result = orchestrator.chat(
                 body.conversation_id,
                 body.message,
+                max_tokens=settings.backend_config()["max_tokens"],
                 current_image_prompt=body.current_image_prompt,
                 current_aspect_ratio=body.current_aspect_ratio,
                 reasoning_effort=reasoning_effort,
@@ -613,6 +615,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
                 lambda: orchestrator.chat_stream(
                     body.conversation_id,
                     body.message,
+                    max_tokens=settings.backend_config()["max_tokens"],
                     current_image_prompt=body.current_image_prompt,
                     current_aspect_ratio=body.current_aspect_ratio,
                     reasoning_effort=reasoning_effort,

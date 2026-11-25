@@ -74,6 +74,13 @@ def _port(data: dict[str, Any], key: str, prefix: str) -> int:
     return value
 
 
+def _positive_integer(data: dict[str, Any], key: str, prefix: str) -> int:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{prefix}.{key} must be a positive integer")
+    return value
+
+
 def _is_loopback(host: str) -> bool:
     if host.lower() == "localhost":
         return True
@@ -102,8 +109,14 @@ def _endpoint(data: dict[str, Any], prefix: str) -> None:
 
 def _validate_strata_config(strata: dict[str, Any]) -> None:
     _endpoint(strata, "chat_backends.strata")
-    for key_name in ("python", "server_script", "source_config_json", "runtime_config", "model"):
+    _positive_integer(strata, "max_tokens", "chat_backends.strata")
+    for key_name in ("python", "server_script", "runtime_config", "model"):
         _text(strata, key_name, "chat_backends.strata")
+    source_config = strata.get("source_config_json")
+    if source_config is not None and (
+        not isinstance(source_config, str) or (source_config and not source_config.strip())
+    ):
+        raise ConfigError("chat_backends.strata.source_config_json must be a path when set")
     if strata.get("api_key"):
         _text(strata, "api_key", "chat_backends.strata")
     idle_unload = strata.get("idle_unload_s")
@@ -118,10 +131,10 @@ def _validate_bonsai_config(bonsai: dict[str, Any]) -> None:
     _endpoint(bonsai, "chat_backends.bonsai")
     for key_name in ("server_binary", "model_file", "mmproj_file", "model"):
         _text(bonsai, key_name, "chat_backends.bonsai")
-    for key_name in ("ctx_size", "parallel", "n_predict", "top_k"):
-        value = bonsai.get(key_name)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ConfigError(f"chat_backends.bonsai.{key_name} must be a positive integer")
+    for key_name in ("ctx_size", "parallel", "n_predict", "top_k", "max_tokens"):
+        _positive_integer(bonsai, key_name, "chat_backends.bonsai")
+    if not isinstance(bonsai.get("mmproj_gpu_offload"), bool):
+        raise ConfigError("chat_backends.bonsai.mmproj_gpu_offload must be a boolean")
     gpu_layers = _text(bonsai, "n_gpu_layers", "chat_backends.bonsai")
     if gpu_layers not in {"all", "auto"} and not gpu_layers.isdecimal():
         raise ConfigError(
@@ -154,8 +167,8 @@ def validate_config(data: Any, required_backend: str | None = None) -> dict[str,
     if not isinstance(data, dict):
         raise ConfigError("the root of config.json must be a JSON object")
     version = data.get("schema_version")
-    if isinstance(version, bool) or version != 6:
-        raise ConfigError("schema_version must be 6")
+    if isinstance(version, bool) or version != 8:
+        raise ConfigError("schema_version must be 8")
 
     app = _mapping(data, "app")
     app_host = _text(app, "listen_host", "app")

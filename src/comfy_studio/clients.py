@@ -26,10 +26,10 @@ class BackendError(RuntimeError):
 class ChatBackend(Protocol):
     def status(self) -> dict[str, Any]: ...
 
-    def chat(self, messages: list[dict[str, Any]], max_tokens: int = 2048,
+    def chat(self, messages: list[dict[str, Any]], max_tokens: int = 8192,
              reasoning_effort: str | None = None) -> dict[str, Any]: ...
 
-    def chat_stream(self, messages: list[dict[str, Any]], max_tokens: int = 2048,
+    def chat_stream(self, messages: list[dict[str, Any]], max_tokens: int = 8192,
                     reasoning_effort: str | None = None) -> Iterator[dict[str, str]]: ...
 
 
@@ -97,7 +97,7 @@ class OpenAIChatClient(JsonHttpClient):
     def _headers(self) -> dict[str, str]:
         return {}
 
-    def chat(self, messages: list[dict[str, Any]], max_tokens: int = 2048,
+    def chat(self, messages: list[dict[str, Any]], max_tokens: int = 8192,
              reasoning_effort: str | None = None) -> dict[str, Any]:
         payload = {
             "model": self.model,
@@ -109,7 +109,7 @@ class OpenAIChatClient(JsonHttpClient):
             payload["reasoning_effort"] = reasoning_effort
         return self.request_json("POST", "/v1/chat/completions", payload, self._headers())
 
-    def chat_stream(self, messages: list[dict[str, Any]], max_tokens: int = 2048,
+    def chat_stream(self, messages: list[dict[str, Any]], max_tokens: int = 8192,
                     reasoning_effort: str | None = None) -> Iterator[dict[str, str]]:
         payload = {
             "model": self.model,

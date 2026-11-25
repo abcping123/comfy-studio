@@ -50,6 +50,9 @@ def service_command(settings: Settings, service: str) -> tuple[list[str], Path, 
                 str(script), "--engine", "strata",
                 "--config", str(settings.path(f"{service}.runtime_config")),
                 "--host", endpoint.hostname or "127.0.0.1", "--port", str(endpoint.port),
+                "--lazy",
+                "--idle-unload", str(config["idle_unload_s"]),
+                "--slot-save-path", str(settings.path("paths.runtime_root").resolve()),
             ]
             cwd = script.parent.parent
         elif backend.service_adapter == "llama-server":
@@ -58,6 +61,7 @@ def service_command(settings: Settings, service: str) -> tuple[list[str], Path, 
                 str(binary),
                 "--model", str(settings.path(f"{service}.model_file").resolve()),
                 "--mmproj", str(settings.path(f"{service}.mmproj_file").resolve()),
+                "--mmproj-offload" if config["mmproj_gpu_offload"] else "--no-mmproj-offload",
                 "--ctx-size", str(config["ctx_size"]),
                 "--n-gpu-layers", str(config["n_gpu_layers"]),
                 "--flash-attn", config["flash_attn"],
@@ -78,6 +82,14 @@ def service_command(settings: Settings, service: str) -> tuple[list[str], Path, 
                 f"no service command adapter is registered for chat backend {service}"
             )
     return command, cwd, endpoint.hostname or "127.0.0.1", endpoint.port or 0
+
+
+def _service_environment(settings: Settings, service: str) -> dict[str, str] | None:
+    if service != "strata":
+        return None
+    environment = os.environ.copy()
+    environment["STRATA_API_KEY"] = settings.backend_config("strata")["api_key"]
+    return environment
 
 
 def _pid_path(settings: Settings, service: str) -> Path:
@@ -466,6 +478,7 @@ def start_service_tracked(
     service: str,
 ) -> tuple[int | None, Path, bool]:
     command, cwd, _, _ = service_command(settings, service)
+    environment = _service_environment(settings, service)
     pid_file = _pid_path(settings, service)
     log_path = pid_file.with_suffix(".log")
     pid_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -490,6 +503,7 @@ def start_service_tracked(
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
+                env=environment,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
         else:
@@ -499,6 +513,7 @@ def start_service_tracked(
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
+                env=environment,
                 start_new_session=True,
             )
     if process.poll() is not None:

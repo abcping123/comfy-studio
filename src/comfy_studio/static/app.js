@@ -5,6 +5,7 @@
     token: sessionStorage.getItem(tokenKey) || "",
     conversationId: null,
     options: null,
+    ready: false,
     pendingDeleteId: null,
     busy: false,
     imageMode: null,
@@ -341,7 +342,7 @@
     updateResolutionPreview();
     updateModeControls();
     document.querySelectorAll(".conversation-item, .conversation-delete").forEach((button) => { button.disabled = busy; });
-    document.querySelectorAll(".source-image-action").forEach((button) => { button.disabled = busy || button.dataset.locked === "true"; });
+    document.querySelectorAll(".source-image-action").forEach((button) => { button.disabled = busy; });
     document.querySelectorAll(".source-image-card").forEach((card) => { card.draggable = !busy; });
   }
 
@@ -730,6 +731,11 @@
   async function refreshState() {
     const data = await api("/api/state");
     const backendId = data.chat_backend || "strata";
+    if (state.options?.chat_backend?.id !== backendId) {
+      await loadOptions();
+      restoreConversationSettings();
+      updateResolutionPreview();
+    }
     const backendName = data.chat_backend_label || backendId;
     const backend = data.services[backendId];
     const comfy = data.services.comfyui;
@@ -767,6 +773,7 @@
       if (conversation) void resumeActiveGeneration(activeGeneration);
       else setBusy(false);
     }
+    state.ready = true;
   }
 
   function renderSystemMetrics(metrics) {
@@ -990,11 +997,10 @@
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "icon-button source-image-action source-image-remove";
-      remove.dataset.locked = String(Boolean(sourceImage.in_use));
       remove.textContent = "×";
-      remove.title = sourceImage.in_use ? "This image is linked to a generation" : "Remove source image";
+      remove.title = "Remove source image";
       remove.setAttribute("aria-label", `Remove Picture ${index + 1}`);
-      remove.disabled = state.busy || Boolean(sourceImage.in_use);
+      remove.disabled = state.busy;
       remove.addEventListener("click", () => removeSourceImage(sourceImage.id));
 
       preview.append(image, remove);
@@ -1105,21 +1111,41 @@
     const limits = state.options?.source_images;
     if (!limits) return;
     const maximum = mode.source_images.max_count;
-    if (state.sourceImages.length + selectedFiles.length > maximum) {
-      toast(`This mode supports at most ${maximum} source images.`, true);
-      return;
-    }
     setBusy(true);
     try {
+      const activeHashes = new Set(state.sourceImages.map((sourceImage) => sourceImage.content_hash));
+      const selectedHashes = new Map();
+      const newHashes = new Set();
+      let clientHashingAvailable = true;
       for (const file of selectedFiles) {
         if (file.size > limits.max_bytes) throw new Error(`${file.name} exceeds the 25 MiB upload limit.`);
         if (!limits.allowed_types.includes(file.type)) {
           throw new Error(`${file.name} is not a PNG, JPEG, or WebP image.`);
         }
+        const digest = await hashSourceFile(file);
+        selectedHashes.set(file, digest);
+        if (digest === null) {
+          clientHashingAvailable = false;
+        } else if (!activeHashes.has(digest)) {
+          newHashes.add(digest);
+        }
+      }
+      if (clientHashingAvailable && state.sourceImages.length + newHashes.size > maximum) {
+        throw new Error(`This mode supports at most ${maximum} source images.`);
+      }
+      for (const file of selectedFiles) {
         const uploaded = await api(
           `/api/conversations/${encodeURIComponent(state.conversationId)}/source-images`,
           { method: "POST", body: file, headers: { "Content-Type": file.type } },
         );
+        if (state.sourceImages.some((sourceImage) => sourceImage.id === uploaded.id)) {
+          toast("This image is already in the source list.");
+          continue;
+        }
+        const expectedHash = selectedHashes.get(file);
+        if (expectedHash && uploaded.content_hash !== expectedHash) {
+          throw new Error("Uploaded source image hash did not match the selected file.");
+        }
         await renderSourceImages([...state.sourceImages, uploaded]);
       }
     } catch (error) {
@@ -1128,6 +1154,16 @@
       byId("source-image-input").value = "";
       setBusy(false);
     }
+  }
+
+  async function hashSourceFile(file) {
+    const subtleCrypto = globalThis.crypto?.subtle;
+    if (!subtleCrypto || typeof subtleCrypto.digest !== "function") return null;
+    const bytes = await file.arrayBuffer();
+    const digest = await subtleCrypto.digest("SHA-256", bytes);
+    return [...new Uint8Array(digest)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
   }
 
   async function addGenerationImage(generation) {
@@ -1625,6 +1661,11 @@
       sessionStorage.removeItem(tokenKey);
       byId("token-error").textContent = error.message;
     }
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || !state.token || !state.ready) return;
+    refreshState().catch((error) => toast(error.message, true));
   });
 
   updatePromptCount();

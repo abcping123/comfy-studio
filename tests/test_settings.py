@@ -29,7 +29,7 @@ def sample_config() -> dict:
         },
     }
     return {
-        "schema_version": 6,
+        "schema_version": 8,
         "app": {
             "listen_host": "127.0.0.1",
             "port": 8765,
@@ -50,6 +50,7 @@ def sample_config() -> dict:
                 "api_key": "test-api-key",
                 "model": "qwen-q2",
                 "idle_unload_s": 600,
+                "max_tokens": 8192,
                 "request_timeout_s": 900,
             },
             "bonsai": {
@@ -57,8 +58,9 @@ def sample_config() -> dict:
                 "server_binary": "/srv/prism-llama.cpp/bin/llama-server",
                 "model_file": "/models/Bonsai-2-27B-PTQ1_0-CRACK.gguf",
                 "mmproj_file": "/models/Ternary-Bonsai-2-27B-mmproj-BF16.gguf",
+                "mmproj_gpu_offload": False,
                 "model": "local-model",
-                "ctx_size": 65536,
+                "ctx_size": 32768,
                 "n_gpu_layers": "all",
                 "flash_attn": "on",
                 "parallel": 1,
@@ -69,6 +71,7 @@ def sample_config() -> dict:
                 "min_p": 0.05,
                 "presence_penalty": 0.0,
                 "repeat_penalty": 1.0,
+                "max_tokens": 8192,
                 "request_timeout_s": 900,
                 "startup_timeout_s": 900,
             },
@@ -125,14 +128,60 @@ def sample_config() -> dict:
 
 class SettingsTests(unittest.TestCase):
     def test_valid_local_config(self) -> None:
-        self.assertEqual(validate_config(sample_config())["schema_version"], 6)
+        self.assertEqual(validate_config(sample_config())["schema_version"], 8)
 
-    def test_only_schema_six_is_supported(self) -> None:
-        for version in range(1, 6):
+    def test_chat_max_tokens_must_be_a_positive_integer_for_each_backend(self) -> None:
+        for backend_id in ("strata", "bonsai"):
+            data = sample_config()
+            data["chat_backends"][backend_id]["max_tokens"] = 4096
+            self.assertEqual(validate_config(data)["chat_backends"][backend_id]["max_tokens"], 4096)
+
+            for value in (True, 0, -1, 1.5, "8192", None):
+                data = sample_config()
+                data["chat_backends"][backend_id]["max_tokens"] = value
+                with self.subTest(backend=backend_id, value=value):
+                    with self.assertRaisesRegex(
+                            ConfigError,
+                            f"chat_backends\\.{backend_id}\\.max_tokens must be a positive integer"):
+                        validate_config(data)
+
+            data = sample_config()
+            del data["chat_backends"][backend_id]["max_tokens"]
+            with self.subTest(backend=backend_id, value="missing"):
+                with self.assertRaisesRegex(
+                        ConfigError,
+                        f"chat_backends\\.{backend_id}\\.max_tokens must be a positive integer"):
+                    validate_config(data)
+
+    def test_strata_source_config_is_optional_after_runtime_bootstrap(self) -> None:
+        data = sample_config()
+        data["chat_backends"]["strata"].pop("source_config_json")
+
+        self.assertEqual(validate_config(data)["schema_version"], 8)
+
+    def test_bonsai_mmproj_gpu_offload_must_be_boolean(self) -> None:
+        data = sample_config()
+        del data["chat_backends"]["bonsai"]["mmproj_gpu_offload"]
+        with self.assertRaisesRegex(ConfigError, "mmproj_gpu_offload must be a boolean"):
+            validate_config(data)
+
+        for value in ("true", 1, None):
+            data = sample_config()
+            data["chat_backends"]["bonsai"]["mmproj_gpu_offload"] = value
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ConfigError, "mmproj_gpu_offload must be a boolean"):
+                    validate_config(data)
+
+        data = sample_config()
+        data["chat_backends"]["bonsai"]["mmproj_gpu_offload"] = False
+        self.assertFalse(validate_config(data)["chat_backends"]["bonsai"]["mmproj_gpu_offload"])
+
+    def test_only_schema_eight_is_supported(self) -> None:
+        for version in range(1, 8):
             data = sample_config()
             data["schema_version"] = version
             with self.subTest(version=version):
-                with self.assertRaisesRegex(ConfigError, "schema_version must be 6"):
+                with self.assertRaisesRegex(ConfigError, "schema_version must be 8"):
                     validate_config(data)
 
     def test_default_megapixels_must_be_between_half_and_twenty(self) -> None:
@@ -175,7 +224,7 @@ class SettingsTests(unittest.TestCase):
         data = sample_config()
         data["chat_backends"].pop("bonsai")
 
-        self.assertEqual(validate_config(data, required_backend="strata")["schema_version"], 6)
+        self.assertEqual(validate_config(data, required_backend="strata")["schema_version"], 8)
         with self.assertRaisesRegex(ConfigError, "chat_backends.bonsai is required"):
             validate_config(data, required_backend="bonsai")
 
