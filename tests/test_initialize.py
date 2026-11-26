@@ -432,6 +432,24 @@ class InitializeTests(unittest.TestCase):
             self.assertEqual(active["chat_backends"]["strata"]["api_key"], "runtime-key")
             self.assertNotIn("source_config_json", active["chat_backends"]["strata"])
 
+    def test_initialization_checks_both_repositories_before_inspecting_strata_python(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            strata_repo = root / "Strata"
+            strata_repo.mkdir()
+            missing_comfy_repo = root / "MissingComfyUI"
+            template = sample_config()
+            template_path = root / "config.example.json"
+            template_path.write_text(json.dumps(template), encoding="utf-8")
+
+            with self.assertRaisesRegex(InitializationError, "ComfyUI repository does not exist"):
+                initialize_config(
+                    template_path,
+                    root / "config.json",
+                    strata_repo_path=strata_repo,
+                    comfyui_repo_path=missing_comfy_repo,
+                )
+
     def test_runtime_rejects_strata_batch_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

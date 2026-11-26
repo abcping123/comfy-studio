@@ -1,3 +1,13 @@
+import { createApiClient } from "./api.js?v=14";
+import {
+  calculateModeResolution,
+  getSavedMegapixels,
+  normalizeSeedInput,
+  sourceImageRole,
+} from "./resolution-ui.js?v=14";
+import { createSourceImagesController } from "./source-images.js?v=14";
+import { createGalleryController } from "./gallery.js?v=14";
+
 (() => {
   const tokenKey = "fieldnotes.access-token";
   const conversationSettingsPrefix = "fieldnotes.conversation-settings.v1.";
@@ -12,7 +22,9 @@
     sourceImages: [],
     sourceImageUrls: new Map(),
     sourceRenderToken: 0,
+    galleryRenderToken: 0,
     draggingSourceImageId: null,
+    activeChatRunId: null,
     generationRunId: null,
     imageUrls: new Set(),
     imageViewerGenerationId: null,
@@ -33,193 +45,29 @@
     return mode;
   }
 
-  function getSavedMegapixels(saved, mode) {
-    const modeSettings = saved.mode_settings;
-    const modeValue = modeSettings && typeof modeSettings === "object" && !Array.isArray(modeSettings)
-      ? modeSettings[mode.id]?.megapixels : undefined;
-    return modeValue === undefined ? Number.NaN : Number(modeValue);
+  function currentGenerateLabel() {
+    if (state.options && state.imageMode) {
+      const mode = state.options.modes.find((item) => item.id === state.imageMode);
+      if (mode?.ui?.generate_label) return mode.ui.generate_label;
+    }
+    return "Generate image";
   }
 
-  function sourceImageRole(mode, index) {
-    const roles = mode.source_images.roles;
-    return roles.length ? roles[Math.min(index, roles.length - 1)] : "source image";
-  }
-
-  function authHeaders(extra = {}) {
-    return state.token ? { ...extra, Authorization: `Bearer ${state.token}` } : extra;
-  }
-
-  async function api(path, options = {}) {
-    const headers = authHeaders(options.headers || {});
-    if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
-    const response = await fetch(path, { ...options, headers, cache: "no-store" });
-    if (response.status === 401) {
+  const {
+    api,
+    fetchBlobUrl,
+    resumeChatRun,
+    resumeGenerationStream,
+    streamChat,
+    streamGeneration,
+  } = createApiClient({
+    getToken: () => state.token,
+    onUnauthorized: () => {
       sessionStorage.removeItem(tokenKey);
       state.token = "";
       if (!tokenDialog.open) tokenDialog.showModal();
-      throw new Error("Access token is missing or invalid.");
-    }
-    const contentType = response.headers.get("content-type") || "";
-    const body = contentType.includes("application/json") ? await response.json() : null;
-    if (!response.ok) throw new Error(body?.detail || `Request failed (${response.status})`);
-    return body;
-  }
-
-  async function consumeChatStream(response, onEvent) {
-    if (response.status === 401) {
-      sessionStorage.removeItem(tokenKey);
-      state.token = "";
-      if (!tokenDialog.open) tokenDialog.showModal();
-      throw new Error("Access token is missing or invalid.");
-    }
-    if (!response.ok) {
-      const error = response.headers.get("content-type")?.includes("application/json")
-        ? await response.json() : null;
-      const failure = new Error(error?.detail || `Request failed (${response.status})`);
-      failure.status = response.status;
-      throw failure;
-    }
-    if (!response.body) throw new Error("Streaming response body is unavailable.");
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let outcome = null;
-    let streamError = null;
-    const dispatch = (frame) => {
-      const data = frame.split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, ""))
-        .join("\n");
-      if (!data || data === "[DONE]") return;
-      const event = JSON.parse(data);
-      if (event.type === "done") outcome = event;
-      else if (event.type === "error") streamError = new Error(event.message || "Image assistant stream failed.");
-      onEvent(event);
-    };
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        buffer += decoder.decode(value || new Uint8Array(), { stream: !done }).replace(/\r\n/g, "\n");
-        let boundary = buffer.indexOf("\n\n");
-        while (boundary >= 0) {
-          dispatch(buffer.slice(0, boundary));
-          buffer = buffer.slice(boundary + 2);
-          boundary = buffer.indexOf("\n\n");
-        }
-        if (done) break;
-      }
-      if (buffer.trim()) dispatch(buffer);
-    } catch (error) {
-      await reader.cancel().catch(() => {});
-      throw error;
-    } finally {
-      reader.releaseLock();
-    }
-    if (streamError) throw streamError;
-    if (!outcome) throw new Error("Image assistant stream ended before the answer was complete.");
-    return outcome;
-  }
-
-  async function streamChat(body, onEvent) {
-    const response = await fetch("/api/chat/stream", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json", Accept: "text/event-stream" }),
-      body: JSON.stringify(body),
-      cache: "no-store",
-    });
-    return consumeChatStream(response, onEvent);
-  }
-
-  async function resumeChatRun(runId, onEvent) {
-    const response = await fetch(`/api/chat/runs/${encodeURIComponent(runId)}/stream`, {
-      headers: authHeaders({ Accept: "text/event-stream" }),
-      cache: "no-store",
-    });
-    return consumeChatStream(response, onEvent);
-  }
-
-  async function consumeGenerationStream(response, onEvent) {
-    if (response.status === 401) {
-      sessionStorage.removeItem(tokenKey);
-      state.token = "";
-      if (!tokenDialog.open) tokenDialog.showModal();
-      throw new Error("Access token is missing or invalid.");
-    }
-    if (!response.ok) {
-      const error = response.headers.get("content-type")?.includes("application/json")
-        ? await response.json() : null;
-      const failure = new Error(error?.detail || `Request failed (${response.status})`);
-      failure.status = response.status;
-      throw failure;
-    }
-    if (!response.body) throw new Error("Generation stream is unavailable.");
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let outcome = null;
-    let streamError = null;
-    const dispatch = (frame) => {
-      const data = frame.split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, ""))
-        .join("\n");
-      if (!data) return;
-      const event = JSON.parse(data);
-      if (event.type === "done") outcome = event;
-      else if (event.type === "error") {
-        streamError = new Error(event.message || "ComfyUI generation failed.");
-        streamError.generationFailed = true;
-      }
-      onEvent(event);
-    };
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        buffer += decoder.decode(value || new Uint8Array(), { stream: !done }).replace(/\r\n/g, "\n");
-        let boundary = buffer.indexOf("\n\n");
-        while (boundary >= 0) {
-          dispatch(buffer.slice(0, boundary));
-          buffer = buffer.slice(boundary + 2);
-          boundary = buffer.indexOf("\n\n");
-        }
-        if (done) break;
-      }
-      if (buffer.trim()) dispatch(buffer);
-    } catch (error) {
-      await reader.cancel().catch(() => {});
-      throw error;
-    } finally {
-      reader.releaseLock();
-    }
-    if (streamError) throw streamError;
-    if (!outcome) throw new Error("Generation stream ended before the image was ready.");
-    return outcome;
-  }
-
-  async function streamGeneration(body, onEvent, onRunId = () => {}) {
-    const requestBody = JSON.stringify(body).replace(
-      `"seed":${JSON.stringify(body.seed)}`,
-      `"seed":${body.seed}`,
-    );
-    const response = await fetch("/api/generate/stream", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json", Accept: "text/event-stream" }),
-      body: requestBody,
-      cache: "no-store",
-    });
-    if (response.ok) onRunId(response.headers.get("X-Generation-Run-Id"));
-    return consumeGenerationStream(response, onEvent);
-  }
-
-  async function resumeGenerationStream(runId, afterSequence, onEvent) {
-    const response = await fetch(
-      `/api/generate/runs/${encodeURIComponent(runId)}/stream?after=${afterSequence}`,
-      { headers: authHeaders({ Accept: "text/event-stream" }), cache: "no-store" },
-    );
-    return consumeGenerationStream(response, onEvent);
-  }
+    },
+  });
 
   function resetGenerationMonitor() {
     const button = byId("generate-image");
@@ -240,7 +88,7 @@
     button.classList.remove("is-error", "is-progressing");
     button.removeAttribute("aria-busy");
     button.title = "";
-    byId("generate-image-label").textContent = "Generate image";
+    byId("generate-image-label").textContent = currentGenerateLabel();
     byId("generate-image-percent").textContent = "";
     const progress = byId("generate-image-progress");
     progress.classList.add("is-indeterminate");
@@ -272,19 +120,25 @@
         "Preparing GPU resources for ComfyUI": "Preparing GPU",
         "Connected to ComfyUI live progress": "Connected to ComfyUI",
         "Live progress unavailable; tracking completion status": "Waiting on ComfyUI",
+        "Live progress connection lost; waiting for ComfyUI completion": "Waiting on ComfyUI",
         "Submitting workflow to ComfyUI": "Submitting workflow",
         "ComfyUI is executing the workflow": "Generating image",
-        "Releasing ComfyUI memory": "Finishing image",
+        "Saving generated image to the session and output archive": "Saving image",
+        "Keeping ComfyUI models loaded for the next generation": "Finishing image",
         "Image ready": "Image ready",
       };
       label.textContent = phaseLabels[event.message] || event.message || "Generating image";
-      if (event.message?.startsWith("Live progress unavailable")) setGenerationProgress(Number.NaN);
+      if (event.message?.startsWith("Live progress unavailable") ||
+          event.message?.startsWith("Live progress connection lost")) {
+        setGenerationProgress(Number.NaN);
+      }
     } else if (event.type === "node" || event.type === "progress") {
       const nodeLabels = {
         LoadImage: "Loading source image",
         ResizeImageMaskNode: "Resizing source image",
         GetImageSize: "Reading source image size",
         UNETLoader: "Loading diffusion model",
+        LoadLoraModel: "Loading character swap LoRA",
         CLIPLoader: "Loading text encoder",
         VAELoader: "Loading VAE",
         MiniMaxH3ImageConditioning: "Preparing image conditioning",
@@ -461,47 +315,15 @@
     chatInput.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
   }
 
-  function roundToEven(value) {
-    const lower = Math.floor(value);
-    const fraction = value - lower;
-    const tolerance = Number.EPSILON * Math.max(1, Math.abs(value)) * 2;
-    if (Math.abs(fraction - 0.5) > tolerance) return Math.round(value);
-    return lower % 2 === 0 ? lower : lower + 1;
-  }
-
   function calculateResolution() {
     if (!state.options) return null;
-    const mode = getMode();
-    const megapixels = Number(byId("image-megapixels").value);
-    const megapixelOptions = mode.resolution.megapixels;
-    if (!Number.isFinite(megapixels) || megapixels < megapixelOptions.min ||
-        megapixels > megapixelOptions.max) return null;
-    const multiple = state.options.resolution_multiple;
-    if (mode.resolution.strategy === "source-image") {
-      const base = state.sourceImages[0];
-      if (!base || !base.width || !base.height) return null;
-      const scale = Math.sqrt(Math.floor(megapixels * 1024 * 1024) / (base.width * base.height));
-      const resizedWidth = roundToEven(base.width * scale);
-      const resizedHeight = roundToEven(base.height * scale);
-      const alignedWidth = Math.floor(resizedWidth / multiple) * multiple;
-      const alignedHeight = Math.floor(resizedHeight / multiple) * multiple;
-      return {
-        width: alignedWidth && alignedHeight ? alignedWidth : resizedWidth,
-        height: alignedWidth && alignedHeight ? alignedHeight : resizedHeight,
-        megapixels,
-        multiple,
-      };
-    }
-    if (mode.resolution.strategy !== "aspect-ratio") return null;
-    const ratio = state.options.aspect_ratios.find((item) => item.label === byId("image-aspect-ratio").value);
-    if (!ratio) return null;
-    const scale = Math.sqrt(megapixels * 1024 * 1024 / (ratio.width * ratio.height));
-    return {
-      width: roundToEven(ratio.width * scale / multiple) * multiple,
-      height: roundToEven(ratio.height * scale / multiple) * multiple,
-      megapixels,
-      multiple,
-    };
+    return calculateModeResolution({
+      options: state.options,
+      mode: getMode(),
+      megapixels: Number(byId("image-megapixels").value),
+      aspectRatioLabel: byId("image-aspect-ratio").value,
+      sourceImages: state.sourceImages,
+    });
   }
 
   function updateResolutionPreview() {
@@ -692,19 +514,29 @@
     }
   }
 
-  function restoreConversationSettings() {
+  function restoreConversationSettings(fallbackGeneration = null) {
     const saved = readConversationSettings();
     if (!state.options) return;
 
-    if (state.options.aspect_ratios.some((item) => item.label === saved.aspect_ratio)) {
-      byId("image-aspect-ratio").value = saved.aspect_ratio;
+    const candidateRatio = saved.aspect_ratio || fallbackGeneration?.aspect_ratio;
+    if (state.options.aspect_ratios.some((item) => item.label === candidateRatio)) {
+      byId("image-aspect-ratio").value = candidateRatio;
     }
     const mode = getMode();
     const megapixelOptions = mode.resolution.megapixels;
-    const megapixels = getSavedMegapixels(saved, mode);
-    byId("image-megapixels").value = Number.isFinite(megapixels) &&
-      megapixels >= megapixelOptions.min && megapixels <= megapixelOptions.max
-      ? megapixels.toFixed(2) : Number(megapixelOptions.default).toFixed(2);
+    const savedMegapixels = getSavedMegapixels(saved, mode);
+    const generationMegapixels = fallbackGeneration &&
+      (fallbackGeneration.image_mode || state.options.default_mode) === mode.id
+      ? Number(fallbackGeneration.megapixels)
+      : Number.NaN;
+    const selectedMegapixels = Number.isFinite(savedMegapixels) &&
+      savedMegapixels >= megapixelOptions.min && savedMegapixels <= megapixelOptions.max
+      ? savedMegapixels
+      : Number.isFinite(generationMegapixels) &&
+        generationMegapixels >= megapixelOptions.min && generationMegapixels <= megapixelOptions.max
+        ? generationMegapixels
+        : Number(megapixelOptions.default);
+    byId("image-megapixels").value = selectedMegapixels.toFixed(2);
     byId("thinking-effort").value = isSupportedReasoningEffort(saved.thinking_effort)
       ? saved.thinking_effort : state.options.default_reasoning_effort;
   }
@@ -825,6 +657,7 @@
       entry.className = "conversation-entry";
       const select = document.createElement("button");
       select.type = "button";
+      select.dataset.conversationId = conversation.id;
       select.className = `conversation-item${conversation.id === state.conversationId ? " is-active" : ""}`;
       const title = conversation.title || "New conversation";
       select.title = title;
@@ -863,6 +696,32 @@
     deleteDialog.showModal();
   }
 
+  function updateSelectedConversationHighlight(conversationId = state.conversationId) {
+    document.querySelectorAll(".conversation-item").forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.conversationId === conversationId);
+    });
+  }
+
+  const gallery = createGalleryController({
+    state,
+    byId,
+    imageLightbox,
+    emptyResult,
+    fetchBlobUrl,
+  });
+
+  const sourceImages = createSourceImagesController({
+    state,
+    byId,
+    getMode,
+    api,
+    fetchBlobUrl,
+    setBusy,
+    toast,
+    updateModeControls,
+    updateResolutionPreview,
+  });
+
   async function deleteConversation() {
     const conversationId = state.pendingDeleteId;
     if (!conversationId || state.busy) return;
@@ -882,11 +741,11 @@
         showEmptyChat();
         byId("conversation-title").textContent = "New conversation";
       }
-      const data = await api("/api/state");
+      const data = await api("/api/conversations");
       renderConversationList(data.conversations || []);
       if (!state.conversationId) {
         const nextId = data.active_conversation_id || data.conversations?.[0]?.id;
-        if (nextId) await selectConversation(nextId);
+        if (nextId) await selectConversation(nextId, null, true);
         else await createConversation();
       }
       toast(deletion.cleanup_warning ||
@@ -900,393 +759,8 @@
   }
 
   function clearImages() {
-    closeImageViewer();
-    state.imageUrls.forEach((url) => URL.revokeObjectURL(url));
-    state.imageUrls.clear();
-    clearSourceImages();
-    byId("image-gallery").replaceChildren(emptyResult);
-    showGeneration();
-  }
-
-  function clearSourceImages() {
-    state.sourceRenderToken += 1;
-    state.draggingSourceImageId = null;
-    state.sourceImageUrls.forEach((url) => URL.revokeObjectURL(url));
-    state.sourceImageUrls.clear();
-    state.sourceImages = [];
-    const addButton = byId("upload-source-images");
-    addButton.className = "source-image-add";
-    byId("source-image-list").replaceChildren(addButton);
-    if (state.options) {
-      byId("source-image-count").textContent = `0 / ${getMode().source_images.max_count}`;
-    }
-    updateModeControls();
-  }
-
-  async function renderSourceImages(sourceImages) {
-    const renderToken = ++state.sourceRenderToken;
-    const conversationId = state.conversationId;
-    const ids = new Set(sourceImages.map((sourceImage) => sourceImage.id));
-    state.sourceImageUrls.forEach((url, id) => {
-      if (!ids.has(id)) {
-        URL.revokeObjectURL(url);
-        state.sourceImageUrls.delete(id);
-      }
-    });
-    state.sourceImages = sourceImages;
-    const list = byId("source-image-list");
-    const addButton = byId("upload-source-images");
-    const mode = getMode();
-    addButton.className = "source-image-add";
-    list.replaceChildren(addButton);
-    updateModeControls();
-
-    for (const [index, sourceImage] of sourceImages.entries()) {
-      const role = sourceImageRole(mode, index);
-      const formattedRole = `${role[0].toUpperCase()}${role.slice(1)}`;
-      const card = document.createElement("article");
-      card.className = "source-image-card";
-      card.dataset.sourceImageId = sourceImage.id;
-      card.draggable = !state.busy;
-      card.tabIndex = 0;
-      card.setAttribute("aria-keyshortcuts", "Alt+Shift+ArrowLeft Alt+Shift+ArrowRight");
-      card.setAttribute(
-        "aria-label",
-        `Picture ${index + 1}, ${role}. Drag to reorder; press Alt+Shift+Left or Alt+Shift+Right to move.`,
-      );
-      const preview = document.createElement("div");
-      preview.className = "source-image-preview";
-      const image = document.createElement("img");
-      image.draggable = false;
-      image.alt = `Picture ${index + 1} ${role}`;
-      image.title = `${image.alt} (${sourceImage.width} x ${sourceImage.height})`;
-      const url = state.sourceImageUrls.get(sourceImage.id);
-      if (url) {
-        image.src = url;
-      } else {
-        const response = await fetch(
-          `/api/conversations/${encodeURIComponent(conversationId)}/source-images/${encodeURIComponent(sourceImage.id)}`,
-          { headers: authHeaders(), cache: "no-store" },
-        );
-        if (response.status === 401) {
-          sessionStorage.removeItem(tokenKey);
-          state.token = "";
-          if (!tokenDialog.open) tokenDialog.showModal();
-          return;
-        }
-        if (!response.ok) throw new Error(`Source image fetch failed (${response.status})`);
-        const objectUrl = URL.createObjectURL(await response.blob());
-        if (renderToken !== state.sourceRenderToken || conversationId !== state.conversationId) {
-          URL.revokeObjectURL(objectUrl);
-          return;
-        }
-        state.sourceImageUrls.set(sourceImage.id, objectUrl);
-        image.src = objectUrl;
-      }
-      if (renderToken !== state.sourceRenderToken || conversationId !== state.conversationId) return;
-
-      const details = document.createElement("div");
-      details.className = "source-image-details";
-      const label = document.createElement("span");
-      label.className = "source-image-label";
-      label.textContent = `Picture ${index + 1} - ${formattedRole}`;
-      details.append(label);
-
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "icon-button source-image-action source-image-remove";
-      remove.textContent = "×";
-      remove.title = "Remove source image";
-      remove.setAttribute("aria-label", `Remove Picture ${index + 1}`);
-      remove.disabled = state.busy;
-      remove.addEventListener("click", () => removeSourceImage(sourceImage.id));
-
-      preview.append(image, remove);
-      card.append(preview, details);
-
-      card.addEventListener("dragstart", (event) => {
-        if (state.busy || !event.dataTransfer || (event.target instanceof Element && event.target.closest("button"))) {
-          event.preventDefault();
-          return;
-        }
-        state.draggingSourceImageId = sourceImage.id;
-        event.dataTransfer.effectAllowed = "move";
-        event.dataTransfer.setData("text/plain", sourceImage.id);
-        card.classList.add("is-dragging");
-      });
-      card.addEventListener("dragover", (event) => {
-        if (state.busy || !state.draggingSourceImageId || state.draggingSourceImageId === sourceImage.id) return;
-        event.preventDefault();
-        if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-        card.classList.add("is-drop-target");
-      });
-      card.addEventListener("dragleave", (event) => {
-        if (!(event.relatedTarget instanceof Node) || !card.contains(event.relatedTarget)) {
-          card.classList.remove("is-drop-target");
-        }
-      });
-      card.addEventListener("drop", async (event) => {
-        const draggedId = state.draggingSourceImageId;
-        if (!draggedId || state.busy) return;
-        event.preventDefault();
-        const fromIndex = state.sourceImages.findIndex((imageItem) => imageItem.id === draggedId);
-        const targetIndex = state.sourceImages.findIndex((imageItem) => imageItem.id === sourceImage.id);
-        const targetRect = card.getBoundingClientRect();
-        const afterTarget = event.clientX >= targetRect.left + targetRect.width / 2;
-        const destination = targetIndex + Number(afterTarget) - Number(fromIndex < targetIndex);
-        state.draggingSourceImageId = null;
-        if (fromIndex < 0 || targetIndex < 0 || fromIndex === targetIndex) return;
-        await moveSourceImage(fromIndex, destination);
-      });
-      card.addEventListener("dragend", () => {
-        state.draggingSourceImageId = null;
-        document.querySelectorAll(".source-image-card").forEach((sourceCard) => {
-          sourceCard.classList.remove("is-dragging", "is-drop-target");
-        });
-      });
-      card.addEventListener("keydown", (event) => {
-        if (event.target !== card || !event.altKey || !event.shiftKey) return;
-        const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
-        if (!delta || index + delta < 0 || index + delta >= state.sourceImages.length) return;
-        event.preventDefault();
-        void moveSourceImage(index, index + delta);
-      });
-      list.insertBefore(card, addButton);
-    }
-    updateModeControls();
-    updateResolutionPreview();
-  }
-
-  async function moveSourceImage(fromIndex, toIndex) {
-    if (state.busy || !state.conversationId) return;
-    const sourceImageIds = state.sourceImages.map((sourceImage) => sourceImage.id);
-    if (fromIndex < 0 || fromIndex >= sourceImageIds.length || toIndex < 0 || toIndex >= sourceImageIds.length) return;
-    if (fromIndex === toIndex) return;
-    const [sourceImageId] = sourceImageIds.splice(fromIndex, 1);
-    sourceImageIds.splice(toIndex, 0, sourceImageId);
-    state.draggingSourceImageId = null;
-    setBusy(true);
-    try {
-      const response = await api(
-        `/api/conversations/${encodeURIComponent(state.conversationId)}/source-images/order`,
-        { method: "PUT", body: JSON.stringify({ source_image_ids: sourceImageIds }) },
-      );
-      await renderSourceImages(response.source_images);
-      const movedCard = [...byId("source-image-list").querySelectorAll(".source-image-card")]
-        .find((card) => card.dataset.sourceImageId === sourceImageId);
-      movedCard?.focus();
-    } catch (error) {
-      toast(error.message, true);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function removeSourceImage(sourceImageId) {
-    if (state.busy || !state.conversationId) return;
-    setBusy(true);
-    try {
-      await api(
-        `/api/conversations/${encodeURIComponent(state.conversationId)}/source-images/${encodeURIComponent(sourceImageId)}`,
-        { method: "DELETE" },
-      );
-      await renderSourceImages(state.sourceImages.filter((image) => image.id !== sourceImageId));
-    } catch (error) {
-      toast(error.message, true);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function uploadSourceImages(files) {
-    if (state.busy || !state.conversationId) return;
-    const mode = getMode();
-    if (mode.source_images.max_count === 0) {
-      toast(`${mode.label} does not accept source images.`, true);
-      return;
-    }
-    const selectedFiles = [...files];
-    const limits = state.options?.source_images;
-    if (!limits) return;
-    const maximum = mode.source_images.max_count;
-    setBusy(true);
-    try {
-      const activeHashes = new Set(state.sourceImages.map((sourceImage) => sourceImage.content_hash));
-      const selectedHashes = new Map();
-      const newHashes = new Set();
-      let clientHashingAvailable = true;
-      for (const file of selectedFiles) {
-        if (file.size > limits.max_bytes) throw new Error(`${file.name} exceeds the 25 MiB upload limit.`);
-        if (!limits.allowed_types.includes(file.type)) {
-          throw new Error(`${file.name} is not a PNG, JPEG, or WebP image.`);
-        }
-        const digest = await hashSourceFile(file);
-        selectedHashes.set(file, digest);
-        if (digest === null) {
-          clientHashingAvailable = false;
-        } else if (!activeHashes.has(digest)) {
-          newHashes.add(digest);
-        }
-      }
-      if (clientHashingAvailable && state.sourceImages.length + newHashes.size > maximum) {
-        throw new Error(`This mode supports at most ${maximum} source images.`);
-      }
-      for (const file of selectedFiles) {
-        const uploaded = await api(
-          `/api/conversations/${encodeURIComponent(state.conversationId)}/source-images`,
-          { method: "POST", body: file, headers: { "Content-Type": file.type } },
-        );
-        if (state.sourceImages.some((sourceImage) => sourceImage.id === uploaded.id)) {
-          toast("This image is already in the source list.");
-          continue;
-        }
-        const expectedHash = selectedHashes.get(file);
-        if (expectedHash && uploaded.content_hash !== expectedHash) {
-          throw new Error("Uploaded source image hash did not match the selected file.");
-        }
-        await renderSourceImages([...state.sourceImages, uploaded]);
-      }
-    } catch (error) {
-      toast(error.message, true);
-    } finally {
-      byId("source-image-input").value = "";
-      setBusy(false);
-    }
-  }
-
-  async function hashSourceFile(file) {
-    const subtleCrypto = globalThis.crypto?.subtle;
-    if (!subtleCrypto || typeof subtleCrypto.digest !== "function") return null;
-    const bytes = await file.arrayBuffer();
-    const digest = await subtleCrypto.digest("SHA-256", bytes);
-    return [...new Uint8Array(digest)]
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
-  }
-
-  async function addGenerationImage(generation) {
-    if (generation.status !== "complete" || !generation.filename) return;
-    const response = await fetch(`/api/generations/${generation.id}/image`, {
-      headers: authHeaders(), cache: "no-store",
-    });
-    if (response.status === 401) {
-      sessionStorage.removeItem(tokenKey);
-      state.token = "";
-      if (!tokenDialog.open) tokenDialog.showModal();
-      return;
-    }
-    if (!response.ok) throw new Error(`Image fetch failed (${response.status})`);
-    const url = URL.createObjectURL(await response.blob());
-    state.imageUrls.add(url);
-    const card = document.createElement("article");
-    card.className = "gallery-item";
-    card.dataset.generationId = generation.id;
-    const image = document.createElement("img");
-    image.src = url;
-    image.alt = generation.prompt;
-    const openImage = document.createElement("button");
-    openImage.type = "button";
-    openImage.className = "gallery-image-button";
-    openImage.title = "View full-size image";
-    openImage.setAttribute("aria-label", "View full-size image");
-    openImage.addEventListener("click", () => openImageViewer(generation.id));
-    openImage.append(image);
-    const indexBadge = document.createElement("span");
-    indexBadge.className = "gallery-index";
-    indexBadge.setAttribute("aria-hidden", "true");
-    openImage.append(indexBadge);
-    const caption = document.createElement("div");
-    caption.className = "gallery-caption";
-    const text = document.createElement("span");
-    const generationMode = state.options?.modes.find((mode) => mode.id === generation.image_mode);
-    const details = [generationMode?.label || generation.image_mode || "Image generation"];
-    if (generation.aspect_ratio && generation.aspect_ratio !== "Source image") {
-      details.push(generation.aspect_ratio);
-    }
-    details.push(
-      `${Number(generation.megapixels).toFixed(2)} MP`,
-      `${generation.width} x ${generation.height}`,
-    );
-    const sourceCount = generation.source_image_ids?.length || 0;
-    if (sourceCount) details.push(`${sourceCount} source images`);
-    if (generation.sampler_name && generation.scheduler) {
-      details.push(`${generation.sampler_name} / ${generation.scheduler}`);
-    }
-    details.push(`seed ${generation.seed}`);
-    text.textContent = details.join(" · ");
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = generation.filename;
-    link.textContent = "Download";
-    caption.append(text, link);
-    card.append(openImage, caption);
-    byId("empty-result")?.remove();
-    byId("image-gallery").prepend(card);
-  }
-
-  function showGeneration(generationId = null) {
-    const cards = [...byId("image-gallery").querySelectorAll(".gallery-item")];
-    let activeIndex = generationId
-      ? cards.findIndex((card) => card.dataset.generationId === generationId)
-      : cards.findIndex((card) => card.classList.contains("is-active"));
-    if (activeIndex < 0) activeIndex = 0;
-    cards.forEach((card, index) => {
-      card.querySelector(".gallery-index").textContent = `${index + 1} / ${cards.length}`;
-    });
-    cards.forEach((card, index) => {
-      const active = index === activeIndex;
-      card.classList.toggle("is-active", active);
-      card.setAttribute("aria-hidden", String(!active));
-    });
-    byId("result-viewer").classList.toggle("has-results", cards.length > 0);
-    byId("older-result").disabled = cards.length < 2 || activeIndex >= cards.length - 1;
-    byId("newer-result").disabled = cards.length < 2 || activeIndex <= 0;
-    byId("result-count").textContent = cards.length ? `${activeIndex + 1} / ${cards.length}` : "0";
-  }
-
-  function moveGeneration(direction) {
-    const cards = [...byId("image-gallery").querySelectorAll(".gallery-item")];
-    if (cards.length < 2) return;
-    const currentIndex = cards.findIndex((card) => card.classList.contains("is-active"));
-    const nextIndex = Math.max(0, Math.min(cards.length - 1, (currentIndex < 0 ? 0 : currentIndex) + direction));
-    showGeneration(cards[nextIndex].dataset.generationId);
-  }
-
-  function updateImageViewer() {
-    const cards = [...byId("image-gallery").querySelectorAll(".gallery-item")];
-    const index = cards.findIndex((card) => card.dataset.generationId === state.imageViewerGenerationId);
-    if (index < 0) {
-      closeImageViewer();
-      return;
-    }
-    const source = cards[index].querySelector("img");
-    const image = byId("lightbox-image");
-    image.src = source.src;
-    image.alt = source.alt;
-    byId("lightbox-count").textContent = `${index + 1} / ${cards.length}`;
-    byId("lightbox-older").disabled = index >= cards.length - 1;
-    byId("lightbox-newer").disabled = index <= 0;
-  }
-
-  function openImageViewer(generationId) {
-    state.imageViewerGenerationId = generationId;
-    updateImageViewer();
-    if (!imageLightbox.open) imageLightbox.showModal();
-  }
-
-  function moveImageViewer(direction) {
-    const cards = [...byId("image-gallery").querySelectorAll(".gallery-item")];
-    const index = cards.findIndex((card) => card.dataset.generationId === state.imageViewerGenerationId);
-    const nextIndex = index + direction;
-    if (index < 0 || nextIndex < 0 || nextIndex >= cards.length) return;
-    state.imageViewerGenerationId = cards[nextIndex].dataset.generationId;
-    updateImageViewer();
-  }
-
-  function closeImageViewer() {
-    if (imageLightbox.open) imageLightbox.close();
-    state.imageViewerGenerationId = null;
-    byId("lightbox-image").removeAttribute("src");
+    gallery.clearGalleryImages();
+    sourceImages.clearSourceImages();
   }
 
   async function selectConversation(conversationId, revealGenerationId = null, allowBusy = false) {
@@ -1296,22 +770,22 @@
       state.conversationId = conversationId;
       clearImages();
       if (!revealGenerationId) clearGenerationMonitor();
-      renderConversationList((await api("/api/state")).conversations || []);
+      updateSelectedConversationHighlight(conversationId);
       byId("conversation-title").textContent = data.conversation.title || "New conversation";
       imagePrompt.value = data.conversation.image_prompt || "";
       applyImageMode(data.conversation.image_mode || state.options.default_mode);
       const conversationRatio = data.conversation.aspect_ratio;
       if (state.options?.aspect_ratios.some((item) => item.label === conversationRatio)) {
         byId("image-aspect-ratio").value = conversationRatio;
+      } else if (state.options) {
+        byId("image-aspect-ratio").value = state.options.default_aspect_ratio;
       }
       const latestGeneration = data.generations[0];
-      if (latestGeneration && (latestGeneration.image_mode || state.options.default_mode) === state.imageMode) {
-        if (state.options?.aspect_ratios.some((item) => item.label === latestGeneration.aspect_ratio)) {
-          byId("image-aspect-ratio").value = latestGeneration.aspect_ratio;
-        }
-        byId("image-megapixels").value = Number(latestGeneration.megapixels).toFixed(2);
-      }
-      restoreConversationSettings();
+      const matchingGeneration = latestGeneration &&
+        (latestGeneration.image_mode || state.options.default_mode) === state.imageMode
+        ? latestGeneration
+        : null;
+      restoreConversationSettings(matchingGeneration);
       updatePromptCount();
       const badge = byId("context-badge");
       badge.classList.toggle("is-warning", !data.conversation.context_saved_at);
@@ -1332,9 +806,11 @@
       } else {
         showEmptyChat();
       }
-      await renderSourceImages(data.source_images || []);
-      for (const generation of data.generations.slice(0, 8).reverse()) await addGenerationImage(generation);
-      showGeneration(revealGenerationId);
+      await Promise.all([
+        sourceImages.renderSourceImages(data.source_images || []),
+        gallery.renderGenerations(data.generations.slice(0, 8), conversationId),
+      ]);
+      gallery.showGeneration(revealGenerationId);
       return data;
     } catch (error) {
       toast(error.message, true);
@@ -1449,6 +925,9 @@
   }
 
   async function resumeActiveChat(activeChat, conversation) {
+    if (state.activeChatRunId === activeChat.id) return;
+    state.activeChatRunId = activeChat.id;
+    setBusy(true);
     const alreadyCommitted = conversation.messages.length > activeChat.base_message_count;
     let assistant = null;
     if (!alreadyCommitted) {
@@ -1467,6 +946,9 @@
         failAssistantTurn(assistant, error);
       }
     } finally {
+      if (state.activeChatRunId === activeChat.id) {
+        state.activeChatRunId = null;
+      }
       setBusy(false);
     }
   }
@@ -1512,15 +994,6 @@
         clearGenerationMonitor();
       }
     }
-  }
-
-  function normalizeSeedInput(value) {
-    const seedText = value.replace(/^0+(?=\d)/, "");
-    if (!/^[0-9]+$/.test(seedText) || seedText.length > 20 ||
-        (seedText.length === 20 && seedText > "18446744073709551615")) {
-      return null;
-    }
-    return seedText;
   }
 
   function updateSeedValidity() {
@@ -1592,15 +1065,15 @@
   byId("generate-image").addEventListener("click", generateImage);
   byId("upload-source-images").addEventListener("click", () => byId("source-image-input").click());
   byId("source-image-input").addEventListener("change", (event) => {
-    uploadSourceImages(event.currentTarget.files || []);
+    sourceImages.uploadSourceImages(event.currentTarget.files || []);
   });
-  byId("older-result").addEventListener("click", () => moveGeneration(1));
-  byId("newer-result").addEventListener("click", () => moveGeneration(-1));
-  byId("lightbox-close").addEventListener("click", closeImageViewer);
-  byId("lightbox-older").addEventListener("click", () => moveImageViewer(1));
-  byId("lightbox-newer").addEventListener("click", () => moveImageViewer(-1));
+  byId("older-result").addEventListener("click", () => gallery.moveGeneration(1));
+  byId("newer-result").addEventListener("click", () => gallery.moveGeneration(-1));
+  byId("lightbox-close").addEventListener("click", gallery.closeImageViewer);
+  byId("lightbox-older").addEventListener("click", () => gallery.moveImageViewer(1));
+  byId("lightbox-newer").addEventListener("click", () => gallery.moveImageViewer(-1));
   imageLightbox.addEventListener("click", (event) => {
-    if (event.target === imageLightbox) closeImageViewer();
+    if (event.target === imageLightbox) gallery.closeImageViewer();
   });
   imageLightbox.addEventListener("close", () => {
     state.imageViewerGenerationId = null;
@@ -1610,13 +1083,13 @@
     if (!imageLightbox.open) return;
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      moveImageViewer(-1);
+      gallery.moveImageViewer(-1);
     } else if (event.key === "ArrowRight") {
       event.preventDefault();
-      moveImageViewer(1);
+      gallery.moveImageViewer(1);
     } else if (event.key === "Escape") {
       event.preventDefault();
-      closeImageViewer();
+      gallery.closeImageViewer();
     }
   });
   byId("cancel-delete").addEventListener("click", () => {
@@ -1642,17 +1115,31 @@
     byId("image-seed").value = String(value[0]);
     updateSeedValidity();
   });
+
+  async function bootAuthenticatedSession() {
+    setBusy(true);
+    try {
+      await loadOptions();
+      await refreshState();
+      startSystemMetricsPolling();
+    } catch (error) {
+      setBusy(false);
+      throw error;
+    } finally {
+      if (!state.activeChatRunId && !state.generationRunId) {
+        setBusy(false);
+      }
+    }
+  }
+
   byId("token-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     state.token = byId("token-input").value.trim();
     sessionStorage.setItem(tokenKey, state.token);
     byId("token-error").textContent = "";
-    setBusy(true);
     try {
-      await loadOptions();
-      await refreshState();
+      await bootAuthenticatedSession();
       tokenDialog.close();
-      startSystemMetricsPolling();
       byId("token-input").value = "";
     } catch (error) {
       state.token = "";
@@ -1670,8 +1157,6 @@
   resizeChatInput();
   updateModeControls();
   if (state.token) {
-    setBusy(true);
-    loadOptions().then(refreshState).catch((error) => toast(error.message, true));
-    startSystemMetricsPolling();
+    bootAuthenticatedSession().catch((error) => toast(error.message, true));
   } else tokenDialog.showModal();
 })();

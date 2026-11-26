@@ -13,6 +13,9 @@ from websockets.sync.client import connect as websocket_connect
 from .settings import Settings
 
 
+PROBE_TIMEOUT_S = 5.0
+
+
 class BackendError(RuntimeError):
     def __init__(self, service: str, message: str, status: int | None = None,
                  body: Any = None, retry_after: str | None = None):
@@ -188,8 +191,9 @@ class StrataClient(OpenAIChatClient):
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}"}
 
-    def status(self) -> dict[str, Any]:
-        return self.request_json("GET", "/v1/status", headers=self._headers())
+    def status(self, timeout_s: float | None = None) -> dict[str, Any]:
+        probe_timeout = min(self.timeout_s, PROBE_TIMEOUT_S) if timeout_s is None else timeout_s
+        return self.request_json("GET", "/v1/status", headers=self._headers(), timeout_s=probe_timeout)
 
     def load(self) -> dict[str, Any]:
         return self.request_json("POST", "/v1/load", {}, self._headers())
@@ -214,8 +218,9 @@ class BonsaiClient(OpenAIChatClient):
             config["model"],
         )
 
-    def status(self) -> dict[str, Any]:
-        self.request_json("GET", "/health", timeout_s=min(self.timeout_s, 2.0))
+    def status(self, timeout_s: float | None = None) -> dict[str, Any]:
+        probe_timeout = min(self.timeout_s, 2.0) if timeout_s is None else timeout_s
+        self.request_json("GET", "/health", timeout_s=probe_timeout)
         return {"loaded": True}
 
 
@@ -224,11 +229,13 @@ class ComfyUIClient(JsonHttpClient):
         config = settings.section("comfyui")
         super().__init__("ComfyUI", config["endpoint"], config["request_timeout_s"])
 
-    def queue(self) -> dict[str, Any]:
-        return self.request_json("GET", "/queue")
+    def queue(self, timeout_s: float | None = None) -> dict[str, Any]:
+        probe_timeout = min(self.timeout_s, PROBE_TIMEOUT_S) if timeout_s is None else timeout_s
+        return self.request_json("GET", "/queue", timeout_s=probe_timeout)
 
-    def system_stats(self) -> dict[str, Any]:
-        return self.request_json("GET", "/system_stats")
+    def system_stats(self, timeout_s: float | None = None) -> dict[str, Any]:
+        probe_timeout = min(self.timeout_s, PROBE_TIMEOUT_S) if timeout_s is None else timeout_s
+        return self.request_json("GET", "/system_stats", timeout_s=probe_timeout)
 
     def free_memory(self) -> dict[str, Any]:
         return self.request_json("POST", "/free", {"unload_models": True, "free_memory": True})
@@ -313,23 +320,3 @@ class ComfyUIClient(JsonHttpClient):
 
     def history(self, prompt_id: str) -> dict[str, Any]:
         return self.request_json("GET", f"/history/{prompt_id}")
-
-    def image(self, filename: str, subfolder: str = "", image_type: str = "output") -> tuple[bytes, str]:
-        if (filename in {"", ".", ".."} or PurePosixPath(filename).name != filename
-                or "\\" in filename):
-            raise BackendError("ComfyUI", "refusing an unsafe image filename")
-        folder = PurePosixPath(subfolder)
-        if folder.is_absolute() or ".." in folder.parts or "\\" in subfolder:
-            raise BackendError("ComfyUI", "refusing an unsafe image subfolder")
-        if image_type not in {"output", "temp", "input"}:
-            raise BackendError("ComfyUI", "unsupported image type")
-        query = urlencode({"filename": filename, "subfolder": subfolder, "type": image_type})
-        request = Request(f"{self.endpoint}/view?{query}", headers={"Accept": "image/*"})
-        try:
-            with self._opener.open(request, timeout=self.timeout_s) as response:
-                return response.read(), response.headers.get("Content-Type", "application/octet-stream")
-        except HTTPError as error:
-            raise BackendError("ComfyUI", f"image request failed with HTTP {error.code}",
-                               status=error.code) from error
-        except (URLError, TimeoutError, OSError) as error:
-            raise BackendError("ComfyUI", f"image request failed: {error}") from error

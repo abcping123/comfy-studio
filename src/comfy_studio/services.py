@@ -273,8 +273,9 @@ def _pid_mismatch_error(
 
 
 def _port_open(host: str, port: int) -> bool:
+    probe_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host.strip(), host)
     try:
-        with socket.create_connection((host, port), timeout=0.25):
+        with socket.create_connection((probe_host, port), timeout=0.25):
             return True
     except OSError:
         return False

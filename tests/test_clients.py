@@ -171,16 +171,35 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(client.progress_websocket_url("studio-client"),
                          f"{self.endpoint.replace('http://', 'ws://')}/ws?clientId=studio-client")
 
-    def test_image_proxy_encodes_query_and_rejects_traversal(self) -> None:
-        client = ComfyUIClient(self.settings)
-        body, content_type = client.image("sample.png", "job/1")
-        self.assertEqual(content_type, "image/png")
-        self.assertEqual(body, b'{"image": true}')
-        method, path, _, _ = FakeHandler.calls[-1]
-        self.assertEqual(method, "GET")
-        self.assertEqual(parse_qs(urlsplit(path).query)["subfolder"], ["job/1"])
-        with self.assertRaisesRegex(BackendError, "unsafe"):
-            client.image("../secret.png")
+    def test_status_and_queue_probes_cap_request_timeout(self) -> None:
+        strata = StrataClient(self.settings)
+        comfy = ComfyUIClient(self.settings)
+        self.settings.data["chat_backends"]["bonsai"]["endpoint"] = self.endpoint
+        bonsai = BonsaiClient(self.settings)
+
+        observed_timeouts: list[tuple[str, float]] = []
+        for client, method_name in (
+            (strata, "status"),
+            (bonsai, "status"),
+            (comfy, "queue"),
+            (comfy, "system_stats"),
+        ):
+            original_open = client._opener.open
+
+            def recording_open(request, timeout=None, _orig=original_open, _name=method_name):
+                observed_timeouts.append((_name, timeout))
+                return _orig(request, timeout=timeout)
+
+            client._opener.open = recording_open
+            try:
+                getattr(client, method_name)()
+            finally:
+                client._opener.open = original_open
+
+        self.assertEqual(
+            observed_timeouts,
+            [("status", 5.0), ("status", 2.0), ("queue", 5.0), ("system_stats", 5.0)],
+        )
 
     def test_comfy_upload_uses_input_subfolder_and_multipart_body(self) -> None:
         client = ComfyUIClient(self.settings)

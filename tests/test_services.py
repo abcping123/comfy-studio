@@ -11,6 +11,7 @@ from comfy_studio.services import (
     ServiceError,
     _pid_exists,
     _pid_path,
+    _port_open,
     _strata_endpoint_matches,
     preflight_service_start,
     preflight_studio_start,
@@ -461,6 +462,27 @@ class ExternalStrataTests(unittest.TestCase):
                 preflight_studio_start(settings)
 
             port_open.assert_called_once_with(app["listen_host"], app["port"])
+
+    def test_port_open_maps_wildcard_hosts_to_loopback(self) -> None:
+        targets: list[tuple[str, int]] = []
+
+        class DummyConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def fake_connect(address, timeout=0.25):
+            targets.append(address)
+            return DummyConnection()
+
+        with patch("comfy_studio.services.socket.create_connection", side_effect=fake_connect):
+            self.assertTrue(_port_open("0.0.0.0", 8765))
+            self.assertTrue(_port_open("::", 8765))
+            self.assertTrue(_port_open("127.0.0.1", 8765))
+
+        self.assertEqual(targets, [("127.0.0.1", 8765), ("::1", 8765), ("127.0.0.1", 8765)])
 
     def test_status_and_stop_report_but_do_not_manage_external_strata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

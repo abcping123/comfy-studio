@@ -368,7 +368,7 @@ class SettingsTests(unittest.TestCase):
     def test_invalid_url_port_is_rejected(self) -> None:
         data = sample_config()
         data["chat_backends"]["strata"]["endpoint"] = "http://127.0.0.1:99999"
-        with self.assertRaisesRegex(ConfigError, "invalid"):
+        with self.assertRaisesRegex(ConfigError, r"chat_backends\.strata\.endpoint is invalid"):
             validate_config(data)
 
     def test_prompt_enhancement_cannot_be_enabled(self) -> None:

@@ -38,6 +38,8 @@ class ConversationStore:
         self._state_path = self.runtime_root / "state.json"
         self._lock = threading.RLock()
         self._initialized: set[str] = set()
+        self._summary_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
+        self._generation_conversations: dict[str, str] = {}
         self._prepare_directory(self.session_root)
         self._prepare_directory(self.runtime_root)
 
@@ -237,19 +239,51 @@ class ConversationStore:
             row = connection.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
         return dict(row) if row else None
 
+    def _invalidate_summary(self, conversation_id: str) -> None:
+        self._summary_cache.pop(conversation_id, None)
+
+    def _conversation_summary(self, conversation_id: str) -> dict[str, Any]:
+        path = self.database_path(conversation_id)
+        if path is None:
+            self._summary_cache.pop(conversation_id, None)
+            raise StorageError(f"session directory {conversation_id} has no conversation database")
+        try:
+            stat_result = path.stat()
+        except OSError as error:
+            raise StorageError(f"could not stat session database: {error}") from error
+        signature = (stat_result.st_mtime_ns, stat_result.st_size)
+        cached = self._summary_cache.get(conversation_id)
+        if cached is not None and cached[:2] == signature:
+            return dict(cached[2])
+        with self._connect(conversation_id) as connection:
+            row = connection.execute(
+                "SELECT c.*, (SELECT count(*) FROM messages m WHERE m.conversation_id = c.id) "
+                "AS message_count FROM conversations c WHERE c.id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            self._summary_cache.pop(conversation_id, None)
+            raise StorageError(f"session directory {conversation_id} has no conversation record")
+        summary = dict(row)
+        try:
+            post_stat = path.stat()
+            self._summary_cache[conversation_id] = (
+                post_stat.st_mtime_ns, post_stat.st_size, dict(summary),
+            )
+        except OSError:
+            self._summary_cache.pop(conversation_id, None)
+        return summary
+
     def list_conversations(self) -> list[dict[str, Any]]:
         conversations: list[dict[str, Any]] = []
         with self._lock:
-            for conversation_id in self._session_ids():
-                with self._connect(conversation_id) as connection:
-                    row = connection.execute(
-                        "SELECT c.*, (SELECT count(*) FROM messages m WHERE m.conversation_id = c.id) "
-                        "AS message_count FROM conversations c WHERE c.id = ?",
-                        (conversation_id,),
-                    ).fetchone()
-                if row is None:
-                    raise StorageError(f"session directory {conversation_id} has no conversation record")
-                conversations.append(dict(row))
+            session_ids = self._session_ids()
+            active_ids = set(session_ids)
+            for cached_id in list(self._summary_cache):
+                if cached_id not in active_ids:
+                    del self._summary_cache[cached_id]
+            for conversation_id in session_ids:
+                conversations.append(self._conversation_summary(conversation_id))
         return sorted(conversations, key=lambda row: row["updated_at"], reverse=True)
 
     def _session_ids(self) -> list[str]:
@@ -327,6 +361,7 @@ class ConversationStore:
                 title = user_text.strip().replace("\n", " ")[:72] or title
             connection.execute("UPDATE conversations SET title = ?, image_prompt = ?, aspect_ratio = ?, updated_at = ? "
                                "WHERE id = ?", (title, image_prompt, aspect_ratio, now, conversation_id))
+            self._invalidate_summary(conversation_id)
 
     def mark_context_saved(self, conversation_id: str, token_count: int | None,
                            byte_count: int, backend: str) -> None:
@@ -348,6 +383,7 @@ class ConversationStore:
             )
             if cursor.rowcount != 1:
                 raise StorageError("conversation does not exist")
+            self._invalidate_summary(conversation_id)
 
     def context_is_current(self, conversation_id: str, backend: str | None = None) -> bool:
         conversation_id = self.validate_id(conversation_id)
@@ -456,6 +492,7 @@ class ConversationStore:
             )
             if cursor.rowcount != 1:
                 raise StorageError("conversation does not exist")
+            self._invalidate_summary(conversation_id)
 
     @staticmethod
     def validate_source_image_id(source_image_id: str) -> str:
@@ -653,6 +690,10 @@ class ConversationStore:
             except OSError as error:
                 raise StorageError(f"could not remove session directory: {error}") from error
             self._initialized.discard(conversation_id)
+            self._invalidate_summary(conversation_id)
+            for gen_id, owner_id in list(self._generation_conversations.items()):
+                if owner_id == conversation_id:
+                    del self._generation_conversations[gen_id]
             return True
 
     def create_generation(self, conversation_id: str, prompt: str, seed: int, aspect_ratio: str,
@@ -691,7 +732,15 @@ class ConversationStore:
                 )
                 if cursor.rowcount != 1:
                     raise StorageError("source image does not belong to this conversation")
+            self._generation_conversations[generation_id] = conversation_id
         return generation_id
+
+    def _candidate_generation_conversations(self, generation_id: str) -> list[str]:
+        cached_id = self._generation_conversations.get(generation_id)
+        session_ids = self._session_ids()
+        if cached_id and cached_id in session_ids:
+            return [cached_id, *[cid for cid in session_ids if cid != cached_id]]
+        return session_ids
 
     def update_generation(self, generation_id: str, status: str, prompt_id: str | None = None,
                           image: dict[str, str] | None = None, error: str | None = None) -> None:
@@ -700,7 +749,7 @@ class ConversationStore:
             raise StorageError("invalid generation status")
         values = image or {}
         with self._lock:
-            for conversation_id in self._session_ids():
+            for conversation_id in self._candidate_generation_conversations(generation_id):
                 with self._connect(conversation_id) as connection:
                     cursor = connection.execute(
                         "UPDATE generations SET status = ?, prompt_id = coalesce(?, prompt_id), "
@@ -710,6 +759,7 @@ class ConversationStore:
                          values.get("type"), error, _now(), generation_id),
                     )
                 if cursor.rowcount == 1:
+                    self._generation_conversations[generation_id] = conversation_id
                     return
         raise StorageError("generation does not exist")
 
@@ -722,18 +772,22 @@ class ConversationStore:
                 "SELECT * FROM generations WHERE conversation_id = ? ORDER BY created_at DESC",
                 (conversation_id,),
             ).fetchall()
-            return [self._generation_with_sources(connection, row) for row in rows]
+            items = [self._generation_with_sources(connection, row) for row in rows]
+            for item in items:
+                self._generation_conversations[item["id"]] = conversation_id
+            return items
 
     def generation(self, generation_id: str) -> dict[str, Any] | None:
         if not isinstance(generation_id, str) or not re.fullmatch(r"^[0-9a-f]{32}$", generation_id):
             raise StorageError("invalid generation id")
         with self._lock:
-            for conversation_id in self._session_ids():
+            for conversation_id in self._candidate_generation_conversations(generation_id):
                 with self._connect(conversation_id) as connection:
                     row = connection.execute(
                         "SELECT * FROM generations WHERE id = ?", (generation_id,),
                     ).fetchone()
                     if row is not None:
+                        self._generation_conversations[generation_id] = conversation_id
                         return self._generation_with_sources(connection, row)
         return None
 

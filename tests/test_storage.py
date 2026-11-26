@@ -212,6 +212,31 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(StorageError, "invalid conversation id: 3d"):
             self.store.list_conversations()
 
+    def test_list_conversations_reuses_summary_cache_and_invalidates_on_mutations(self) -> None:
+        first = self.store.create_conversation("First")
+        second = self.store.create_conversation("Second")
+        initial = self.store.list_conversations()
+        self.assertEqual({item["id"] for item in initial}, {first["id"], second["id"]})
+
+        connect_calls: list[str] = []
+        original_connect = self.store._connect
+
+        def counting_connect(conversation_id: str):
+            connect_calls.append(conversation_id)
+            return original_connect(conversation_id)
+
+        self.store._connect = counting_connect
+        cached = self.store.list_conversations()
+        self.assertEqual(connect_calls, [])
+        self.assertEqual(cached, initial)
+
+        self.store._connect = original_connect
+        self.store.set_conversation_mode(first["id"], "edit")
+        self.store.append_exchange(first["id"], "Update prompt", "Updated")
+        refreshed = next(item for item in self.store.list_conversations() if item["id"] == first["id"])
+        self.assertEqual(refreshed["image_mode"], "edit")
+        self.assertEqual(refreshed["message_count"], 2)
+
     def test_delete_cascades_records_and_clears_conversation_state(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
         self.store.append_exchange(conversation_id, "A prompt", "A reply")

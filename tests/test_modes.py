@@ -46,6 +46,8 @@ class ImageModeTests(unittest.TestCase):
         self.assertEqual(character_swap["resolution"]["strategy"], "source-image")
         self.assertEqual(character_swap["resolution"]["megapixels"]["default"], 1.0)
         self.assertEqual(character_swap["ui"]["generate_label"], "Swap character")
+        for item in options:
+            self.assertNotIn("Strata", item["ui"]["composer_hint"])
 
     def test_source_image_limits_are_owned_by_the_selected_mode(self) -> None:
         text_to_image = get_mode(DEFAULT_MODE_ID)

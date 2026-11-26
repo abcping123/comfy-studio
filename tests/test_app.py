@@ -641,9 +641,42 @@ class AppTests(unittest.TestCase):
             {"available": True, "loaded": False},
         )
 
-    def test_unknown_asset_is_not_served(self) -> None:
-        response = self.client.get("/assets/../../config.json")
-        self.assertEqual(response.status_code, 404)
+    def test_unknown_asset_is_not_served_and_es_modules_have_js_mime(self) -> None:
+        self.assertEqual(self.client.get("/assets/../../config.json").status_code, 404)
+        for module_name in ("app.js", "api.js", "resolution-ui.js", "source-images.js", "gallery.js"):
+            response = self.client.get(f"/assets/{module_name}")
+            self.assertEqual(response.status_code, 200, module_name)
+            self.assertTrue(response.headers["content-type"].startswith("text/javascript"))
+        css_response = self.client.get("/assets/app.css")
+        self.assertEqual(css_response.status_code, 200)
+        self.assertTrue(css_response.headers["content-type"].startswith("text/css"))
+
+    def test_conversations_list_endpoint_skips_backend_status_probes(self) -> None:
+        headers = {"Authorization": f"Bearer {self.data['app']['access_token']}"}
+        created = self.client.post("/api/conversations", headers=headers).json()
+        with (
+            patch.object(AppStrata, "status", side_effect=AssertionError("unexpected status probe")),
+            patch.object(AppComfy, "queue", side_effect=AssertionError("unexpected queue probe")),
+        ):
+            response = self.client.get("/api/conversations", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["active_conversation_id"], created["id"])
+        self.assertEqual([item["id"] for item in response.json()["conversations"]], [created["id"]])
+
+    def test_chat_and_generation_runs_share_mutually_exclusive_gate(self) -> None:
+        headers = {"Authorization": f"Bearer {self.data['app']['access_token']}"}
+        conversation = self.client.post("/api/conversations", headers=headers).json()
+        active_generation = self.app.state.generation_runs.start(conversation["id"])
+        try:
+            conflict = self.client.post("/api/chat/stream", headers=headers, json={
+                "conversation_id": conversation["id"],
+                "message": "Should conflict while generation is running",
+            })
+            self.assertEqual(conflict.status_code, 409)
+        finally:
+            self.app.state.generation_runs.finish(
+                active_generation, {"type": "error", "message": "cancelled"},
+            )
 
     def test_conversation_delete_requires_auth_and_returns_empty_state(self) -> None:
         conversation = self.client.post("/api/conversations",

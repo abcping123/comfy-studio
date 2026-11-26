@@ -108,7 +108,7 @@ def _endpoint(data: dict[str, Any], prefix: str) -> None:
         parsed = urlsplit(url)
         url_port = parsed.port
     except ValueError as error:
-        raise ConfigError(f"{prefix}.base_url is invalid: {error}") from error
+        raise ConfigError(f"{prefix}.endpoint is invalid: {error}") from error
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ConfigError(f"{prefix}.endpoint must be an HTTP(S) URL with a host")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:

@@ -748,6 +748,30 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIsNone(self.store.get_conversation(conversation_id))
         self.assertIsNone(self.store.active_conversation_id())
 
+    def test_failed_generation_omits_retained_phase_and_callback_error_releases_lock(self) -> None:
+        conversation_id = self.store.create_conversation()["id"]
+        events: list[dict] = []
+        with patch.object(self.comfy, "submit_prompt", side_effect=BackendError("ComfyUI", "boom")):
+            with self.assertRaisesRegex(CoordinationError, "boom"):
+                self.orchestrator.generate(
+                    conversation_id, "A red teapot", 1, progress_callback=events.append,
+                )
+        messages = [event.get("message") for event in events]
+        self.assertNotIn("Keeping ComfyUI models loaded for the next generation", messages)
+        self.assertNotIn("Image ready", messages)
+
+        def exploding_callback(event: dict) -> None:
+            if event.get("message") == "Image ready":
+                raise RuntimeError("subscriber failed")
+
+        with self.assertRaisesRegex(RuntimeError, "subscriber failed"):
+            self.orchestrator.generate(
+                conversation_id, "A blue teapot", 2, progress_callback=exploding_callback,
+            )
+
+        recovered = self.orchestrator.generate(conversation_id, "A green teapot", 3)
+        self.assertEqual(recovered.image["filename"], f"{GENERATED_IMAGE_HASH}.png")
+
     def test_failed_session_save_prevents_unload_and_generation(self) -> None:
         conversation_id = self.store.create_conversation()["id"]
         self.orchestrator.chat(conversation_id, "Keep the native context")

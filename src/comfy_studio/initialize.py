@@ -133,23 +133,23 @@ def initialize_config(template_path: Path | None = None, output_path: Path | Non
             if not repository.is_dir():
                 raise InitializationError(f"{label} repository does not exist: {repository}")
 
-            terminal_root = strata_repo / "terminal"
-            strata_root = terminal_root if (terminal_root / "serve/server.py").is_file() else strata_repo
-            strata_roots = (strata_root, strata_repo) if strata_root != strata_repo else (strata_root,)
-            strata_python_candidates = tuple(_python_executable(root) for root in strata_roots)
-            strata_python = next(
-                (path for path in strata_python_candidates if path.is_file()),
-                None,
-            )
-            if strata_python is None:
-                checked = ", ".join(str(path) for path in strata_python_candidates)
-                raise InitializationError(f"Strata Python does not exist; checked: {checked}")
-            strata_server = strata_root / "serve/server.py"
-            source_path = (
-                strata_root / Path(source_value).name
-                if not runtime_exists and isinstance(source_value, str)
-                else None
-            )
+        terminal_root = strata_repo / "terminal"
+        strata_root = terminal_root if (terminal_root / "serve/server.py").is_file() else strata_repo
+        strata_roots = (strata_root, strata_repo) if strata_root != strata_repo else (strata_root,)
+        strata_python_candidates = tuple(_python_executable(root) for root in strata_roots)
+        strata_python = next(
+            (path for path in strata_python_candidates if path.is_file()),
+            None,
+        )
+        if strata_python is None:
+            checked = ", ".join(str(path) for path in strata_python_candidates)
+            raise InitializationError(f"Strata Python does not exist; checked: {checked}")
+        strata_server = strata_root / "serve/server.py"
+        source_path = (
+            strata_root / Path(source_value).name
+            if not runtime_exists and isinstance(source_value, str)
+            else None
+        )
         comfy_python = _python_executable(comfyui_repo)
         comfy_main = comfyui_repo / "main.py"
         required_files = [

@@ -118,12 +118,20 @@ def _resolve_reasoning_effort(settings: Settings, requested: str | None) -> str:
     return effort
 
 
-class ChatRun:
-    def __init__(self, conversation_id: str, message: str, base_message_count: int):
+_STATIC_ASSETS = {
+    "app.css": "text/css",
+    "app.js": "text/javascript",
+    "api.js": "text/javascript",
+    "resolution-ui.js": "text/javascript",
+    "source-images.js": "text/javascript",
+    "gallery.js": "text/javascript",
+}
+
+
+class EventRun:
+    def __init__(self, conversation_id: str):
         self.id = uuid.uuid4().hex
         self.conversation_id = conversation_id
-        self.message = message
-        self.base_message_count = base_message_count
         self._events: list[dict[str, Any]] = []
         self._condition = threading.Condition()
         self._complete = False
@@ -135,25 +143,21 @@ class ChatRun:
 
     def publish(self, event: dict[str, Any]) -> None:
         with self._condition:
+            if self._complete:
+                return
             self._events.append(event)
             self._condition.notify_all()
 
     def finish(self, event: dict[str, Any]) -> None:
         with self._condition:
+            if self._complete:
+                return
             self._events.append(event)
             self._complete = True
             self._condition.notify_all()
 
-    def public_info(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "conversation_id": self.conversation_id,
-            "message": self.message,
-            "base_message_count": self.base_message_count,
-        }
-
-    def stream(self) -> Iterator[str]:
-        index = 0
+    def stream(self, after_sequence: int = 0) -> Iterator[str]:
+        index = max(0, after_sequence)
         while True:
             with self._condition:
                 if index < len(self._events):
@@ -174,20 +178,83 @@ class ChatRun:
                 return
 
 
-class ChatRunManager:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._active: ChatRun | None = None
-        self._runs: dict[str, ChatRun] = {}
+class ChatRun(EventRun):
+    def __init__(self, conversation_id: str, message: str, base_message_count: int):
+        super().__init__(conversation_id)
+        self.message = message
+        self.base_message_count = base_message_count
 
-    def start(self, conversation_id: str, message: str, base_message_count: int,
-              operation: Callable[[], Iterator[dict[str, Any]]]) -> ChatRun:
-        with self._lock:
-            if self._active is not None and not self._active.complete:
-                raise CoordinationError("another model operation is already in progress")
-            run = ChatRun(conversation_id, message, base_message_count)
+    def public_info(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "conversation_id": self.conversation_id,
+            "message": self.message,
+            "base_message_count": self.base_message_count,
+        }
+
+
+class GenerationRun(EventRun):
+    def public_info(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "id": self.id,
+                "conversation_id": self.conversation_id,
+                "sequence": len(self._events),
+                "latest_event": self._events[-1] if self._events else None,
+            }
+
+
+class RunGate:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._active: EventRun | None = None
+
+    def claim(self, run: EventRun) -> None:
+        if self._active is not None and not self._active.complete:
+            raise CoordinationError("another model operation is already in progress")
+        self._active = run
+
+    def release(self, run: EventRun) -> None:
+        if self._active is run:
+            self._active = None
+
+
+class _BaseRunManager:
+    def __init__(self, gate: RunGate | None = None):
+        self._gate = gate or RunGate()
+        self._active: Any = None
+        self._runs: dict[str, Any] = {}
+
+    def _register_run(self, run: EventRun) -> None:
+        with self._gate.lock:
+            self._gate.claim(run)
             self._active = run
             self._runs[run.id] = run
+
+    def _complete_run(self, run: EventRun, terminal_event: dict[str, Any]) -> None:
+        with self._gate.lock:
+            run.finish(terminal_event)
+            if self._active is run:
+                self._active = None
+            self._gate.release(run)
+            completed = [run_id for run_id, item in self._runs.items() if item.complete]
+            for run_id in completed[:-8]:
+                del self._runs[run_id]
+
+    def active(self) -> Any:
+        with self._gate.lock:
+            return self._active if self._active and not self._active.complete else None
+
+    def get(self, run_id: str) -> Any:
+        with self._gate.lock:
+            return self._runs.get(run_id)
+
+
+class ChatRunManager(_BaseRunManager):
+    def start(self, conversation_id: str, message: str, base_message_count: int,
+              operation: Callable[[], Iterator[dict[str, Any]]]) -> ChatRun:
+        run = ChatRun(conversation_id, message, base_message_count)
+        self._register_run(run)
         thread = threading.Thread(target=self._execute, args=(run, operation),
                                   name="studio-chat", daemon=True)
         thread.start()
@@ -216,116 +283,20 @@ class ChatRunManager:
                 try:
                     close_stream()
                 except Exception:
-                    logging.exception("Could not close the Strata chat stream")
+                    logging.exception("Could not close the chat stream")
             if terminal_event is None:
                 terminal_event = {"type": "error", "message": "Chat stream ended unexpectedly."}
-            with self._lock:
-                run.finish(terminal_event)
-                if self._active is run:
-                    self._active = None
-                completed = [run_id for run_id, item in self._runs.items() if item.complete]
-                for run_id in completed[:-8]:
-                    del self._runs[run_id]
-
-    def active(self) -> ChatRun | None:
-        with self._lock:
-            return self._active
-
-    def get(self, run_id: str) -> ChatRun | None:
-        with self._lock:
-            return self._runs.get(run_id)
+            self._complete_run(run, terminal_event)
 
 
-class GenerationRun:
-    def __init__(self, conversation_id: str):
-        self.id = uuid.uuid4().hex
-        self.conversation_id = conversation_id
-        self._events: list[dict[str, Any]] = []
-        self._condition = threading.Condition()
-        self._complete = False
-
-    @property
-    def complete(self) -> bool:
-        with self._condition:
-            return self._complete
-
-    def publish(self, event: dict[str, Any]) -> None:
-        with self._condition:
-            if self._complete:
-                return
-            self._events.append(event)
-            self._condition.notify_all()
-
-    def finish(self, event: dict[str, Any]) -> None:
-        with self._condition:
-            if self._complete:
-                return
-            self._events.append(event)
-            self._complete = True
-            self._condition.notify_all()
-
-    def public_info(self) -> dict[str, Any]:
-        with self._condition:
-            return {
-                "id": self.id,
-                "conversation_id": self.conversation_id,
-                "sequence": len(self._events),
-                "latest_event": self._events[-1] if self._events else None,
-            }
-
-    def stream(self, after_sequence: int = 0) -> Iterator[str]:
-        index = max(0, after_sequence)
-        while True:
-            with self._condition:
-                if index < len(self._events):
-                    event = self._events[index]
-                    index += 1
-                elif self._complete:
-                    return
-                else:
-                    notified = self._condition.wait(timeout=15)
-                    if notified:
-                        continue
-                    event = None
-            if event is None:
-                yield ": keep-alive\n\n"
-                continue
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            if event.get("type") in {"done", "error"}:
-                return
-
-
-class GenerationRunManager:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._active: GenerationRun | None = None
-        self._runs: dict[str, GenerationRun] = {}
-
+class GenerationRunManager(_BaseRunManager):
     def start(self, conversation_id: str) -> GenerationRun:
-        with self._lock:
-            if self._active is not None and not self._active.complete:
-                raise CoordinationError("another model operation is already in progress")
-            run = GenerationRun(conversation_id)
-            self._active = run
-            self._runs[run.id] = run
-            return run
+        run = GenerationRun(conversation_id)
+        self._register_run(run)
+        return run
 
     def finish(self, run: GenerationRun, event: dict[str, Any]) -> None:
-        run.finish(event)
-        with self._lock:
-            if self._active is run:
-                self._active = None
-            completed = [run_id for run_id, item in self._runs.items() if item.complete]
-            for run_id in completed[:-8]:
-                del self._runs[run_id]
-
-    def active(self) -> GenerationRun | None:
-        with self._lock:
-            return self._active if self._active and not self._active.complete else None
-
-    def get(self, run_id: str) -> GenerationRun | None:
-        with self._lock:
-            return self._runs.get(run_id)
+        self._complete_run(run, event)
 
 
 def create_app(settings: Settings | None = None, store: ConversationStore | None = None,
@@ -340,8 +311,9 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         chat_backend = create_chat_backend(settings)
     comfy = comfy or ComfyUIClient(settings)
     orchestrator = Orchestrator(settings, store, chat_backend, comfy)
-    chat_runs = ChatRunManager()
-    generation_runs = GenerationRunManager()
+    run_gate = RunGate()
+    chat_runs = ChatRunManager(run_gate)
+    generation_runs = GenerationRunManager(run_gate)
     resource_monitor = SystemMetrics(settings.section("comfyui")["gpu_id"])
     static_dir = Path(__file__).resolve().parent / "static"
 
@@ -366,12 +338,13 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
 
     @app.get("/assets/{asset_name}", include_in_schema=False)
     async def assets(asset_name: str) -> FileResponse:
-        if asset_name not in {"app.css", "app.js"}:
+        media_type = _STATIC_ASSETS.get(asset_name)
+        if media_type is None:
             raise HTTPException(status_code=404, detail="Asset not found")
-        return FileResponse(static_dir / asset_name)
+        return FileResponse(static_dir / asset_name, media_type=media_type)
 
     @app.get("/api/state", dependencies=[Depends(authenticated)])
-    async def state() -> dict[str, Any]:
+    def state() -> dict[str, Any]:
         backend_definition = get_chat_backend(settings.chat_backend)
         chat_backend_status: dict[str, Any]
         comfy_status: dict[str, Any]
@@ -419,7 +392,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         return resource_monitor.snapshot()
 
     @app.get("/api/options", dependencies=[Depends(authenticated)])
-    async def options() -> dict[str, Any]:
+    def options() -> dict[str, Any]:
         generation = settings.section("generation")
         modes = public_mode_options(generation)
         backend_definition = get_chat_backend(settings.chat_backend)
@@ -453,14 +426,21 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         }
         return options
 
+    @app.get("/api/conversations", dependencies=[Depends(authenticated)])
+    def list_conversations() -> dict[str, Any]:
+        return {
+            "active_conversation_id": store.selected_conversation_id(),
+            "conversations": store.list_conversations(),
+        }
+
     @app.post("/api/conversations", dependencies=[Depends(authenticated)])
-    async def create_conversation() -> dict[str, Any]:
+    def create_conversation() -> dict[str, Any]:
         conversation = store.create_conversation()
         store.set_selected_conversation_id(conversation["id"])
         return conversation
 
     @app.get("/api/conversations/{conversation_id}", dependencies=[Depends(authenticated)])
-    async def get_conversation(conversation_id: str) -> dict[str, Any]:
+    def get_conversation(conversation_id: str) -> dict[str, Any]:
         conversation = store.get_conversation(conversation_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -475,7 +455,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         }
 
     @app.put("/api/conversations/{conversation_id}/mode", dependencies=[Depends(authenticated)])
-    async def set_conversation_mode(conversation_id: str, body: ConversationModeRequest) -> dict[str, str]:
+    def set_conversation_mode(conversation_id: str, body: ConversationModeRequest) -> dict[str, str]:
         try:
             orchestrator.set_conversation_mode(conversation_id, body.image_mode)
         except StorageError as error:
@@ -513,7 +493,8 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         except SourceImageError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         try:
-            source_image = orchestrator.upload_source_image(
+            source_image = await run_in_threadpool(
+                orchestrator.upload_source_image,
                 conversation_id, content, inspected.content_type, inspected.extension,
                 inspected.width, inspected.height,
             )
@@ -527,8 +508,8 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
 
     @app.put("/api/conversations/{conversation_id}/source-images/order",
              dependencies=[Depends(authenticated)])
-    async def reorder_source_images(conversation_id: str,
-                                    body: SourceImageOrderRequest) -> dict[str, Any]:
+    def reorder_source_images(conversation_id: str,
+                              body: SourceImageOrderRequest) -> dict[str, Any]:
         try:
             source_images = orchestrator.reorder_source_images(
                 conversation_id, body.source_image_ids,
@@ -541,7 +522,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
 
     @app.delete("/api/conversations/{conversation_id}/source-images/{source_image_id}",
                 dependencies=[Depends(authenticated)])
-    async def delete_source_image(conversation_id: str, source_image_id: str) -> dict[str, bool]:
+    def delete_source_image(conversation_id: str, source_image_id: str) -> dict[str, bool]:
         try:
             orchestrator.delete_source_image(conversation_id, source_image_id)
         except StorageError as error:
@@ -552,7 +533,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
 
     @app.get("/api/conversations/{conversation_id}/source-images/{source_image_id}",
              dependencies=[Depends(authenticated)])
-    async def source_image(conversation_id: str, source_image_id: str) -> Response:
+    def source_image(conversation_id: str, source_image_id: str) -> Response:
         try:
             image_record = store.source_image(conversation_id, source_image_id)
         except StorageError as error:
@@ -570,7 +551,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         )
 
     @app.delete("/api/conversations/{conversation_id}", dependencies=[Depends(authenticated)])
-    async def delete_conversation(conversation_id: str) -> dict[str, Any]:
+    def delete_conversation(conversation_id: str) -> dict[str, Any]:
         try:
             cleanup_warning = orchestrator.delete_conversation(conversation_id)
         except StorageError as error:
@@ -580,7 +561,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         return {"deleted": True, "cleanup_warning": cleanup_warning}
 
     @app.post("/api/chat", dependencies=[Depends(authenticated)])
-    async def chat(body: ChatRequest) -> dict[str, Any]:
+    def chat(body: ChatRequest) -> dict[str, Any]:
         reasoning_effort = _resolve_reasoning_effort(settings, body.reasoning_effort)
         try:
             result = orchestrator.chat(
@@ -604,7 +585,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         }
 
     @app.post("/api/chat/stream", dependencies=[Depends(authenticated)])
-    async def chat_stream(body: ChatRequest) -> StreamingResponse:
+    def chat_stream(body: ChatRequest) -> StreamingResponse:
         reasoning_effort = _resolve_reasoning_effort(settings, body.reasoning_effort)
         try:
             base_message_count = len(store.messages(body.conversation_id))
@@ -634,7 +615,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         )
 
     @app.get("/api/chat/runs/{run_id}/stream", dependencies=[Depends(authenticated)])
-    async def resume_chat_stream(run_id: str) -> StreamingResponse:
+    def resume_chat_stream(run_id: str) -> StreamingResponse:
         run = chat_runs.get(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Chat run not found")
@@ -645,7 +626,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         )
 
     @app.get("/api/generate/runs/{run_id}/stream", dependencies=[Depends(authenticated)])
-    async def resume_generation_stream(run_id: str, after: int = 0) -> StreamingResponse:
+    def resume_generation_stream(run_id: str, after: int = 0) -> StreamingResponse:
         run = generation_runs.get(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Generation run not found")
@@ -656,7 +637,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         )
 
     @app.post("/api/generate", dependencies=[Depends(authenticated)])
-    async def generate(body: GenerateRequest) -> dict[str, Any]:
+    def generate(body: GenerateRequest) -> dict[str, Any]:
         try:
             result = orchestrator.generate(
                 body.conversation_id, body.prompt, body.seed,
@@ -673,7 +654,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         }
 
     @app.post("/api/generate/stream", dependencies=[Depends(authenticated)])
-    async def generate_stream(body: GenerateRequest) -> StreamingResponse:
+    def generate_stream(body: GenerateRequest) -> StreamingResponse:
         try:
             run = generation_runs.start(body.conversation_id)
         except CoordinationError as error:
@@ -713,7 +694,7 @@ def create_app(settings: Settings | None = None, store: ConversationStore | None
         )
 
     @app.get("/api/generations/{generation_id}/image", dependencies=[Depends(authenticated)])
-    async def generation_image(generation_id: str) -> Response:
+    def generation_image(generation_id: str) -> Response:
         try:
             generation = store.generation(generation_id)
         except StorageError as error:
